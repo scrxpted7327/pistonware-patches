@@ -7549,78 +7549,53 @@ shared.bedwars = {
     namecallGuard       = namecallGuard,
 }
 
--- bedwars.lua is the ONLY file fetched from GitLab -- everything else comes from GitHub.
--- Note it sits at the REPO ROOT there (gitlab.com/pistonware/pistonware/bedwars.lua), even
--- though it is cached locally under pistonware/games/. It auto-updates: the sha of the latest
--- commit that touched it is tracked in bedwarscheck.txt; whenever GitLab reports a newer
--- commit, the file is silently re-downloaded (no prompt) and the sha re-recorded.
+-- bedwars.lua is the ONLY file fetched from GitLab -- everything else comes from GitHub -- and
+-- it sits at the REPO ROOT there (gitlab.com/pistonware/pistonware/bedwars.lua).
 --
--- What that GitLab file actually contains is a ONE-LINE REDIRECT to LuaArmor's loader endpoint,
--- not the protected build -- LuaArmor hosts the build itself. So the caching below pins the
--- redirect, never the payload: the real script is pulled fresh from LuaArmor every time this
--- runs, which is what keeps security updates and Heartbeat current. The commit tracking still
--- earns its keep, since it is how a changed redirect (new script id, different obfuscator,
--- rolled-back build) reaches installs that already cached the old one.
+-- What lives at that URL is a ~220 byte REDIRECT to LuaArmor's loader endpoint, not the
+-- protected build; LuaArmor hosts the build itself and serves the current one on every request,
+-- which is what keeps security updates and Heartbeat live.
+--
+-- It is never written to disk and never read from disk. This is the one file whose integrity
+-- the whole key system rests on, so it does not get the caching, the commit tracking or the
+-- developer-mode escape hatch that every other file in the project has -- each of those turned
+-- out to be a way to get a local file executed in its place. See downloadBedwars.
 --
 -- The payload validates the global script_key server-side on execution. The loader's key gate
 -- is what sets it; nothing here can substitute for it.
 
--- Latest commit sha that touched bedwars.lua on GitLab, or nil on failure.
--- GitLab's commits API names the sha field 'id' (GitHub/Codeberg call it 'sha').
-local function fetchBedwarsCommit()
-    local suc, res = pcall(function()
-        return game:HttpGet('https://gitlab.com/api/v4/projects/pistonware%2Fpistonware/repository/commits?path=bedwars.lua&ref_name=main&per_page=1', true)
-    end)
-    if not (suc and res and res ~= '' and res ~= '404: Not Found') then return nil end
-    local dsuc, body = pcall(function()
-        return httpService:JSONDecode(res)
-    end)
-    if not (dsuc and type(body) == 'table' and body[1] and body[1].id) then return nil end
-    return body[1].id
-end
+--[[
+    Fetches the payload redirect from GitLab. It is NEVER cached, NEVER read from disk, and
+    developer mode does not apply to it.
 
--- Returns the bedwars.lua source, auto-updating from GitLab when a newer commit exists.
--- Raw file hosts intermittently fail (Codeberg, which this replaced, served empty-bodied
--- 504s and eventually a full outage), hence the retries; the download is pinned to the exact
--- commit sha so a fetch right after a push can't grab a stale CDN copy of the branch head.
+    This is the one file in the project that protection depends on, and every convenience that
+    made sense for the others turned out to be a bypass for this one:
+
+      * It used to honour shared.PistonwareDeveloper and return the local file untouched,
+        without making a request at all. The published loader ships plaintext, so anyone can
+        edit it to set that flag -- and from then on pistonware would execute whatever sat at
+        pistonware/games/bedwars.lua forever. A dumped or rewritten payload, run unkeyed, with
+        no network request that could ever notice.
+      * Even with the flag off, a cached copy whose recorded commit sha still matched was
+        returned as-is. Editing the file did not change the sha, so a tampered cache survived
+        every update check.
+
+    Fetching fresh removes both. There is also no offline fallback on purpose: what lives on
+    GitLab is a ~220 byte redirect to LuaArmor, and running it needs LuaArmor reachable anyway,
+    so a cached copy could not have helped a genuinely offline user -- it could only have helped
+    someone who wanted a local file executed instead of the real one.
+
+    Cheap, too: one small request, and dropping the cache also dropped the commit-check round
+    trip that used to precede it.
+]]
 local function downloadBedwars()
-    local path = 'pistonware/games/bedwars.lua'
-    local checkPath = 'pistonware/games/bedwarscheck.txt'
-
-    local cached = isfile(path) and readfile(path) or nil
-    if cached and cached:gsub('%s', '') == '' then cached = nil end
-
-    -- Developer mode: never touch the network -- run the local bedwars.lua exactly as-is so a
-    -- dev can test unpushed edits without the auto-update overwriting them.
-    if shared.PistonwareDeveloper then
-        return cached
-    end
-
-    local latest = fetchBedwarsCommit()
-    local stored = isfile(checkPath) and readfile(checkPath):gsub('%s', '') or nil
-
-    -- Up to date, or the commit couldn't be fetched (don't wipe a good cache we can't verify):
-    -- use what we already have.
-    if cached and (not latest or latest == stored) then
-        return cached
-    end
-
-    -- No cache, or a newer commit exists -> (re)download and record the new sha.
     for attempt = 1, 4 do
         local suc, res = pcall(function()
-            local url = latest
-                and ('https://gitlab.com/pistonware/pistonware/-/raw/'..latest..'/bedwars.lua')
-                or 'https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua'
-            return game:HttpGet(url, true)
+            return game:HttpGet('https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua', true)
         end)
-        -- loadstring compile check: during a host outage HttpGet can hand back the 503/error
-        -- page as the body, which the ~=''/'404' checks accept -- caching that poisons the
-        -- install silently forever (cache-first means it would never be refetched).
+        -- compile check: during an outage HttpGet can hand back the 503/error page as the body,
+        -- which the ~=''/'404' tests would accept
         if suc and res and res ~= '' and res ~= '404: Not Found' and loadstring(res) ~= nil then
-            pcall(writefile, path, '--This watermark is used to delete the file if its cached, remove it to make the file persist after vape updates.\n'..res)
-            if latest then
-                pcall(writefile, checkPath, latest)
-            end
             return res
         end
         if attempt < 4 then
@@ -7628,9 +7603,10 @@ local function downloadBedwars()
         end
     end
 
-    -- Every download attempt failed: fall back to the stale cache rather than nil so the
-    -- script still runs (it just stays on the previous version until the next successful run).
-    return cached
+    -- Every attempt failed. Returns nil rather than falling back to a local copy: a local copy
+    -- is precisely what must never be executed here, and there is nothing useful it could do
+    -- anyway, since what it contains still needs LuaArmor reachable to run.
+    return nil
 end
 
 -- LuaArmor blanks the global script_key as soon as it has authenticated -- an anti-key-theft
@@ -7678,24 +7654,16 @@ if bedwarsSource then
             warn('[pistonware] bedwars.lua errored while running: '..tostring(err))
         end
     else
-        -- Doesn't compile: the cached copy is corrupt (a truncated write, or an error page
-        -- cached by an older loader). Delete it so the next session redownloads instead of
-        -- failing silently forever.
-        warn('[pistonware] cached bedwars.lua is corrupt, deleting it -- rejoin to redownload')
+        -- What came back does not compile. Nothing is cached now, so there is no stale file to
+        -- delete and no state to repair -- the next run fetches again from scratch. Almost
+        -- certainly the host served an error page that happened to pass the checks above.
+        warn('[pistonware] bedwars.lua did not compile -- the file host may be serving an error page')
         pcall(function()
-            if delfile then
-                delfile('pistonware/games/bedwars.lua')
-            else
-                writefile('pistonware/games/bedwars.lua', '')
-            end
-        end)
-        pcall(function()
-            vape:CreateNotification('Vape', 'Cached bedwars.lua was corrupt and has been removed -- rejoin the game to redownload it.', 30, 'alert')
+            vape:CreateNotification('Vape', 'Combat modules could not be loaded (the file host returned something invalid). Rejoin the game to retry.', 30, 'alert')
         end)
     end
 else
-    -- Every attempt failed and there is no usable cache (fresh install during a host
-    -- outage). Say so instead of silently loading without combat modules.
+    -- Every attempt failed. Say so instead of silently loading without combat modules.
     warn('[pistonware] bedwars.lua could not be downloaded -- the file host may be down')
     pcall(function()
         vape:CreateNotification('Vape', 'Could not download bedwars.lua -- the file host may be down. Combat modules are unavailable; rejoin the game to retry.', 30, 'alert')
