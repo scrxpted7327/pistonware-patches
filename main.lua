@@ -1,9 +1,3 @@
--- The loader is the only supported entry point: it runs the LuaArmor key gate and publishes
--- script_key (which the protected bedwars.lua reads) before any of this downloads or executes.
--- main.lua is re-run directly in two places -- the queued teleport script below, and the GUI's
--- reinject buttons -- and both re-establish that state first, so reaching here without it means
--- the gate was skipped. Checked before the uninject below, so a failed check cannot tear down a
--- working instance on its way out.
 if not shared.PistonwareAuthenticated then
 	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
 	return
@@ -192,6 +186,15 @@ local function finishLoading()
 		synchronously and behaves exactly as it always did.
 	]]
 	local function applyProfile()
+		-- A session LuaArmor refused registered no game modules at all (see the session
+		-- block at the top of bedwars.lua). Loading a profile against that empty set would
+		-- bring everything up on defaults, and the Save below would write those defaults
+		-- back -- deleting the user's real config. Withholding the modules is the intended
+		-- consequence of a refusal; deleting configs is not, so do neither here.
+		if shared.PistonwareSessionRejected then
+			warn('[pistonware] session was not authorised -- leaving profiles untouched')
+			return
+		end
 		vape:Load(nil, customProfile)
 		profileApplied = true
 		-- Persist the applied profile so a reinject before the first autosave tick still comes
@@ -200,12 +203,16 @@ local function finishLoading()
 			pcall(function() vape:Save() end)
 		end
 		-- Only now is autosaving safe, and only now is there a profile worth saving.
+		-- The rejection check repeats inside the wait as well as at the top: a key can be
+		-- revoked mid-session, and when that happens bedwars.lua switches every module off.
+		-- Catching the flag only once per cycle would leave up to ten seconds in which this
+		-- loop could persist that switched-off state over a good config.
 		task.spawn(function()
-			while vape.Loaded do
+			while vape.Loaded and not shared.PistonwareSessionRejected do
 				vape:Save()
 				for _ = 1, 10 do
 					task.wait(1)
-					if not vape.Loaded then break end
+					if not vape.Loaded or shared.PistonwareSessionRejected then break end
 				end
 			end
 		end)
@@ -391,6 +398,10 @@ if not shared.VapeIndependent then
 		-- from the previous injection would tell waitForModules the payload had already finished
 		-- before it had even started re-registering.
 		shared.PistonwareBedwarsLoaded = nil
+		-- Same reasoning for the refusal flag: bedwars.lua sets it from a fresh verdict every
+		-- run, but a game script that never sets it at all (the lobby) would otherwise inherit
+		-- a true left behind by a revoked BedWars session and refuse to save profiles there.
+		shared.PistonwareSessionRejected = nil
 
 		-- Re-publish the key immediately before the game script runs. LuaArmor blanks the global
 		-- script_key once it has authenticated, so it is single-use per session and any later
