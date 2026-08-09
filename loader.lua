@@ -1267,36 +1267,69 @@ do
 			if savedKey == '' then savedKey = nil end
 		end
 
-		-- A reinject carries the key it already validated, so the same key gets re-checked
-		-- instead of the user being asked for it again. Anything forged here just fails the
-		-- check below and lands on the prompt. Falls back to the copy on disk.
-		local candidate = shared.PistonwareKey
-		if type(candidate) == 'string' and trim(candidate) ~= '' then
-			candidate = trim(candidate)
-		else
-			candidate = savedKey
+		-- Three places a key can already be, tried in this order:
+		--
+		--   1. a script_key global set in front of the loadstring. This is the snippet
+		--      LuaArmor's own bot hands people, so it has to work -- and it is the most
+		--      explicit statement of intent there is: pasting a key means use THAT key.
+		--   2. shared.PistonwareKey, the copy a reinject carries so the user is not asked
+		--      again for a key that was validated seconds ago.
+		--   3. pistonwarekey.json.
+		--
+		-- Every one is tried until one validates, rather than committing to the first that
+		-- exists. That matters for the new source: a mistyped key pasted in front of the
+		-- loadstring should fall back to the good key on disk, not force the prompt and make
+		-- the user think their saved key had gone.
+		--
+		-- None of these are trusted. They are candidates, and LuaArmor decides.
+		local candidates, seen = {}, {}
+		local function offer(value)
+			if type(value) ~= 'string' then return end
+			value = trim(value)
+			if value == '' or seen[value] then return end
+			seen[value] = true
+			table.insert(candidates, value)
 		end
 
-		if candidate then
+		-- Executors disagree about where a chunk's globals live, so a key the user set before
+		-- the loadstring can land in any of these three tables -- the same divergence that
+		-- made authenticate() write all three.
+		for _, src in {
+			function() return script_key end,
+			function() return getgenv().script_key end,
+			function() return _G.script_key end
+		} do
+			local ok, value = pcall(src)
+			if ok then offer(value) end
+		end
+		offer(shared.PistonwareKey)
+		offer(savedKey)
+
+		for _, candidate in candidates do
 			local status = checkKey(candidate)
 			local code = status.code
-			-- Only a key that came off disk is deleted on rejection: a bogus session key must
-			-- not be able to destroy the good one the user has saved.
+			-- Only the key that came off disk is deleted on rejection: a bogus preset or
+			-- session key must not be able to destroy the good one the user has saved.
 			local fromDisk = candidate == savedKey
 			if code == 'KEY_VALID' then
 				authenticate(candidate)
+				-- Persist whatever just worked. This is what makes LuaArmor's snippet behave
+				-- the way people expect: paste it once, the key lands in pistonwarekey.json,
+				-- and every run after that needs no key in front of the loadstring at all.
+				if candidate ~= savedKey then saveKey(candidate) end
+				break
 			elseif code == 'KEY_EXPIRED' then
 				if fromDisk then deleteSavedKey() end
-				reason = t('saved_expired')
+				reason = fromDisk and t('saved_expired') or t('expired')
 			elseif code == 'KEY_HWID_LOCKED' then
 				if fromDisk then deleteSavedKey() end
-				reason = t('saved_hwid')
+				reason = fromDisk and t('saved_hwid') or t('hwid_locked')
 			elseif code == 'KEY_INCORRECT' then
 				if fromDisk then deleteSavedKey() end
-				reason = t('saved_incorrect')
+				reason = fromDisk and t('saved_incorrect') or t('incorrect')
 			elseif code == 'KEY_BANNED' then
 				if fromDisk then deleteSavedKey() end
-				reason = t('saved_banned')
+				reason = fromDisk and t('saved_banned') or t('banned')
 			end
 			-- UNKNOWN_ERROR / SECURITY_ERROR and friends deliberately keep the file: the key is
 			-- probably fine and LuaArmor (or the network) is not, so a bad minute must not cost
