@@ -78,6 +78,46 @@ local TrapDisabler
 local AntiFallPart
 local bedwars, remotes, sides, oldinvrender, oldSwing = {}, {}, {}
 
+-- Resolves a player's active enchant to its icon. Enchants replicate as
+-- StatusEffect_<type> attributes on the character (with a matching _stacks
+-- attribute that is skipped), so the type has to be run back through
+-- StatusEffectMeta and stripped of its _1/_2/_3 level suffix before EnchantMeta
+-- will recognise it. Indexed rather than precomputed because the set changes
+-- constantly mid-fight.
+--
+-- Has to sit BELOW the `local bedwars` declaration above, not up with the rest of
+-- `store`. A local is only in scope for code that comes after it, so from up there
+-- these `bedwars` references compiled against the (never-assigned) global instead of
+-- capturing the local as an upvalue -- the file assigns the local later, which this
+-- closure would never have seen. Deferring the call didn't help; it was scope, not
+-- timing.
+store.enchants = setmetatable({}, {
+	__index = function(self, plr)
+		return {
+			async = function()
+				if plr and plr.Character then
+					for i in plr.Character:GetAttributes() do
+						if i:find('StatusEffect_') and not i:find('_stacks') then
+							local name = bedwars.StatusEffectMeta[({i:gsub('StatusEffect_', '')})[1]]
+							if bedwars.StatusEffectMeta[name] then
+								name = bedwars.StatusEffectMeta[name]
+								for num = 1, 3 do
+									name = name:gsub(`_{num}`, '')
+								end
+
+								if bedwars.EnchantMeta[name] then
+									return bedwars.EnchantMeta[name].image
+								end
+							end
+						end
+					end
+				end
+				return nil
+			end,
+		}
+	end
+})
+
 local function addBlur(parent)
 	local blur = Instance.new('ImageLabel')
 	blur.Name = 'Blur'
@@ -698,7 +738,6 @@ local genv = getgenv()
 -- hasn't already set it. Add new flags here instead of another line below.
 -- (== nil, not `or`, so a stored `false` is never clobbered back to default.)
 for key, default in pairs({
-	AntiLagbackDelayFactor   = 1,
 	IsLongJumping            = false,
 	LongJumpFireballThrown   = false,
 	ItemOwner                = "none",
@@ -920,6 +959,7 @@ run(function()
 		DamageIndicator = Knit.Controllers.DamageIndicatorController.spawnDamageIndicator,
 		DefaultKillEffect = require(lplr.PlayerScripts.TS.controllers.global.locker["kill-effect"].effects['default-kill-effect']),
 		EmoteType = require(replicatedStorage.TS.locker.emote['emote-type']).EmoteType,
+		EnchantMeta = require(replicatedStorage.TS.enchant['enchant-meta']).EnchantMeta,
 		GameAnimationUtil = require(replicatedStorage.TS.animation['animation-util']).GameAnimationUtil,
 		getIcon = function(item, showinv)
 			local itemmeta = bedwars.ItemMeta[item.itemType]
@@ -2832,6 +2872,7 @@ run(function()
 	local Distance
 	local Equipment
 	local Rank
+	local Enchant
 	local Device
 	local DrawingToggle
 	local Scale
@@ -2870,12 +2911,31 @@ run(function()
 		return meta and meta.image or nil
 	end
 
-	-- the icon rides the right edge of the text, so everywhere that re-measures the tag has
-	-- to move it as well
-	local function positionRankIcon(nametag, width)
-		local icon = nametag:FindFirstChild('RankIcon')
-		if icon then
-			icon.Position = UDim2.fromOffset(width + 10, -4)
+	-- the icons ride the right edge of the text, so everywhere that re-measures the tag has
+	-- to move them as well. They pack outward from the end of the text in list order,
+	-- and a slot is consumed only by an icon that is actually SHOWING something.
+	--
+	-- Existence isn't enough: both icons get created up front whenever their toggle is
+	-- on, and start blank -- rank until the async fetch lands (or forever, if the player
+	-- is unranked), enchant whenever nothing is currently applied. A blank one used to
+	-- hold its slot, which is what left the hole. Skipping it means an enchant-only
+	-- player draws exactly where a rank icon would have gone, a rank-only player is
+	-- unaffected, and with both showing they sit flush against each other -- the same
+	-- 30px step the equipment row above uses, so the two rows line up.
+	local ICON_SIZE = 30
+	local rightIcons = {'RankIcon', 'EnchantIcon'}
+	local function positionIcons(nametag, width)
+		local offset = width + 10
+		for _, name in rightIcons do
+			local icon = nametag:FindFirstChild(name)
+			if icon then
+				local shown = icon.Image ~= ''
+				icon.Visible = shown
+				if shown then
+					icon.Position = UDim2.fromOffset(offset, -4)
+					offset += ICON_SIZE
+				end
+			end
 		end
 	end
 
@@ -2891,6 +2951,46 @@ run(function()
 				controller:getRanks({plr.UserId}, true):andThen(function()
 					if refreshTag then refreshTag(ent) end
 				end)
+			end)
+		end)
+	end
+
+	-- The guards are kept without the logging: every step of the chain
+	-- (store.enchants -> StatusEffectMeta -> EnchantMeta) throws on a nil table rather
+	-- than returning nil, so a missing piece has to fall out as a blank icon instead of
+	-- an error escaping into the tag build.
+	local function getEnchantImage(plr)
+		if not plr then return nil end
+		if not (store.enchants and bedwars.EnchantMeta) then return nil end
+		local suc, res = pcall(function()
+			return store.enchants[plr].async()
+		end)
+		return suc and res or nil
+	end
+
+	-- Enchants come and go as StatusEffect_* attributes on the character, several times
+	-- over a fight, and far more often than EntityUpdated fires -- so the icon gets its
+	-- own watcher rather than riding the health/equipment refresh and showing a stale
+	-- enchant in between. Keyed by entity and torn down with the tag.
+	local enchantConns = {}
+
+	local function unwatchEnchant(ent)
+		local conn = enchantConns[ent]
+		if conn then
+			pcall(function() conn:Disconnect() end)
+			enchantConns[ent] = nil
+		end
+	end
+
+	local function watchEnchant(ent)
+		unwatchEnchant(ent)
+		local char = ent.Character
+		if not char then return end
+		pcall(function()
+			enchantConns[ent] = char.AttributeChanged:Connect(function(attribute)
+				if attribute:find('StatusEffect_') and refreshTag then
+					refreshTag(ent)
+				end
 			end)
 		end)
 	end
@@ -2975,17 +3075,34 @@ run(function()
 				-- Rank Icon: sits immediately to the right of the text, so it has to be
 				-- built after the text has been measured
 				if Rank.Enabled and ent.Player then
+					-- no Position here: positionIcons below owns the layout, and setting
+					-- one now would flash the icon at a slot it may not end up in
 					local Icon = Instance.new('ImageLabel')
 					Icon.Name = 'RankIcon'
-					Icon.Size = UDim2.fromOffset(30, 30)
-					Icon.Position = UDim2.fromOffset(size.X + 10, -4)
+					Icon.Size = UDim2.fromOffset(ICON_SIZE, ICON_SIZE)
 					Icon.BackgroundTransparency = 1
 					Icon.Image = getRankImage(ent.Player) or ''
+					Icon.Visible = false
 					Icon.Parent = nametag
 					if Icon.Image == '' then
 						requestRank(ent.Player, ent)
 					end
 				end
+
+				if Enchant.Enabled and ent.Player then
+					local Icon = Instance.new('ImageLabel')
+					Icon.Name = 'EnchantIcon'
+					Icon.Size = UDim2.fromOffset(ICON_SIZE, ICON_SIZE)
+					Icon.BackgroundTransparency = 1
+					Icon.Image = getEnchantImage(ent.Player) or ''
+					Icon.Visible = false
+					Icon.Parent = nametag
+					watchEnchant(ent)
+				end
+
+				-- after both right-side icons exist, so each lands at its own slot
+				positionIcons(nametag, size.X)
+
 				nametag.AnchorPoint = Vector2.new(0.5, 1)
 				nametag.BackgroundColor3 = Color3.new()
 				nametag.BackgroundTransparency = Background.Value
@@ -3045,6 +3162,7 @@ run(function()
 	local Removed = {
 		Normal = function(ent)
 			pcall(function()
+				unwatchEnchant(ent)
 				local v = Reference[ent]
 				if v then
 					Reference[ent] = nil
@@ -3056,6 +3174,9 @@ run(function()
 		end,
 		Drawing = function(ent)
 			pcall(function()
+				-- the Drawing path never creates the watcher, but Removed runs for
+				-- entities whose tag was built under the other method too
+				unwatchEnchant(ent)
 				local v = Reference[ent]
 				if v then
 					Reference[ent] = nil
@@ -3117,9 +3238,16 @@ run(function()
 					end
 				end
 
+				if Enchant.Enabled and ent.Player then
+					local icon = nametag:FindFirstChild('EnchantIcon')
+					if icon then
+						icon.Image = getEnchantImage(ent.Player) or ''
+					end
+				end
+
 				local size = getfontsize(removeTags(Strings[ent]), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
 				nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
-				positionRankIcon(nametag, size.X)
+				positionIcons(nametag, size.X)
 				nametag.Text = Strings[ent]
 			end)
 		end,
@@ -3219,7 +3347,7 @@ run(function()
 							nametag.Text = string.format(Strings[ent], mag)
 							local ize = getfontsize(removeTags(nametag.Text), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
 							nametag.Size = UDim2.fromOffset(ize.X + 8, ize.Y + 7)
-							positionRankIcon(nametag, ize.X)
+							positionIcons(nametag, ize.X)
 							Sizes[ent] = mag
 						end
 					end
@@ -3330,6 +3458,11 @@ run(function()
 						Removed[methodused](i)
 					end
 				end
+				-- the loop above only reaches entities that still have a tag; sweep the
+				-- rest so no attribute listener outlives the module
+				for ent in enchantConns do
+					unwatchEnchant(ent)
+				end
 			end
 		end,
 		Tooltip = 'Renders nametags on entities through walls.'
@@ -3423,6 +3556,16 @@ run(function()
 			end
 		end,
 		Tooltip = 'Shows the ranked division icon above the nametag'
+	})
+	Enchant = NameTags:CreateToggle({
+		Name = 'Show Enchant',
+		Function = function()
+			if NameTags.Enabled then
+				NameTags:Toggle()
+				NameTags:Toggle()
+			end
+		end,
+		Tooltip = 'Shows the player\'s active enchant icon above the nametag (Drawing mode has no icons)'
 	})
 	Device = NameTags:CreateToggle({
 		Name = 'Show Device',
@@ -7556,39 +7699,72 @@ shared.bedwars = {
 -- protected build; LuaArmor hosts the build itself and serves the current one on every request,
 -- which is what keeps security updates and Heartbeat live.
 --
--- It is never written to disk and never read from disk. This is the one file whose integrity
--- the whole key system rests on, so it does not get the caching, the commit tracking or the
--- developer-mode escape hatch that every other file in the project has -- each of those turned
--- out to be a way to get a local file executed in its place. See downloadBedwars.
+-- It is never written to disk and, outside developer mode, never read from disk. This is the
+-- one file whose integrity the key system rests on, so it gets neither the caching nor the
+-- commit tracking that every other file in the project has -- both turned out to be ways to get
+-- a tampered local file executed in its place. See downloadBedwars for why the developer hatch
+-- is the one exception and why it no longer costs anything.
 --
 -- The payload validates the global script_key server-side on execution. The loader's key gate
 -- is what sets it; nothing here can substitute for it.
 
 --[[
-    Fetches the payload redirect from GitLab. It is NEVER cached, NEVER read from disk, and
-    developer mode does not apply to it.
+    Fetches the payload redirect from GitLab. Outside developer mode it is NEVER cached and
+    NEVER read from disk.
 
-    This is the one file in the project that protection depends on, and every convenience that
-    made sense for the others turned out to be a bypass for this one:
+    This is the file protection depends on, and two conveniences that made sense everywhere else
+    turned out to be bypasses here:
 
-      * It used to honour shared.PistonwareDeveloper and return the local file untouched,
-        without making a request at all. The published loader ships plaintext, so anyone can
-        edit it to set that flag -- and from then on pistonware would execute whatever sat at
-        pistonware/games/bedwars.lua forever. A dumped or rewritten payload, run unkeyed, with
-        no network request that could ever notice.
-      * Even with the flag off, a cached copy whose recorded commit sha still matched was
-        returned as-is. Editing the file did not change the sha, so a tampered cache survived
-        every update check.
+      * A cached copy whose recorded commit sha still matched was returned as-is. Editing the
+        file did not change the sha, so a tampered cache survived every update check.
+      * Honouring shared.PistonwareDeveloper returned the local file without making a request at
+        all -- which, before the payload validated its own key, meant a dumped or rewritten
+        bedwars.lua could run unkeyed forever.
 
-    Fetching fresh removes both. There is also no offline fallback on purpose: what lives on
-    GitLab is a ~220 byte redirect to LuaArmor, and running it needs LuaArmor reachable anyway,
-    so a cached copy could not have helped a genuinely offline user -- it could only have helped
-    someone who wanted a local file executed instead of the real one.
+    The cache is gone for good. The developer hatch is back, because the second problem was
+    never really about where the source came from -- it was about the source not being checked.
+    Now that it checks itself, see downloadBedwars.
+
+    There is no offline fallback, on purpose: what lives on GitLab is a ~220 byte redirect to
+    LuaArmor, and running it needs LuaArmor reachable anyway, so a cached copy could not have
+    helped a genuinely offline user -- only someone who wanted a local file executed instead of
+    the real one.
 
     Cheap, too: one small request, and dropping the cache also dropped the commit-check round
     trip that used to precede it.
 ]]
 local function downloadBedwars()
+    -- Developer mode runs the local file instead of fetching. This hatch was removed and is
+    -- now back, and the reason it is safe this time is specific, so it is worth stating:
+    --
+    -- It was removed because a local payload meant ZERO contact with LuaArmor. The published
+    -- loader ships plaintext, so anyone could set the developer flag, drop any bedwars.lua at
+    -- this path, and have pistonware execute it forever -- unkeyed, with no request that could
+    -- ever notice.
+    --
+    -- It is back because bedwars.lua now validates its own key (the session block at the top
+    -- of it). The genuine source contacts LuaArmor whether it was loaded from disk or off the
+    -- network, so loading it locally no longer grants an unkeyed session -- the file refuses by
+    -- itself. What the hatch still helps is someone running a payload they have already dumped
+    -- and stripped, and for them it is a convenience rather than a capability: anyone holding a
+    -- working stripped payload has no need of this loader to run it.
+    --
+    -- PUBLIC_BUILD nulls shared.PistonwareDeveloper and locks it behind a metatable, so this
+    -- branch is unreachable from the published loader unless that loader is itself edited.
+    if shared.PistonwareDeveloper then
+        local suc, res = pcall(function()
+            if not isfile('pistonware/games/bedwars.lua') then return nil end
+            return readfile('pistonware/games/bedwars.lua')
+        end)
+        if suc and res and res ~= '' and loadstring(res) ~= nil then
+            warn('[pistonware] developer mode: running local games/bedwars.lua (not the published build)')
+            return res
+        end
+        -- Falls through to the network rather than failing: a developer with no local copy, or
+        -- one that does not compile, still wants a working script.
+        warn('[pistonware] developer mode: no usable local games/bedwars.lua -- using the published build')
+    end
+
     for attempt = 1, 4 do
         local suc, res = pcall(function()
             return game:HttpGet('https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua', true)
