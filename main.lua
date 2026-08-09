@@ -1,3 +1,9 @@
+-- The loader is the only supported entry point: it runs the LuaArmor key gate and publishes
+-- script_key (which the protected bedwars.lua reads) before any of this downloads or executes.
+-- main.lua is re-run directly in two places -- the queued teleport script below, and the GUI's
+-- reinject buttons -- and both re-establish that state first, so reaching here without it means
+-- the gate was skipped. Checked before the uninject below, so a failed check cannot tear down a
+-- working instance on its way out.
 if not shared.PistonwareAuthenticated then
 	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
 	return
@@ -218,16 +224,6 @@ local function finishLoading()
 		end)
 	end
 
-	-- A protected payload never hands control back: LuaArmor's VM keeps the thread it was
-	-- invoked on, so for BedWars gameScriptFinished never flips and waiting on it would mean
-	-- never loading a profile at all.
-	--
-	-- What IS observable is the side effect -- modules appearing in vape.Modules. Once that
-	-- count has held steady for a few seconds, everything that is going to register has
-	-- registered, and the profile can be applied once against the complete set. Quiescence is a
-	-- heuristic, but it is the only completion signal a payload that never returns can give us,
-	-- and it degrades safely: worst case a late module misses its settings, which is what
-	-- happened before any of this existed.
 	-- Waits until the game script has finished registering its modules, because the profile can
 	-- only be applied to modules that exist.
 	--
