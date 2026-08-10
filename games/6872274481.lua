@@ -4235,7 +4235,12 @@ run(function()
 	local Range
 	local Network
 	local Lower
-	
+	local Delay
+	-- Item drop -> the tick() at which another request for it is allowed. Weak keys so drops
+	-- that get picked up or destroyed fall out on their own rather than piling up for the
+	-- round; cleared on disable regardless.
+	local pickups = setmetatable({}, {__mode = 'k'})
+
 	PickupRange = vape.Categories.Utility:CreateModule({
 		Name = 'PickupRange',
 		Function = function(callback)
@@ -4252,6 +4257,19 @@ run(function()
 							
 							if (localPosition - v.Position).Magnitude <= Range.Value then
 								if Lower.Enabled and (localPosition.Y - v.Position.Y) < (entitylib.character.HipHeight - 1) then continue end
+
+								-- One request per drop per Delay, rather than one per pass.
+								-- This loop runs at 10hz and had nothing holding it back, so
+								-- it re-asked for every drop in range until the server got
+								-- round to removing it -- three items on the floor is already
+								-- 1800 calls a minute against the 299 the server's rate
+								-- limiter allows. AntiBanwave mirrors that budget and drops
+								-- the overflow, which is why pickups died with it enabled.
+								-- The first sighting is still instant: an unseen drop has no
+								-- entry here, so it goes out on the pass that spots it.
+								if (pickups[v] or 0) >= tick() then continue end
+								pickups[v] = tick() + Delay.Value
+
 								task.spawn(function()
 									bedwars.Client:Get(remotes.PickupItem):CallServerAsync({
 										itemDrop = v
@@ -4273,6 +4291,8 @@ run(function()
 					end
 					task.wait(0.1)
 				until not PickupRange.Enabled
+			else
+				table.clear(pickups)
 			end
 		end,
 		Tooltip = 'Picks up items from a farther distance'
@@ -4285,6 +4305,15 @@ run(function()
 		Suffix = function(val) 
 			return val == 1 and 'stud' or 'studs' 
 		end
+	})
+	Delay = PickupRange:CreateSlider({
+		Name = 'Delay',
+		Min = 0.2,
+		Max = 5,
+		Default = 1,
+		Decimal = 10,
+		Suffix = function(val) return 's' end,
+		Tooltip = 'How long before the same drop is requested again.\nOnly applies to retries -- a drop is always requested\nthe moment it is spotted. Lower it and a floor full of\nitems can outrun the 299/min the server allows.'
 	})
 	Network = PickupRange:CreateToggle({
 		Name = 'Network TP',
@@ -4805,27 +4834,44 @@ run(function()
 	local Range
 	local Open
 	local Skywars
+	local Delay
 	local Delays = {}
 	
 	local function lootChest(chest)
 		chest = chest and chest.Value or nil
-		local chestitems = chest and chest:GetChildren() or {}
-		if #chestitems > 1 and (Delays[chest] or 0) < tick() then
-			Delays[chest] = tick() + 0.2
-			bedwars.Client:GetNamespace('Inventory'):Get('SetObservedChest'):SendToServer(chest)
-	
-			for _, v in chestitems do
-				if v:IsA('Accessory') then
-					task.spawn(function()
-						pcall(function()
-							bedwars.Client:GetNamespace('Inventory'):Get('ChestGetItem'):CallServer(chest, v)
-						end)
-					end)
-				end
+		if not chest or (Delays[chest] or 0) >= tick() then return end
+
+		-- Counts what can actually be taken rather than what is in there. The gate used to
+		-- be #GetChildren() > 1, but only Accessories are ever pulled -- so a chest holding
+		-- anything else, or armour a ChestGetItem keeps failing on, never emptied and this
+		-- kept firing at it for the rest of the round.
+		local accessories = {}
+		for _, v in chest:GetChildren() do
+			if v:IsA('Accessory') then
+				table.insert(accessories, v)
 			end
-	
-			bedwars.Client:GetNamespace('Inventory'):Get('SetObservedChest'):SendToServer(nil)
 		end
+		if #accessories == 0 then return end
+
+		-- Two SetObservedChest calls go out per pass, so the old fixed 0.2s was 600 calls a
+		-- minute off a single chest in range -- against the 299 the server's rate limiter
+		-- allows, and doubling with every extra chest. AntiBanwave mirrors that budget and
+		-- swallows the overflow (going over is a rate_limit_exceeded detection, and the
+		-- server discards the calls either way), which is what looked like chest looting
+		-- breaking partway through a round. Slider so a chest-dense skywars map can be given
+		-- more room; the accessory gate above is what keeps the steady-state cost at zero.
+		Delays[chest] = tick() + Delay.Value
+		bedwars.Client:GetNamespace('Inventory'):Get('SetObservedChest'):SendToServer(chest)
+
+		for _, v in accessories do
+			task.spawn(function()
+				pcall(function()
+					bedwars.Client:GetNamespace('Inventory'):Get('ChestGetItem'):CallServer(chest, v)
+				end)
+			end)
+		end
+
+		bedwars.Client:GetNamespace('Inventory'):Get('SetObservedChest'):SendToServer(nil)
 	end
 	
 	ChestSteal = vape.Categories.World:CreateModule({
@@ -4853,6 +4899,10 @@ run(function()
 						task.wait(0.1)
 					until not ChestSteal.Enabled
 				end
+			else
+				-- Keyed by chest folder, which is destroyed with the chest -- without this
+				-- the table holds a reference to every chest looted this session.
+				table.clear(Delays)
 			end
 		end,
 		Tooltip = 'Grabs items from near chests.'
@@ -4865,6 +4915,15 @@ run(function()
 		Suffix = function(val)
 			return val == 1 and 'stud' or 'studs'
 		end
+	})
+	Delay = ChestSteal:CreateSlider({
+		Name = 'Delay',
+		Min = 0.2,
+		Max = 3,
+		Default = 0.5,
+		Decimal = 10,
+		Suffix = function(val) return 's' end,
+		Tooltip = 'How long before the same chest is tried again.\nRaise it if looting stops partway through a round --\ntwo remotes go out per pass against a 299/min budget.'
 	})
 	Open = ChestSteal:CreateToggle({Name = 'GUI Check'})
 	Skywars = ChestSteal:CreateToggle({
