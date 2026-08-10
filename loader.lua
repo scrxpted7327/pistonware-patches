@@ -51,8 +51,8 @@ local HELP_URL    = 'https://discord.gg/pistonware'
 
 local Strings = {
 	enter_key       = 'Enter your key below to continue.',
-	saved_expired   = 'Saved key expired - grab a new one below.',
-	saved_hwid      = 'Saved key is locked to another device.',
+	saved_expired   = 'Your key expired - renew it, then run again. It is still saved.',
+	saved_hwid      = 'Your key is linked to another device - reset your HWID, then run again. The key itself is still good and is still saved.',
 	saved_incorrect = 'Saved key no longer exists - get a new one.',
 	saved_banned    = 'Saved key is blacklisted.',
 	placeholder     = 'Paste your key here',
@@ -64,8 +64,10 @@ local Strings = {
 	bad_format      = "That doesn't look like a valid key.",
 	checking        = 'Checking key...',
 	valid_loading   = 'Key valid%s - loading...',
-	hwid_locked     = 'Key is locked to another device - reset your HWID via the bot.',
-	expired         = 'Key expired - grab a new one.',
+	hwid_locked     = 'That key is linked to another device - reset your HWID via the bot, then submit it again.',
+	expired         = 'That key has expired - renew it, then submit it again.',
+	time_left       = '%s left',
+	lifetime        = 'lifetime',
 	banned          = 'Key is blacklisted.',
 	incorrect       = 'Key is incorrect or has been deleted.',
 	invalid_format  = 'Invalid key format.',
@@ -87,6 +89,44 @@ local function t(key, ...)
 		return string.format(s, ...)
 	end
 	return s
+end
+
+-- Coarse on purpose: '3 days' is what someone needs to know, and '3 days 4 hours 12 minutes'
+-- is noise in a one-line status. Rounds down, so it never promises time that is not there.
+local function formatDuration(seconds)
+	if seconds <= 0 then return nil end
+	local days = math.floor(seconds / 86400)
+	if days >= 1 then return days..(days == 1 and ' day' or ' days') end
+	local hours = math.floor(seconds / 3600)
+	if hours >= 1 then return hours..(hours == 1 and ' hour' or ' hours') end
+	local minutes = math.max(1, math.floor(seconds / 60))
+	return minutes..(minutes == 1 and ' minute' or ' minutes')
+end
+
+-- The parenthesised detail after 'Key valid', built from the fields LuaArmor only returns on
+-- KEY_VALID: the seller note, and auth_expire (a unix timestamp, with -1 or 0 meaning a
+-- lifetime key). Showing what is left matters because the complaint this addresses is people
+-- believing a key had died when it had days on it -- if the remaining time is on screen every
+-- run, that confusion has nowhere to start.
+local function keyDetail(status)
+	local data = type(status) == 'table' and type(status.data) == 'table' and status.data or nil
+	if not data then return '' end
+
+	local parts = {}
+	if data.note ~= nil and tostring(data.note) ~= '' then
+		table.insert(parts, tostring(data.note))
+	end
+
+	local expire = tonumber(data.auth_expire)
+	if expire == -1 or expire == 0 then
+		table.insert(parts, t('lifetime'))
+	elseif expire then
+		local left = formatDuration(expire - os.time())
+		if left then table.insert(parts, t('time_left', left)) end
+	end
+
+	if #parts == 0 then return '' end
+	return ' ('..table.concat(parts, ', ')..')'
 end
 
 local function trim(s)
@@ -1318,11 +1358,25 @@ do
 				-- and every run after that needs no key in front of the loadstring at all.
 				if candidate ~= savedKey then saveKey(candidate) end
 				break
+			-- Only a key that CANNOT come back is deleted. Two of these four states used to
+			-- delete it and should never have:
+			--
+			--   KEY_HWID_LOCKED is not a bad key. LuaArmor's own wording is "key is valid, hwid
+			--   does not match and needs to be reset". The user resets their HWID via the bot,
+			--   comes back, and it works -- except that we had already thrown the key away, so
+			--   instead they came back to an empty prompt and had to go find the key again.
+			--   That is the bug this fixes: a key with time left on it, in the ordinary waiting
+			--   state, being treated as though it had died.
+			--
+			--   KEY_EXPIRED is renewable. The ad link renews the same key rather than issuing a
+			--   different one, so deleting it costs the user a re-paste for no gain.
+			--
+			-- KEY_INCORRECT (does not exist in the database) and KEY_BANNED (blacklisted) are
+			-- the genuinely terminal ones. Nothing the user does brings those back, so a stale
+			-- file only means a wasted request on every future run.
 			elseif code == 'KEY_EXPIRED' then
-				if fromDisk then deleteSavedKey() end
 				reason = fromDisk and t('saved_expired') or t('expired')
 			elseif code == 'KEY_HWID_LOCKED' then
-				if fromDisk then deleteSavedKey() end
 				reason = fromDisk and t('saved_hwid') or t('hwid_locked')
 			elseif code == 'KEY_INCORRECT' then
 				if fromDisk then deleteSavedKey() end
@@ -1331,9 +1385,10 @@ do
 				if fromDisk then deleteSavedKey() end
 				reason = fromDisk and t('saved_banned') or t('banned')
 			end
-			-- UNKNOWN_ERROR / SECURITY_ERROR and friends deliberately keep the file: the key is
-			-- probably fine and LuaArmor (or the network) is not, so a bad minute must not cost
-			-- the user the key they already earned. They just get prompted this once.
+			-- UNKNOWN_ERROR / SECURITY_ERROR / TIME_ERROR / INVALID_EXECUTOR and friends also
+			-- keep the file, for the same reason: the key is probably fine and LuaArmor (or the
+			-- network, or the executor) is not, so a bad minute must not cost the user the key
+			-- they already earned. They just get prompted this once.
 		end
 
 		if not shared.PistonwareAuthenticated then
@@ -1391,11 +1446,7 @@ do
 					local code = status.code
 					if code == 'KEY_VALID' then
 						saveKey(key)
-						local extra = ''
-						if type(status.data) == 'table' and status.data.note then
-							extra = ' ('..tostring(status.data.note)..')'
-						end
-						say(t('valid_loading', extra), 'ok')
+						say(t('valid_loading', keyDetail(status)), 'ok')
 						authenticate(key)
 						return true
 					elseif code == 'KEY_HWID_LOCKED' then
