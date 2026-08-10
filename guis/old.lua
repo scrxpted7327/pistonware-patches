@@ -1857,6 +1857,9 @@ function mainapi:CreateBar()
 		buttontext.Parent = buttonbkg
 
 		function optionapi:SetBind(tab, mouse)
+			-- `#tab` errors on a nil, which is what Load hands over when the saved GUI state
+			-- has no Keybind -- leaving a built menu with no key that opens it.
+			if type(tab) ~= 'table' then tab = mainapi.Keybind end
 			mainapi.Keybind = #tab <= 0 and mainapi.Keybind or table.clone(tab)
 			self.Bind = mainapi.Keybind
 			if mainapi.VapeButton then
@@ -3107,7 +3110,9 @@ function mainapi:Load(skipgui, profile)
 		end
 
 		if not skipgui then
-			self.Keybind = guidata.Keybind
+			-- `or self.Keybind` so a gui.txt with no Keybind in it cannot wipe the default
+			-- set at the top of this file and leave the menu unopenable.
+			self.Keybind = guidata.Keybind or self.Keybind
 			for i, v in guidata.Categories do
 				local object = self.Categories[i]
 				if not object then continue end
