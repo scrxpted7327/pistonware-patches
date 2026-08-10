@@ -1167,6 +1167,12 @@ components = {
 			Type = 'Slider',
 			Value = optionsettings.Default or optionsettings.Min,
 			Max = optionsettings.Max,
+			-- Exposed alongside Max so callers driving a slider through SetValue can
+			-- work out its grid and fill position without hardcoding either. Decimal
+			-- is a MULTIPLIER (see the drag handler below: floor(value * Decimal) /
+			-- Decimal), so 1000 is three places and 10000 is four.
+			Min = optionsettings.Min,
+			Decimal = optionsettings.Decimal or 1,
 			Index = getTableSize(api.Options)
 		}
 		
@@ -1247,17 +1253,28 @@ components = {
 		optionsettings.Function = optionsettings.Function or function() end
 		optionsettings.Decimal = optionsettings.Decimal or 1
 		
+		-- Fill position for an arbitrary value, normalised over the slider's own range.
+		-- SetValue's fallback when pos is nil is `value / Max`, which is only correct
+		-- for a slider whose Min is 0 -- everything else renders the handle somewhere
+		-- unrelated to the number it is displaying. Values outside [Min, Max] are fine:
+		-- SetValue clamps the visual to [0.04, 0.96] on its own, so an out-of-range
+		-- value simply pins the bar to one end while keeping its real number.
+		local function fillPosition(value)
+			local span = optionsettings.Max - optionsettings.Min
+			return span > 0 and (value - optionsettings.Min) / span or 0
+		end
+
 		function optionapi:Save(tab)
 			tab[optionsettings.Name] = {
 				Value = self.Value,
 				Max = self.Max
 			}
 		end
-		
+
 		function optionapi:Load(tab)
 			local newval = tab.Value == tab.Max and tab.Max ~= self.Max and self.Max or tab.Value
 			if self.Value ~= newval then
-				self:SetValue(newval, nil, true)
+				self:SetValue(newval, fillPosition(newval), true)
 			end
 		end
 		
@@ -1333,13 +1350,25 @@ components = {
 			valuebutton.Visible = true
 			valuebox.Visible = false
 			if enter and tonumber(valuebox.Text) then
-				optionapi:SetValue(tonumber(valuebox.Text), nil, true)
+				-- Deliberately NOT clamped to [Min, Max] and NOT snapped to the Decimal
+				-- grid. The box is the escape hatch from both: typing is how you push a
+				-- slider past its Max (reach sliders, delays) or set a precision finer
+				-- than its Decimal allows, and dragging is already confined to the
+				-- range and the grid for anyone who wants that. A clamp here was
+				-- briefly added for "safety" and it silently removed the only way to
+				-- exceed a Max -- don't put it back.
+				--
+				-- The one thing that IS corrected is the fill position: passing nil
+				-- makes SetValue fall back to value / Max, which puts the handle in the
+				-- wrong place on any slider whose Min isn't 0.
+				local typed = tonumber(valuebox.Text)
+				optionapi:SetValue(typed, fillPosition(typed), true)
 			end
 		end)
-		
+
 		optionapi.Object = slider
 		api.Options[optionsettings.Name] = optionapi
-		
+
 		return optionapi
 	end,
 	Targets = function(optionsettings, children, api)
@@ -2641,6 +2670,11 @@ function mainapi:CreateGUI()
 		label.Parent = bind
 
 		function optionapi:SetBind(tab)
+			-- `#tab` errors outright on a nil, and this is reached with one whenever the
+			-- saved GUI state has no Keybind in it (see Load). That error lands after the
+			-- menu is built but before any bind is registered, so the GUI exists with no key
+			-- that opens it -- the script looks like it loaded fine and simply has no menu.
+			if type(tab) ~= 'table' then tab = mainapi.Keybind end
 			mainapi.Keybind = #tab <= 0 and mainapi.Keybind or table.clone(tab)
 			self.Bind = mainapi.Keybind
 			if mainapi.VapeButton then
@@ -5385,7 +5419,12 @@ function mainapi:Load(skipgui, profile)
 		end
 
 		if not skipgui then
-			self.Keybind = guidata.Keybind
+			-- `or self.Keybind` so a gui.txt without a Keybind cannot wipe the {'RightShift'}
+			-- default set at the top of this file. It reaches here as nil in two ordinary
+			-- cases -- the decode above failed and swapped in a bare {Categories = {}}, or
+			-- the file was written by a build/theme that never stored one -- and a nil here
+			-- used to leave the menu with no key that opens it.
+			self.Keybind = guidata.Keybind or self.Keybind
 			for i, v in guidata.Categories do
 				local object = self.Categories[i]
 				if not object then continue end
@@ -5681,7 +5720,7 @@ function mainapi:Uninject()
 	end
 
 	-- Deterministic safety net: getgenv() persists across uninject/reinject by design
-	-- (that's why AntiLagbackDelayFactor etc. live there instead of as plain locals),
+	-- (that's why ItemOwner etc. live there instead of as plain locals),
 	-- so any of these left in an "active" state -- because a module wasn't Enabled at
 	-- uninject time, or its own Toggle() above still failed -- would otherwise leak
 	-- into the next injection and make LongJump/ProjectileAura/Killaura/AutoPearl think
