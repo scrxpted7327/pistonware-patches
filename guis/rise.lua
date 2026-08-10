@@ -2318,7 +2318,9 @@ function mainapi:Load(skipgui, profile)
 		end
 
 		if not skipgui then
-			self.Keybind = guidata.Keybind
+			-- `or self.Keybind` so a gui.txt with no Keybind in it cannot wipe the default
+			-- set at the top of this file and leave the menu unopenable.
+			self.Keybind = guidata.Keybind or self.Keybind
 			for i, v in guidata.Categories do
 				local object = self.Categories[i]
 				if not object or object.Type ~= 'Overlay' and object.Type ~= 'CategoryTheme' then continue end
