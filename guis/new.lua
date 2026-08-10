@@ -336,9 +336,24 @@ end
 -- losing one icon. getcustomassets holds an uploaded rbxassetid for each of these paths --
 -- the same images mobile already runs on -- so falling back to it costs nothing visible.
 -- Covers a failed download too, which errors out of downloadFile the same way.
+-- What comes back is checked, not just whether the call threw. The pcall above only covers
+-- getcustomasset ERRORING; it does nothing about getcustomasset RETURNING something that is not
+-- a content URI, and several executors do exactly that -- handing back the raw filesystem path,
+-- a truncated string, or a partial result when the copy into the client content directory only
+-- half-succeeded. Assigning any of those to .Image throws 'ContentId formatting failed' at the
+-- assignment site, which is outside this pcall and outside every other pcall in this file, so a
+-- single bad icon took down the whole GUI chunk and surfaced as 'Injection failed: ContentId
+-- formatting failed' instead of as one missing image.
+--
+-- Rejecting a URI that would in fact have worked costs nothing: every path this file asks for
+-- has an uploaded id in getcustomassets, so the fallback is the same picture.
+local function usableAsset(value)
+	return type(value) == 'string' and value:match('^rbx%a*://') ~= nil
+end
 getcustomasset = not inputService.TouchEnabled and assetfunction and function(path)
 	local ok, res = pcall(downloadFile, path, assetfunction)
-	return (ok and res) or getcustomassets[path] or ''
+	if ok and usableAsset(res) then return res end
+	return getcustomassets[path] or ''
 end or function(path)
 	return getcustomassets[path] or ''
 end
