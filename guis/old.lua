@@ -3774,6 +3774,9 @@ do
 	-- reinject, so syncing and choosing stay one flow rather than two reloads.
 	local pending, syncmessage = false, nil
 	local refreshConfigButtons
+	-- Tracked because the recolour below runs on every rainbow tick and would otherwise
+	-- overwrite whatever MouseEnter/MouseLeave just set on the background.
+	local synchovered = false
 	local children = profilescategory.Object:FindFirstChild('Children')
 	local syncbutton = Instance.new('TextButton')
 	syncbutton.Name = 'SyncProfiles'
@@ -3806,9 +3809,11 @@ do
 	synctitle.Parent = syncbutton
 
 	syncbutton.MouseEnter:Connect(function()
+		synchovered = true
 		syncbkg.BackgroundColor3 = color.Dark(uipallet.Main, 0.14)
 	end)
 	syncbutton.MouseLeave:Connect(function()
+		synchovered = false
 		syncbkg.BackgroundColor3 = color.Dark(uipallet.Main, 0.05)
 	end)
 	syncbutton.MouseButton1Click:Connect(function()
@@ -3883,9 +3888,12 @@ do
 			button.BackgroundColor3 = selected and Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or color.Dark(uipallet.Main, 0.05)
 			button.TextColor3 = selected and mainapi:TextColor(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or uipallet.Text
 		end
-		-- The sync label takes the GUI colour, which is what makes it ride the rainbow with
-		-- everything else. Hover here only tints the background, so nothing contends for it.
-		synctitle.TextColor3 = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
+		-- The button takes the GUI colour, not its label -- the text keeps whatever the
+		-- constructor and the hover handlers give it. Skipped while hovered or mid-sync,
+		-- because hover owns the background then and a per-tick write would fight it.
+		if not (synchovered or syncing) then
+			syncbkg.BackgroundColor3 = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
+		end
 	end
 	mainapi.RecolorProfileCards = recolorProfileCards
 
