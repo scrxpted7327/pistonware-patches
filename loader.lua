@@ -1637,6 +1637,36 @@ if not firstRunProfiles and not declinedDownload and not isReload then
 		if console:IsAborted() then deleteInstall() return end
 		if ok and wantsSync == true then
 			console:SetLine('Syncing configs...')
+
+			-- Read BEFORE anything is overwritten. <GameId>.gui.txt holds `Profile` -- the
+			-- config currently equipped -- and the sync rewrites that file from the repo's
+			-- copy, whose Profile is whatever happened to be equipped when it was committed
+			-- ('blatant', in the version shipping today). mergeGuiState carries the local
+			-- value across, but on any decode failure it falls back to writing the incoming
+			-- file verbatim, and that fallback is exactly how someone on 'legit' or on a
+			-- config they made themselves comes back up on 'blatant'. Re-applying the name
+			-- below makes the equipped config survive the sync whether the merge held or not.
+			local lastProfile
+			pcall(function()
+				-- The live object first. SetProfile stamps a switch into gui.txt immediately,
+				-- so the file is normally current -- but this is read before the Uninject
+				-- below flushes in-memory state, and vape.Profile cannot be stale under any
+				-- ordering. On a fresh execution there is no object and the file is the only
+				-- source, which is the common case here.
+				local live = shared.vape and shared.vape.Profile
+				if type(live) == 'string' and live ~= '' then
+					lastProfile = live
+					return
+				end
+
+				local guipath = 'pistonware/profiles/'..game.GameId..'.gui.txt'
+				if not isfile(guipath) then return end
+				local guidata = cloneref(game:GetService('HttpService')):JSONDecode(readfile(guipath))
+				if type(guidata) == 'table' and type(guidata.Profile) == 'string' and guidata.Profile ~= '' then
+					lastProfile = guidata.Profile
+				end
+			end)
+
 			pcall(function()
 				-- If a previous instance is still injected, uninject it BEFORE overwriting:
 				-- Uninject() saves the old in-memory config to disk as its first step, and
@@ -1658,6 +1688,18 @@ if not firstRunProfiles and not declinedDownload and not isReload then
 				end
 			end)
 			if console:IsAborted() then deleteInstall() return end
+
+			-- Hand the equipped config back to the load that is about to happen. This covers
+			-- a config the user made themselves and 'legit' alike -- and 'blatant' and
+			-- 'default' too, since the shipped gui.txt names one of them and a user sitting
+			-- on either would otherwise be indistinguishable from one who got reset onto it.
+			-- finishLoading in main.lua treats this as a one-shot and clears it, so it steers
+			-- only the load that follows this sync and does not leak into later reinjects.
+			-- Left nil when gui.txt was unreadable, which keeps the old behaviour of letting
+			-- whatever ends up in gui.txt decide rather than inventing a profile here.
+			if lastProfile then
+				shared.VapeCustomProfile = lastProfile
+			end
 		end
 		-- On "No"/timeout the stored commit stays stale, so the prompt returns next session
 		-- until the user agrees to sync once.
