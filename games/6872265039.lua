@@ -61,6 +61,10 @@ run(function()
 	end)
 end)
 
+for _, v in {'AntiRagdoll', 'TriggerBot', 'SilentAim', 'AutoRejoin', 'Rejoin', 'Disabler', 'Timer', 'ServerHop', 'MouseTP', 'MurderMystery', 'Swim', 'Jesus', 'Invisible', 'Desync', 'Waypoints', 'PlayerModel', 'Schematica'} do
+	vape:Remove(v)
+end
+
 for _, v in vape.Modules do
 	if v.Category == 'Combat' or v.Category == 'Minigames' then
 		vape:Remove(i)
