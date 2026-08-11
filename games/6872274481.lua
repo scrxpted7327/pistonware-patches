@@ -3,7 +3,20 @@ if not shared.PistonwareAuthenticated then
 	return
 end
 
-local run = function(func) if shared.VapeSmoothBoot then task.wait() end func() end
+-- Every module in this file and in bedwars.lua is registered inside one of these -- 60 blocks
+-- here, 59 there, all at top level, and bedwars.lua takes this same function through bw.run.
+-- Unprotected, an error anywhere in any of them aborted the rest of the file: every module
+-- below the failure never registered, and in bedwars.lua the completion signal on the last
+-- line never ran either, so main.lua sat in waitForModules for the full 120s before loading a
+-- profile against a half-built module set. One game update touching one API took the whole
+-- script down that way. Contained here, a bad block costs its own modules and nothing else.
+local run = function(func)
+	if shared.VapeSmoothBoot then task.wait() end
+	local ok, err = pcall(func)
+	if not ok then
+		warn('[pistonware] a module block failed to load: '..tostring(err))
+	end
+end
 
 local cloneref = cloneref or function(obj)
 	return obj
@@ -944,8 +957,20 @@ run(function()
 		task.wait()
 	until KnitInit
 
-	if not debug.getupvalue(Knit.Start, 1) then
-		repeat task.wait() until debug.getupvalue(Knit.Start, 1)
+	-- pcall'd, and with a deadline. Two separate hazards, both fatal here before the fix:
+	-- Knit.Start is nil if a game update reshapes Knit, and debug.getupvalue(nil, 1) THROWS --
+	-- which killed this block before the bedwars table on the next line was ever built, taking
+	-- every module in this file and bedwars.lua with it. And a Knit that loads but never
+	-- finishes starting parked this loop at frame rate for the rest of the session.
+	local knitDeadline = os.clock() + 60
+	while true do
+		local started, value = pcall(debug.getupvalue, Knit.Start, 1)
+		if started and value then break end
+		if os.clock() > knitDeadline then
+			warn('[pistonware] Knit did not finish starting within 60s -- loading anyway')
+			break
+		end
+		task.wait()
 	end
 
 	local Flamework = require(replicatedStorage['rbxts_include']['node_modules']['@flamework'].core.out).Flamework
@@ -4897,7 +4922,10 @@ run(function()
 		Function = function(callback)
 			if callback then
 				local chests = collection('chest', ChestSteal)
-				repeat task.wait() until store.queueType ~= 'bedwars_test'
+				-- The enabled check is the exit, not just the queue type: without it, toggling the
+				-- module back off inside a test queue left this spinning at frame rate forever.
+				repeat task.wait(0.1) until store.queueType ~= 'bedwars_test' or (not ChestSteal.Enabled)
+				if not ChestSteal.Enabled then return end
 				if (not Skywars.Enabled) or store.queueType:find('skywars') then
 					repeat
 						if entitylib.isAlive and store.matchState ~= 2 then
@@ -5412,7 +5440,8 @@ run(function()
 		Name = 'AutoBuy',
 		Function = function(callback)
 			if callback then
-				repeat task.wait(0.1) until store.queueType ~= 'bedwars_test'
+				repeat task.wait(0.1) until store.queueType ~= 'bedwars_test' or (not AutoBuy.Enabled)
+				if not AutoBuy.Enabled then return end
 				if BedwarsCheck.Enabled and not store.queueType:find('bedwars') then return end
 	
 				local lastupgrades
