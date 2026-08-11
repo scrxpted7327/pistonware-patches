@@ -916,6 +916,22 @@ local function safeGetProto(func, index)
     end
 end
 
+-- The `out` barrel re-exports sound-manager, but each of its re-exports is guarded by
+-- `or {}`, so a build where that submodule fails to resolve silently drops the key and
+-- leaves SoundManager nil -- which is how "attempt to index nil with 'playSound'" reached
+-- both SoundChanger and the projectile launch sound. Handing back a stub instead of nil is
+-- what fixes that: a dozen call sites across both files index this directly and none of
+-- them are worth taking down over a missing sound effect. Every method on the stub is a
+-- no-op, and SoundChanger's hook and restore still work against it.
+local function resolveSoundManager()
+    local ok, res = pcall(function()
+        return require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out).SoundManager
+    end)
+    if ok and res then return res end
+
+    return setmetatable({}, {__index = function() return blankFunction end})
+end
+
 -- pistonware funcs
 
 run(function()
@@ -993,7 +1009,7 @@ run(function()
 		Roact = require(replicatedStorage['rbxts_include']['node_modules']['@rbxts']['roact'].src),
 		RuntimeLib = require(replicatedStorage['rbxts_include'].RuntimeLib),
 		SoundList = require(replicatedStorage.TS.sound['game-sound']).GameSound,
-		SoundManager = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out).SoundManager,
+		SoundManager = resolveSoundManager(),
 		StatusEffectUtil = require(replicatedStorage.TS['status-effect']['status-effect-util']).StatusEffectUtil,
 		StatusEffectMeta = require(replicatedStorage.TS['status-effect']['status-effect-type']).StatusEffectType,
 		Store = require(lplr.PlayerScripts.TS.ui.store).ClientStore,
