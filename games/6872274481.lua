@@ -946,6 +946,8 @@ run(function()
 		AppController = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out.client.controllers['app-controller']).AppController,
 		BedBreakEffectMeta = require(replicatedStorage.TS.locker['bed-break-effect']['bed-break-effect-meta']).BedBreakEffectMeta,
 		BedwarsKitMeta = require(replicatedStorage.TS.games.bedwars.kit['bedwars-kit-meta']).BedwarsKitMeta,
+		BlackMarketeerBalance = require(replicatedStorage.TS.balance['black-marketeer-balance']).BlackMarketeerBalance,
+		JuggernautUtil = require(replicatedStorage.TS.balance['juggernaut-balance-file']).JuggernautUtil,
 		BlockBreaker = Knit.Controllers.BlockBreakController.blockBreaker,
 		BlockController = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['block-engine'].out).BlockEngine,
 		BlockEngine = require(lplr.PlayerScripts.TS.lib['block-engine']['client-block-engine']).ClientBlockEngine,
@@ -6683,8 +6685,47 @@ run(function()
 	local FPSBoost
 	local Kill
 	local Visualizer
+	local Nametags
 	local effects, util = {}, {}
-	
+
+	-- The game's own nametag builder, stashed the first time we stub it so disable can
+	-- put it back. This is the ONLY thing that builds a character nametag -- the game
+	-- turns Roblox's own Humanoid name display off (NameDisplayDistance = 0,
+	-- DisplayDistanceType = None) and then calls this for every entity, players and
+	-- mobs alike -- so stubbing it and never restoring it left the session with no
+	-- nametags on anyone until a rejoin, whatever the module's knob said.
+	local oldAddGameNametag
+
+	local function removeGameNametags()
+		local controller = bedwars.NametagController
+		if not (controller and bedwars.AppController) then return end
+		if oldAddGameNametag then return end
+		oldAddGameNametag = controller.addGameNametag
+		controller.addGameNametag = function() end
+		for _, v in bedwars.AppController:getOpenApps() do
+			if tostring(v):find('Nametag') then
+				bedwars.AppController:closeApp(tostring(v))
+			end
+		end
+	end
+
+	-- Puts the builder back and re-runs it over everything currently tagged as an
+	-- entity, since the tags we closed above won't come back on their own until that
+	-- character is re-tagged (i.e. respawns). addGameNametag bails on its own for
+	-- anyone whose tag is already open, so this fills in the gaps without doubling
+	-- anybody up, and it still honours NoNametag / shouldShowNametag.
+	local function restoreGameNametags()
+		local controller = bedwars.NametagController
+		if not (controller and oldAddGameNametag) then return end
+		controller.addGameNametag = oldAddGameNametag
+		oldAddGameNametag = nil
+		for _, char in collectionService:GetTagged('entity') do
+			pcall(function()
+				controller:addGameNametag(char)
+			end)
+		end
+	end
+
 	FPSBoost = vape.Legit:CreateModule({
 		Name = 'FPS Boost',
 		Function = function(callback)
@@ -6714,12 +6755,14 @@ run(function()
 					end
 				end
 	
-				repeat task.wait(0.1) until store.matchState ~= 0
-				if not bedwars.AppController then return end
-				bedwars.NametagController.addGameNametag = function() end
-				for _, v in bedwars.AppController:getOpenApps() do
-					if tostring(v):find('Nametag') then
-						bedwars.AppController:closeApp(tostring(v))
+				if Nametags.Enabled then
+					-- the module's own thread parks here in the lobby. It used to wait
+					-- on matchState alone, so turning FPS Boost off before the match
+					-- started still stubbed the nametags the moment it did -- hence the
+					-- re-check on both flags after the wait.
+					repeat task.wait(0.1) until store.matchState ~= 0 or not (FPSBoost.Enabled and Nametags.Enabled)
+					if FPSBoost.Enabled and Nametags.Enabled then
+						removeGameNametags()
 					end
 				end
 			else
@@ -6731,6 +6774,7 @@ run(function()
 				end
 				table.clear(effects)
 				table.clear(util)
+				restoreGameNametags()
 			end
 		end,
 		Tooltip = 'Improves the framerate by turning off certain effects'
@@ -6754,6 +6798,28 @@ run(function()
 			end
 		end,
 		Default = true
+	})
+	-- Split out of the module body and defaulted off. It used to run unconditionally
+	-- whenever FPS Boost was on, with no way to keep the framerate work and keep the
+	-- nametags. Doesn't borrow Kill/Visualizer's re-toggle trick: that restarts the
+	-- whole module, and the enable path parks on matchState for as long as the lobby
+	-- lasts, so this drives its own state directly.
+	Nametags = FPSBoost:CreateToggle({
+		Name = 'Hide Nametags',
+		Function = function(callback)
+			if not FPSBoost.Enabled then return end
+			if callback then
+				task.spawn(function()
+					repeat task.wait(0.1) until store.matchState ~= 0 or not (FPSBoost.Enabled and Nametags.Enabled)
+					if FPSBoost.Enabled and Nametags.Enabled then
+						removeGameNametags()
+					end
+				end)
+			else
+				restoreGameNametags()
+			end
+		end,
+		Tooltip = 'Removes the game nametag above every character, your teammates included.\nTurning this off puts them back without a rejoin.'
 	})
 end)
 	
