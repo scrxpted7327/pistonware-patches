@@ -814,6 +814,14 @@ function namecallGuard.watch(inst, method, handler)
     return true
 end
 
+-- Marks that the __namecall body below understands a table return as replacement arguments.
+-- bedwars.lua ships from GitLab and this file from GitHub, and both are cached independently,
+-- so the two genuinely can run out of step. Against a guard that predates the contract a
+-- returned table reads as plain truthy -- i.e. "swallow" -- so the call the handler meant to
+-- adjust is eaten instead, and the module looks broken rather than absent. Modules test this
+-- before registering a rewriting handler.
+namecallGuard.rewrites = true
+
 function namecallGuard.block(inst, method)
     return namecallGuard.watch(inst, method, true)
 end
