@@ -6137,6 +6137,9 @@ do
 	-- reinject, so syncing and choosing stay one flow rather than two reloads.
 	local pending, syncmessage = false, nil
 	local refreshConfigButtons
+	-- Tracked because the recolour below runs on every rainbow tick and would otherwise
+	-- overwrite whatever MouseEnter/MouseLeave just set.
+	local synchovered = false
 	local children = profilescategory.Object:FindFirstChild('Children')
 	local syncbutton = Instance.new('TextButton')
 	syncbutton.Name = 'SyncProfiles'
@@ -6155,6 +6158,7 @@ do
 	addTooltip(syncbutton, 'Redownloads the profiles from GitHub, then pick a config below to load one')
 
 	syncbutton.MouseEnter:Connect(function()
+		synchovered = true
 		if syncing then return end
 		syncbutton.TextColor3 = uipallet.Text
 		tween:Tween(syncbutton, uipallet.Tween, {
@@ -6162,6 +6166,7 @@ do
 		})
 	end)
 	syncbutton.MouseLeave:Connect(function()
+		synchovered = false
 		if syncing then return end
 		syncbutton.TextColor3 = color.Dark(uipallet.Text, 0.4)
 		tween:Tween(syncbutton, uipallet.Tween, {
@@ -6227,6 +6232,28 @@ do
 	defaultrow.Parent = children
 
 	local configbuttons = {}
+	-- Colour only, and deliberately split from refreshConfigButtons: that one stats the
+	-- profile files to decide what is offered, and this runs on every rainbow tick --
+	-- at the default 60hz the combined version would be 120 isfile calls a second.
+	--
+	-- Registered on mainapi so UpdateGUI can reach it: UpdateGUI is defined at file scope,
+	-- well outside this block, and is the only thing that runs per rainbow tick.
+	local function recolorProfileCards()
+		for name, button in configbuttons do
+			local selected = mainapi.Profile == name and not pending
+			button.BackgroundColor3 = selected and Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or color.Light(uipallet.Main, 0.02)
+			-- while a sync is waiting on a choice both read as live options, not one active one
+			button.TextColor3 = selected and mainapi:TextColor(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or (pending and uipallet.Text or color.Dark(uipallet.Text, 0.4))
+		end
+		-- The sync button takes the GUI colour on its text, which is what makes it ride the
+		-- rainbow with everything else. Skipped while hovered or mid-sync, since both own the
+		-- label at those moments.
+		if not (synchovered or syncing) then
+			syncbutton.TextColor3 = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
+		end
+	end
+	mainapi.RecolorProfileCards = recolorProfileCards
+
 	function refreshConfigButtons()
 		local anyvisible = false
 		for name, button in configbuttons do
@@ -6235,13 +6262,10 @@ do
 			-- possible answer is an error.
 			button.Visible = pending or isfile('pistonware/profiles/'..name..mainapi.Place..'.txt')
 			anyvisible = anyvisible or button.Visible
-			local selected = mainapi.Profile == name and not pending
-			button.BackgroundColor3 = selected and Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or color.Light(uipallet.Main, 0.02)
-			-- while a sync is waiting on a choice both read as live options, not one active one
-			button.TextColor3 = selected and mainapi:TextColor(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or (pending and uipallet.Text or color.Dark(uipallet.Text, 0.4))
 		end
 		-- an invisible row is skipped by the list layout, so the gap closes with it
 		defaultrow.Visible = anyvisible
+		recolorProfileCards()
 	end
 
 	local function selectConfig(name)
@@ -7343,6 +7367,14 @@ function mainapi:UpdateGUI(hue, sat, val, default)
 
 	if not clickgui.Visible and not mainapi.Legit.Window.Visible then return end
 	local rainbow = mainapi.GUIColor.Rainbow and mainapi.RainbowMode.Value ~= 'Retro'
+
+	-- The Profiles cards are built inside their own do-block and were only recoloured when
+	-- something poked them (a load, or the mouse entering the row), so with the GUI colour on
+	-- rainbow the sync button and the equipped-config highlight sat frozen at whatever hue
+	-- happened to be current at the time while everything around them cycled.
+	if mainapi.RecolorProfileCards then
+		mainapi.RecolorProfileCards()
+	end
 
 	for i, v in mainapi.Categories do
 		if i == 'Main' then
