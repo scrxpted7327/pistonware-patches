@@ -6150,28 +6150,24 @@ do
 	syncbutton.BackgroundColor3 = color.Light(uipallet.Main, 0.02)
 	syncbutton.AutoButtonColor = false
 	syncbutton.Text = 'Sync to current profiles'
-	syncbutton.TextColor3 = color.Dark(uipallet.Text, 0.4)
+	-- Static black, and never touched again: the background under it is the GUI colour now,
+	-- so anything that varied with the colour or with hover read as the label flickering.
+	syncbutton.TextColor3 = Color3.new(0, 0, 0)
 	syncbutton.TextSize = 15
 	syncbutton.FontFace = uipallet.Font
 	syncbutton.Parent = children
 	addCorner(syncbutton)
 	addTooltip(syncbutton, 'Redownloads the profiles from GitHub, then pick a config below to load one')
 
+	-- Flag only. The tween these used to run fought recolorProfileCards, which rewrites this
+	-- background every rainbow tick: leaving the button started a tween back to the flat
+	-- grey while the tick kept writing the colour, and the two took turns each frame.
+	-- The hover shade is applied by the tick instead, off this flag.
 	syncbutton.MouseEnter:Connect(function()
 		synchovered = true
-		if syncing then return end
-		syncbutton.TextColor3 = uipallet.Text
-		tween:Tween(syncbutton, uipallet.Tween, {
-			BackgroundColor3 = color.Light(uipallet.Main, 0.14)
-		})
 	end)
 	syncbutton.MouseLeave:Connect(function()
 		synchovered = false
-		if syncing then return end
-		syncbutton.TextColor3 = color.Dark(uipallet.Text, 0.4)
-		tween:Tween(syncbutton, uipallet.Tween, {
-			BackgroundColor3 = color.Light(uipallet.Main, 0.02)
-		})
 	end)
 	syncbutton.MouseButton1Click:Connect(function()
 		if syncing then return end
@@ -6243,15 +6239,15 @@ do
 			local selected = mainapi.Profile == name and not pending
 			button.BackgroundColor3 = selected and Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or color.Light(uipallet.Main, 0.02)
 			-- while a sync is waiting on a choice both read as live options, not one active one
-			button.TextColor3 = selected and mainapi:TextColor(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or (pending and uipallet.Text or color.Dark(uipallet.Text, 0.4))
+			-- Fixed black rather than mainapi:TextColor: that picks dark or white from the
+			-- colour's brightness, and a rainbow sweeps across its threshold several times a
+			-- cycle, so the label flipped between the two every few frames.
+			button.TextColor3 = selected and Color3.new(0, 0, 0) or (pending and uipallet.Text or color.Dark(uipallet.Text, 0.4))
 		end
-		-- The button takes the GUI colour, not its label -- the text keeps whatever the
-		-- constructor and the hover handlers give it. Skipped while hovered or mid-sync,
-		-- because the hover tween owns the background then and a per-tick write would
-		-- fight it a frame later.
-		if not (synchovered or syncing) then
-			syncbutton.BackgroundColor3 = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
-		end
+		-- The button takes the GUI colour, its label stays black. Hover is a shade of the same
+		-- colour applied here rather than a tween, so there is only ever one writer.
+		local synccolor = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
+		syncbutton.BackgroundColor3 = synchovered and color.Light(synccolor, 0.12) or synccolor
 	end
 	mainapi.RecolorProfileCards = recolorProfileCards
 
