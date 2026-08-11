@@ -133,8 +133,21 @@ local function trim(s)
 	return (tostring(s):gsub('^%s*(.-)%s*$', '%1'))
 end
 
+-- Empty counts as missing. The executor's real isfile reports a zero-byte file as present, so a
+-- write interrupted by a cancel, a crash or a teleport leaves a truncated file that this
+-- function would otherwise never fetch again. For a .lua file that means a chunk that silently
+-- does nothing; for an asset it means getcustomasset producing an invalid content id, which
+-- throws 'ContentId formatting failed' and kills the GUI. Both states used to survive every
+-- retry, because everything that could have repaired them asked isfile and was told the file
+-- was fine -- so the only remedy was reinstalling the script.
+local function hasContent(path)
+	if not isfile(path) then return false end
+	local ok, body = pcall(readfile, path)
+	return ok and type(body) == 'string' and body ~= ''
+end
+
 local function downloadFile(path, func)
-	if not isfile(path) then
+	if not hasContent(path) then
 		local relPath = select(1, path:gsub('pistonware/', ''))
 		local isBedwars = relPath == 'games/bedwars.lua'
 		local content
