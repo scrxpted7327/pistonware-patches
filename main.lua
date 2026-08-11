@@ -1,3 +1,9 @@
+-- The loader is the only supported entry point: it runs the LuaArmor key gate and publishes
+-- script_key (which the protected bedwars.lua reads) before any of this downloads or executes.
+-- main.lua is re-run directly in two places -- the queued teleport script below, and the GUI's
+-- reinject buttons -- and both re-establish that state first, so reaching here without it means
+-- the gate was skipped. Checked before the uninject below, so a failed check cannot tear down a
+-- working instance on its way out.
 if not shared.PistonwareAuthenticated then
 	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
 	return
@@ -135,28 +141,48 @@ local function prefetchFolder(folder)
 	end
 	if #toFetch <= 0 then return end
 
-	local completed, pending, total = 0, #toFetch, #toFetch
+	local completed, total = 0, #toFetch
 	local done = Instance.new('BindableEvent')
 	updateDownloader('Downloading '..folder..' ('..completed..'/'..total..')')
-	for _, name in toFetch do
+
+	-- A fixed pool rather than one task per file. assets/new alone holds 63 files, and a user
+	-- on any other theme prefetches their theme AND assets/new -- so spawning per file put
+	-- 60+ HttpGets in flight at once, each holding its response body, each able to retry four
+	-- times. That is a large memory and socket spike at boot on a device that has not even
+	-- built the GUI yet. Same files, same order, same completion signal; just a ceiling on how
+	-- many are outstanding at once.
+	local PREFETCH_WORKERS = 6
+	local nextIndex = 1
+	local workers = math.min(PREFETCH_WORKERS, total)
+	local active = workers
+
+	for _ = 1, workers do
 		task.spawn(function()
-			pcall(downloadFile, 'pistonware/'..folder..'/'..name)
-			completed += 1
-			pending -= 1
-			-- pcall'd and after the counters: if this ever threw, the task would die
-			-- before releasing the wait below and the boot would hang on a GUI error
-			pcall(updateDownloader, 'Downloading '..folder..' ('..completed..'/'..total..')')
-			if pending <= 0 then
+			while true do
+				-- Claiming an index takes no yield between the read and the increment, so
+				-- two workers can never be handed the same file.
+				local index = nextIndex
+				nextIndex += 1
+				if index > total then break end
+
+				pcall(downloadFile, 'pistonware/'..folder..'/'..toFetch[index])
+				completed += 1
+				-- pcall'd and after the counter: if this ever threw, the worker would die
+				-- before releasing the wait below and the boot would hang on a GUI error
+				pcall(updateDownloader, 'Downloading '..folder..' ('..completed..'/'..total..')')
+			end
+			active -= 1
+			if active <= 0 then
 				done:Fire()
 			end
 		end)
 	end
-	-- Only wait when something is still outstanding. task.spawn runs each task inline
-	-- until it yields, so on executors where HttpGet does NOT yield the scheduler every
-	-- download finishes inside the loop above -- done:Fire() then lands with nothing
-	-- listening yet, and an unconditional Wait() blocks forever with the label frozen at
-	-- total/total. Same guard the loader's downloaders already use.
-	if pending > 0 then
+	-- Only wait when a worker is still outstanding. task.spawn runs each task inline until it
+	-- yields, so on executors where HttpGet does NOT yield the scheduler every worker drains
+	-- the whole queue inside the loop above -- done:Fire() then lands with nothing listening
+	-- yet, and an unconditional Wait() blocks forever with the label frozen at total/total.
+	-- Same guard the loader's downloaders already use.
+	if active > 0 then
 		done.Event:Wait()
 	end
 	done:Destroy()
@@ -368,7 +394,11 @@ end
 if not shared.VapeIndependent then
 	-- downloading doesn't need the game loaded; only wait here, right before touching game/character state
 	if not game:IsLoaded() then
-		repeat task.wait() until game:IsLoaded()
+		-- Deadline, matching every equivalent wait in the loader. Unbounded, a place that never
+		-- reports loaded parks this thread forever AFTER the GUI has already been built above --
+		-- so the menu opens, no game modules ever register, and nothing says why.
+		local loadDeadline = os.clock() + 120
+		repeat task.wait() until game:IsLoaded() or os.clock() > loadDeadline
 		-- identifyexecutor is absent on some executors (common on mobile); calling it
 		-- unguarded errors here and aborts everything below, including the game script.
 		local executorName = ''
