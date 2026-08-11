@@ -3803,18 +3803,21 @@ do
 	synctitle.BackgroundTransparency = 1
 	synctitle.Text = 'Sync to current profiles'
 	synctitle.TextXAlignment = Enum.TextXAlignment.Left
-	synctitle.TextColor3 = uipallet.Text
+	-- Static black: the frame behind it is the GUI colour now, and anything that varied with
+	-- that colour read as the label flickering.
+	synctitle.TextColor3 = Color3.new(0, 0, 0)
 	synctitle.TextSize = 18
 	synctitle.FontFace = uipallet.Font
 	synctitle.Parent = syncbutton
 
+	-- Flag only -- recolorProfileCards rewrites this background every rainbow tick, so a
+	-- second writer here would just take turns with it each frame. The hover shade is
+	-- applied by the tick instead, off this flag.
 	syncbutton.MouseEnter:Connect(function()
 		synchovered = true
-		syncbkg.BackgroundColor3 = color.Dark(uipallet.Main, 0.14)
 	end)
 	syncbutton.MouseLeave:Connect(function()
 		synchovered = false
-		syncbkg.BackgroundColor3 = color.Dark(uipallet.Main, 0.05)
 	end)
 	syncbutton.MouseButton1Click:Connect(function()
 		if syncing then return end
@@ -3886,14 +3889,15 @@ do
 			-- while a sync is waiting on a choice both read as live options, not one active one
 			local selected = mainapi.Profile == name and not pending
 			button.BackgroundColor3 = selected and Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or color.Dark(uipallet.Main, 0.05)
-			button.TextColor3 = selected and mainapi:TextColor(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or uipallet.Text
+			-- Fixed black rather than mainapi:TextColor: that picks dark or white from the
+			-- colour's brightness, and a rainbow sweeps across its threshold several times a
+			-- cycle, so the label flipped between the two every few frames.
+			button.TextColor3 = selected and Color3.new(0, 0, 0) or uipallet.Text
 		end
-		-- The button takes the GUI colour, not its label -- the text keeps whatever the
-		-- constructor and the hover handlers give it. Skipped while hovered or mid-sync,
-		-- because hover owns the background then and a per-tick write would fight it.
-		if not (synchovered or syncing) then
-			syncbkg.BackgroundColor3 = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
-		end
+		-- The button takes the GUI colour, its label stays black. Hover is a shade of the same
+		-- colour applied here rather than in the handler, so there is only ever one writer.
+		local synccolor = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
+		syncbkg.BackgroundColor3 = synchovered and color.Dark(synccolor, 0.09) or synccolor
 	end
 	mainapi.RecolorProfileCards = recolorProfileCards
 
