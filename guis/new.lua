@@ -311,8 +311,20 @@ local function createMobileButton(buttonapi, position)
 	buttonapi.Bind = {Button = button}
 end
 
+-- Empty counts as missing. The executor's real isfile reports a zero-byte file as present, so a
+-- write interrupted by a cancel, crash or teleport leaves a truncated asset that this function
+-- would otherwise skip re-downloading forever -- and a truncated PNG is what makes the
+-- executor's getcustomasset produce an invalid content id, which throws 'ContentId formatting
+-- failed' at the assignment and kills the whole GUI. Until this check existed, the only way out
+-- of that state was reinstalling the script.
+local function hasContent(path)
+	if not isfile(path) then return false end
+	local ok, body = pcall(readfile, path)
+	return ok and type(body) == 'string' and body ~= ''
+end
+
 local function downloadFile(path, func)
-	if not isfile(path) then
+	if not hasContent(path) then
 		createDownloader(path)
 		local suc, res = pcall(function()
 			return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..select(1, path:gsub('pistonware/', '')), true)
