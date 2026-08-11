@@ -1,9 +1,3 @@
--- The loader is the only supported entry point: it runs the LuaArmor key gate and publishes
--- script_key (which the protected bedwars.lua reads) before any of this downloads or executes.
--- main.lua is re-run directly in two places -- the queued teleport script below, and the GUI's
--- reinject buttons -- and both re-establish that state first, so reaching here without it means
--- the gate was skipped. Checked before the uninject below, so a failed check cannot tear down a
--- working instance on its way out.
 if not shared.PistonwareAuthenticated then
 	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
 	return
@@ -18,7 +12,7 @@ local vape
 local loadstring = function(...)
 	local res, err = loadstring(...)
 	if err and vape then
-		vape:CreateNotification('Vape', 'Failed to load : '..err, 30, 'alert')
+		vape:CreateNotification('Pistonware', 'Failed to load : '..err, 30, 'alert')
 	end
 	return res
 end
@@ -36,8 +30,26 @@ local cloneref = cloneref or function(obj)
 end
 local playersService = cloneref(game:GetService('Players'))
 
+-- isfile is not the question. A zero-byte file reads back as PRESENT through every executor's
+-- real isfile, and only the fallback above treats empty as absent -- so on executors that ship
+-- one (most of them), an interrupted write leaves a truncated file that nothing ever repairs.
+--
+-- That is not hypothetical: cancelling, crashing or teleporting during the concurrent asset
+-- prefetch below leaves a half-written PNG. From then on prefetchFolder skips it, downloadFile
+-- skips it, getcustomasset hands the corrupt file to the client, and the resulting invalid
+-- content id throws 'ContentId formatting failed' at the assignment -- taking the whole GUI
+-- chunk with it. Every route that could have fixed it asked isfile and was told the file was
+-- fine, which is why the only known remedy was reinstalling the entire script.
+--
+-- Treating empty as missing makes it repair itself on the next run instead.
+local function hasContent(path)
+	if not isfile(path) then return false end
+	local ok, body = pcall(readfile, path)
+	return ok and type(body) == 'string' and body ~= ''
+end
+
 local function downloadFile(path, func)
-	if not isfile(path) then
+	if not hasContent(path) then
 		-- bedwars.lua only exists in the GitLab repo (kept separate/obfuscated there), at that
 		-- repo's ROOT even though it caches locally under games/; everything else lives in the
 		-- GitHub repo.
@@ -115,7 +127,9 @@ local function prefetchFolder(folder)
 
 	local toFetch = {}
 	for _, v in body do
-		if v.type == 'file' and not isfile('pistonware/'..folder..'/'..v.name) then
+		-- hasContent, not isfile: a truncated asset from an interrupted prefetch must be picked
+		-- up again here rather than skipped forever. See the note on hasContent.
+		if v.type == 'file' and not hasContent('pistonware/'..folder..'/'..v.name) then
 			table.insert(toFetch, v.name)
 		end
 	end
@@ -316,21 +330,21 @@ local function finishLoading()
 				vape:Save()
 			end
 			if not hasQueueOnTeleport then
-				vape:CreateNotification('Vape', 'queue_on_teleport is not supported by your executor -- Vape will not re-inject automatically after this teleport (e.g. queueing into a match). You will need to re-run your loadstring manually.', 15, 'alert')
+				vape:CreateNotification('Pistonware', 'queue_on_teleport is not supported by your executor -- Vape will not re-inject automatically after this teleport (e.g. queueing into a match). You will need to re-run your loadstring manually.', 15, 'alert')
 			end
 			queue_on_teleport(teleportScript)
 		end
 	end))
 
 	if shared.PistonwareSyncResult then
-		vape:CreateNotification('Vape', shared.PistonwareSyncResult, 15, shared.PistonwareSyncResult:find('failed') and 'alert' or nil)
+		vape:CreateNotification('Pistonware', shared.PistonwareSyncResult, 15, shared.PistonwareSyncResult:find('failed') and 'alert' or nil)
 		shared.PistonwareSyncResult = nil
 	end
 
 	if not shared.vapereload then
 		if not vape.Categories then return end
 		if vape.Categories.Main.Options['GUI bind indicator'].Enabled then
-			vape:CreateNotification('Finished Loading', vape.VapeButton and 'Press the button in the top right to open GUI' or 'Press '..table.concat(vape.Keybind, ' + '):upper()..' to open GUI', 5)
+			vape:CreateNotification('Pistonware | Finished Loading', vape.VapeButton and 'Press the button in the top right to open GUI' or 'Press '..table.concat(vape.Keybind, ' + '):upper()..' to open GUI', 5)
 		end
 	end
 end
