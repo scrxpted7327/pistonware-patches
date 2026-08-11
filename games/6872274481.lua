@@ -791,9 +791,18 @@ end)
 local namecallWatch = {}
 local namecallGuard = {}
 
--- handler may be `true` to swallow the call outright, or a function -- return a
--- truthy value from it to swallow the call, nil/false to let it through.
+-- handler may be `true` to swallow the call outright, or a function. From a function:
+--   nil / false       -- let the call through unchanged
+--   a table           -- REPLACEMENT ARGUMENTS, table.pack shape (`n` plus 1..n), forwarded
+--                        to the same method in place of the originals
+--   any other truthy  -- swallow the call
 -- Method names are matched exactly as getnamecallmethod() reports them.
+--
+-- The table form exists so a module can rewrite what a remote sends without installing a
+-- second __namecall hook of its own. That is not a style preference: a hook installed from
+-- bedwars.lua charges a Luraph VM re-entry to EVERY namecall in the game, and the item shop
+-- issues tens of thousands of them per Roact render -- enough to take the client down when
+-- the shop opens. Registering here costs one hash lookup on the hot path instead.
 function namecallGuard.watch(inst, method, handler)
     if typeof(inst) ~= 'Instance' or type(method) ~= 'string' then return false end
     local entry = namecallWatch[inst]
@@ -844,8 +853,25 @@ mt.__namecall = function(self, ...)
         if handler == true then
             return
         elseif handler then
-            local ok, blocked = pcall(handler, self, ...)
-            if ok and blocked then return end
+            local ok, result = pcall(handler, self, ...)
+            -- Any truthy non-table result swallows the call, as it always did.
+            if ok and result ~= nil and result ~= false and type(result) ~= 'table' then
+                return
+            end
+            -- The handler ran, so it may have made namecalls of its own -- and
+            -- getnamecallmethod() reports the LAST namecall made on this thread, not the
+            -- one we are inside. oldNamecall dispatches off exactly that, so forwarding
+            -- through it here would invoke whatever the handler happened to touch last, on
+            -- this instance. Index the method off self instead: __index carries the method
+            -- with it and cannot be clobbered. Only reached for watched pairs, so the
+            -- unwatched hot path below is untouched.
+            local fn = self[method]
+            if type(fn) == 'function' then
+                if ok and type(result) == 'table' then
+                    return fn(self, table.unpack(result, 1, result.n or #result))
+                end
+                return fn(self, ...)
+            end
         end
     end
     return oldNamecall(self, ...)
