@@ -509,6 +509,26 @@ local function createConsole()
 	local inputService = cloneref(game:GetService('UserInputService'))
 	local playersService = cloneref(game:GetService('Players'))
 
+	-- Whatever a previous run left standing goes first. Several paths through this file
+	-- return without destroying the console -- the unsupported-executor bail and Fail() both
+	-- leave the window up on purpose so the message can be read -- and each one leaves behind
+	-- a GUI tree, three service-level connections and the reveal thread below. Re-executing
+	-- is the natural response to all of them, so without this the leak grows once per attempt
+	-- rather than being replaced.
+	pcall(function()
+		if type(shared.PistonwareLoaderTeardown) == 'function' then
+			shared.PistonwareLoaderTeardown()
+		end
+	end)
+
+	-- Connections on services and the camera, which outlive screen:Destroy() -- unlike the
+	-- button and titlebar ones, which are parented into the GUI and go with it.
+	local connections = {}
+	local function track(connection)
+		table.insert(connections, connection)
+		return connection
+	end
+
 	local screen = Instance.new('ScreenGui')
 	screen.Name = 'PistonwareLoader'
 	screen.DisplayOrder = 999999999
@@ -576,7 +596,7 @@ local function createConsole()
 	end
 	applyScale()
 	if camera then
-		camera:GetPropertyChangedSignal('ViewportSize'):Connect(applyScale)
+		track(camera:GetPropertyChangedSignal('ViewportSize'):Connect(applyScale))
 	end
 
 	local titlebar = Instance.new('Frame')
@@ -622,8 +642,18 @@ local function createConsole()
 	local closed, aborted = false, false
 	local function destroy()
 		if closed then return end
+		-- Set first: the reveal thread and every wait loop below key off it, so they stop
+		-- even if destroying the GUI throws.
 		closed = true
+		for _, connection in connections do
+			pcall(function() connection:Disconnect() end)
+		end
+		table.clear(connections)
 		pcall(function() screen:Destroy() end)
+		-- Only clear the handle if it is still ours; a newer console may already own it.
+		if shared.PistonwareLoaderTeardown == destroy then
+			shared.PistonwareLoaderTeardown = nil
+		end
 	end
 
 	-- Closing the window by hand is a cancel, not a dismissal: the boot stops at the next
@@ -730,7 +760,7 @@ local function createConsole()
 			end)
 		end
 	end)
-	inputService.InputChanged:Connect(function(input)
+	track(inputService.InputChanged:Connect(function(input)
 		if not dragging then return end
 		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
 			local delta = input.Position - dragStart
@@ -738,7 +768,7 @@ local function createConsole()
 			-- so unmaximising and unminimising both come back to where it was left
 			restorePosition = window.Position
 		end
-	end)
+	end))
 
 	local ascii = Instance.new('Frame')
 	ascii.BackgroundTransparency = 1
@@ -842,16 +872,19 @@ local function createConsole()
 	footer.Font = Enum.Font.Code
 	footer.Parent = window
 
-	inputService.InputBegan:Connect(function(input, gameProcessed)
+	track(inputService.InputBegan:Connect(function(input, gameProcessed)
 		if gameProcessed then return end
 		if input.KeyCode == Enum.KeyCode.C and inputService:IsKeyDown(Enum.KeyCode.LeftControl) then
 			cancel()
 		end
-	end)
+	end))
 
 	local revealed, revealTarget = 0, 0
+	-- Set by Halt() on the paths that leave the window up for reading but have no more rows
+	-- to draw. Without it this thread outlives the boot at ~14Hz for the rest of the session.
+	local halted = false
 	task.spawn(function()
-		while not closed do
+		while not closed and not halted do
 			if revealed < revealTarget then
 				revealed += 1
 				local row = rows[revealed]
@@ -1116,6 +1149,12 @@ local function createConsole()
 		end)
 	end
 
+	-- Stops the reveal thread without taking the window down, for the paths that end the boot
+	-- but still want the message on screen. Everything already drawn stays drawn.
+	function console:Halt()
+		halted = true
+	end
+
 	function console:Fail(err)
 		if closed then return end
 		self:SetStatus('FAILED', '#E15046')
@@ -1126,7 +1165,12 @@ local function createConsole()
 		line.TextYAlignment = Enum.TextYAlignment.Top
 		line.Size = UDim2.new(1, -ContentPadding * 2, 0, AnswersY + 34 - LineY)
 		self:SetLine(err, Palette.Error)
+		-- Nothing further is drawn after a failure, so the thread has no work left.
+		self:Halt()
 	end
+
+	-- Published so the next execution can tear this console down before building its own.
+	shared.PistonwareLoaderTeardown = destroy
 
 	return console
 end
@@ -1141,6 +1185,7 @@ local function createHeadlessConsole()
 	function console:SetProgress() end
 	function console:Finish() end
 	function console:Fail() end
+	function console:Halt() end
 	function console:IsAborted() return false end
 	-- unattended, so a question can only answer with whatever the timeout would have picked
 	function console:Ask(question, buttons, timeoutSeconds, fallback)
@@ -1184,6 +1229,11 @@ do
 			console:SetStatus('ERROR', '#E15046')
 			console:SetLine(message, Palette.Error)
 			warn('[pistonware] '..message)
+			-- The window deliberately stays up so the message can be read, but the boot is
+			-- over -- so the reveal thread stops instead of spinning at ~14Hz for the rest of
+			-- the session. The GUI and its connections go when [x] is pressed, or when the
+			-- next execution tears this console down before building its own.
+			console:Halt()
 			-- released so a later execution on a supported executor is not locked out by the
 			-- duplicate-boot guard at the top of this file
 			shared.PistonwareLoaderBoot = nil
