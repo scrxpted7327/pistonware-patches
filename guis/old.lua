@@ -217,8 +217,17 @@ local function createMobileButton(buttonapi, position)
 	buttonapi.Bind = {Button = button}
 end
 
+-- See the note in guis/new.lua: the executor's real isfile reports a zero-byte file as present,
+-- so an interrupted write leaves a truncated asset that is never re-downloaded, and a truncated
+-- PNG is what makes getcustomasset produce the invalid content id that kills the GUI.
+local function hasContent(path)
+	if not isfile(path) then return false end
+	local ok, body = pcall(readfile, path)
+	return ok and type(body) == 'string' and body ~= ''
+end
+
 local function downloadFile(path, func)
-	if not isfile(path) then
+	if not hasContent(path) then
 		createDownloader(path)
 		local suc, res = pcall(function()
 			return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..select(1, path:gsub('pistonware/', '')), true)
