@@ -6245,11 +6245,12 @@ do
 			-- while a sync is waiting on a choice both read as live options, not one active one
 			button.TextColor3 = selected and mainapi:TextColor(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or (pending and uipallet.Text or color.Dark(uipallet.Text, 0.4))
 		end
-		-- The sync button takes the GUI colour on its text, which is what makes it ride the
-		-- rainbow with everything else. Skipped while hovered or mid-sync, since both own the
-		-- label at those moments.
+		-- The button takes the GUI colour, not its label -- the text keeps whatever the
+		-- constructor and the hover handlers give it. Skipped while hovered or mid-sync,
+		-- because the hover tween owns the background then and a per-tick write would
+		-- fight it a frame later.
 		if not (synchovered or syncing) then
-			syncbutton.TextColor3 = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
+			syncbutton.BackgroundColor3 = Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value)
 		end
 	end
 	mainapi.RecolorProfileCards = recolorProfileCards
