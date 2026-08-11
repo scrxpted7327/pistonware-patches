@@ -2885,6 +2885,9 @@ do
 	-- reinject, so syncing and choosing stay one flow rather than two reloads.
 	local pending, syncmessage = false, nil
 	local refreshConfigButtons
+	-- Tracked because the recolour below runs on every rainbow tick and would otherwise
+	-- overwrite whatever the hover tween just set on the background.
+	local synchovered = false
 	-- Sits in the profile grid as a card, matching the theme cards next door.
 	local syncbutton = Instance.new('TextButton')
 	syncbutton.Name = 'SyncProfiles'
@@ -2907,11 +2910,13 @@ do
 	synctitle.Parent = syncbutton
 
 	syncbutton.MouseEnter:Connect(function()
+		synchovered = true
 		tween:Tween(syncbutton, uipallet.Tween, {
 			BackgroundColor3 = color.Light(uipallet.Main, 0.06)
 		})
 	end)
 	syncbutton.MouseLeave:Connect(function()
+		synchovered = false
 		tween:Tween(syncbutton, uipallet.Tween, {
 			BackgroundColor3 = color.Dark(uipallet.Main, 0.03)
 		})
@@ -3005,10 +3010,12 @@ do
 			button.BackgroundColor3 = selected and themed or color.Light(uipallet.Main, 0.06)
 			button.TextColor3 = selected and mainapi:TextColor(themed:ToHSV()) or uipallet.Text
 		end
-		-- The sync label takes the theme colour the same way an enabled module title does,
-		-- which is what makes it ride the rainbow. Hover only tints the card behind it, so
-		-- nothing contends for the label.
-		synctitle.TextColor3 = mainapi:RiseColor(synctitle.AbsolutePosition)
+		-- The card takes the theme colour, not its label -- the text keeps uipallet.Text.
+		-- Skipped while hovered or mid-sync, because the hover tween owns the background
+		-- then and a per-tick write would fight it a frame later.
+		if not (synchovered or syncing) then
+			syncbutton.BackgroundColor3 = mainapi:RiseColor(syncbutton.AbsolutePosition)
+		end
 	end
 	mainapi.RecolorProfileCards = recolorProfileCards
 
