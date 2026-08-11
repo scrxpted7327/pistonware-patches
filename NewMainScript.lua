@@ -13,8 +13,20 @@ local cloneref = cloneref or function(ref)
 	return ref
 end
 
+-- isfile is not the question, for the same reason main.lua spells out at length: every
+-- executor's real isfile reports a zero-byte file as PRESENT, so a write cut short by a
+-- cancel, crash or teleport leaves a truncated file that cache-first logic then skips
+-- forever. For a .lua file that is a chunk which silently does nothing; for an asset it is a
+-- content id that throws when the GUI reads it. Treating empty as missing repairs it on the
+-- next run instead of requiring a reinstall.
+local function hasContent(path)
+	if not isfile(path) then return false end
+	local ok, body = pcall(readfile, path)
+	return ok and type(body) == 'string' and body ~= ''
+end
+
 local function downloadFile(path, func)
-	if not isfile(path) then
+	if not hasContent(path) then
 		-- bedwars.lua only exists in the GitLab repo (kept separate/obfuscated there), at that
 		-- repo's ROOT even though it caches locally under games/; everything else lives in the
 		-- GitHub repo.
