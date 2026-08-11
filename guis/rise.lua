@@ -2903,23 +2903,23 @@ do
 	synctitle.Position = UDim2.fromOffset(12, 0)
 	synctitle.BackgroundTransparency = 1
 	synctitle.Text = 'Sync to current profiles'
-	synctitle.TextColor3 = uipallet.Text
+	-- Static black: the button behind it is the theme colour now, and anything that varied
+	-- with that colour read as the label flickering.
+	synctitle.TextColor3 = Color3.new(0, 0, 0)
 	synctitle.TextSize = 18
 	synctitle.TextWrapped = true
 	synctitle.FontFace = uipallet.Font
 	synctitle.Parent = syncbutton
 
+	-- Flag only. The tween these used to run fought recolorProfileCards, which rewrites this
+	-- background every theme tick: leaving the button started a tween back to the flat grey
+	-- while the tick kept writing the theme colour, and the two took turns each frame.
+	-- The hover shade is applied by the tick instead, off this flag.
 	syncbutton.MouseEnter:Connect(function()
 		synchovered = true
-		tween:Tween(syncbutton, uipallet.Tween, {
-			BackgroundColor3 = color.Light(uipallet.Main, 0.06)
-		})
 	end)
 	syncbutton.MouseLeave:Connect(function()
 		synchovered = false
-		tween:Tween(syncbutton, uipallet.Tween, {
-			BackgroundColor3 = color.Dark(uipallet.Main, 0.03)
-		})
 	end)
 	syncbutton.MouseButton1Click:Connect(function()
 		if syncing then return end
@@ -3008,14 +3008,15 @@ do
 			local selected = mainapi.Profile == name and not pending
 			local themed = mainapi:RiseColor(button.AbsolutePosition)
 			button.BackgroundColor3 = selected and themed or color.Light(uipallet.Main, 0.06)
-			button.TextColor3 = selected and mainapi:TextColor(themed:ToHSV()) or uipallet.Text
+			-- Fixed black rather than mainapi:TextColor: that picks dark or white from the
+			-- colour's brightness, and a rainbow sweeps across its threshold several times a
+			-- cycle, so the label flipped between the two every few frames.
+			button.TextColor3 = selected and Color3.new(0, 0, 0) or uipallet.Text
 		end
-		-- The card takes the theme colour, not its label -- the text keeps uipallet.Text.
-		-- Skipped while hovered or mid-sync, because the hover tween owns the background
-		-- then and a per-tick write would fight it a frame later.
-		if not (synchovered or syncing) then
-			syncbutton.BackgroundColor3 = mainapi:RiseColor(syncbutton.AbsolutePosition)
-		end
+		-- The button takes the theme colour, its label stays black. Hover is a shade of the
+		-- same colour applied here rather than a tween, so there is only ever one writer.
+		local synccolor = mainapi:RiseColor(syncbutton.AbsolutePosition)
+		syncbutton.BackgroundColor3 = synchovered and color.Light(synccolor, 0.06) or synccolor
 	end
 	mainapi.RecolorProfileCards = recolorProfileCards
 
