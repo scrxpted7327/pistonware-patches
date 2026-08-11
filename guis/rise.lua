@@ -2986,6 +2986,32 @@ do
 	defaulttitle.Parent = defaultcard
 
 	local configbuttons = {}
+	-- Colour only, and deliberately split from refreshConfigButtons: that one stats the
+	-- profile files to decide what is offered, and this runs on every rainbow tick --
+	-- at the default 60hz the combined version would be 120 isfile calls a second.
+	--
+	-- RiseColor rather than mainapi.GUIColor. Rise has no GUI colour slider -- its colour
+	-- comes from the Themes tab, and the Rainbow theme is what drives uipallet.MainColor
+	-- each tick. These cards were reading GUIColor, which nothing in this file ever moves,
+	-- so they sat on its default teal whichever theme was picked and never rainbowed.
+	--
+	-- Registered on mainapi so UpdateGUI can reach it: UpdateGUI is defined at file scope,
+	-- well outside this block, and is the only thing that runs per rainbow tick.
+	local function recolorProfileCards()
+		for name, button in configbuttons do
+			-- while a sync is waiting on a choice both read as live options, not one active one
+			local selected = mainapi.Profile == name and not pending
+			local themed = mainapi:RiseColor(button.AbsolutePosition)
+			button.BackgroundColor3 = selected and themed or color.Light(uipallet.Main, 0.06)
+			button.TextColor3 = selected and mainapi:TextColor(themed:ToHSV()) or uipallet.Text
+		end
+		-- The sync label takes the theme colour the same way an enabled module title does,
+		-- which is what makes it ride the rainbow. Hover only tints the card behind it, so
+		-- nothing contends for the label.
+		synctitle.TextColor3 = mainapi:RiseColor(synctitle.AbsolutePosition)
+	end
+	mainapi.RecolorProfileCards = recolorProfileCards
+
 	function refreshConfigButtons()
 		local anyvisible = false
 		for name, button in configbuttons do
@@ -2994,13 +3020,10 @@ do
 			-- possible answer is an error.
 			button.Visible = pending or isfile('pistonware/profiles/'..name..mainapi.Place..'.txt')
 			anyvisible = anyvisible or button.Visible
-			-- while a sync is waiting on a choice both read as live options, not one active one
-			local selected = mainapi.Profile == name and not pending
-			button.BackgroundColor3 = selected and Color3.fromHSV(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or color.Light(uipallet.Main, 0.06)
-			button.TextColor3 = selected and mainapi:TextColor(mainapi.GUIColor.Hue, mainapi.GUIColor.Sat, mainapi.GUIColor.Value) or uipallet.Text
 		end
 		-- an invisible row is skipped by the list layout, so the gap closes with it
 		defaultcard.Visible = anyvisible
+		recolorProfileCards()
 	end
 
 	local function selectConfig(name)
@@ -3726,6 +3749,13 @@ function mainapi:UpdateGUI(hue, sat, val, default)
 	end
 
 	if not clickgui.Visible then return end
+
+	-- The Profiles cards live in their own do-block and were only recoloured when something
+	-- poked them (a load, or the mouse entering the row), so the sync label and the
+	-- equipped-config highlight sat still while every other themed surface cycled.
+	if mainapi.RecolorProfileCards then
+		mainapi.RecolorProfileCards()
+	end
 
 	swatermarkversion.TextColor3 = uipallet.MainColor
 	categoryhighlight.BackgroundColor3 = color.Dark(self:RiseColor(categoryhighlight.AbsolutePosition), 0.2)
