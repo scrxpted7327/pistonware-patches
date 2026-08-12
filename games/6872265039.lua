@@ -133,4 +133,65 @@ run(function()
 		end,
 		Tooltip = 'Automatically opens lucky crates, piston inspired!'
 	})
+
+run(function()
+	local DeviceSpoofer
+	local Device
+	local spoofedType
+	local realInputType
+	local realGetUserInputType
+
+	local function sendInputType(inputType)
+		bedwars.Client:Get('SendUserInputType'):SendToServer({
+			userInputType = inputType
+		})
+	end
+
+	local function resolveInputType()
+		if Device.Value == 'Random' then
+			local types = {'MOBILE', 'PC', 'GAMEPAD'}
+			return types[math.random(#types)]
+		end
+		return Device.Value:upper()
+	end
+
+	DeviceSpoofer = vape.Categories.Utility:CreateModule({
+		Name = 'DeviceSpoofer',
+		Function = function(callback)
+			if callback then
+				realInputType = bedwars.UserInputController:getUserInputType()
+				realGetUserInputType = bedwars.UserInputController.getUserInputType
+				spoofedType = resolveInputType()
+
+				bedwars.UserInputController.getUserInputType = function()
+					return spoofedType
+				end
+
+				sendInputType(spoofedType)
+			else
+				bedwars.UserInputController.getUserInputType = realGetUserInputType
+				sendInputType(realInputType)
+				realGetUserInputType = nil
+			end
+		end,
+		ExtraText = function()
+			if Device.Value == 'Random' then
+				return 'Random'..(spoofedType and ' ('..spoofedType..')' or '')
+			end
+			return Device.Value
+		end,
+		Tooltip = 'Spoofs the device you show up as to the server'
+	})
+
+	Device = DeviceSpoofer:CreateDropdown({
+		Name = 'Device',
+		List = {'Mobile', 'PC', 'Gamepad', 'Random'},
+		Function = function(value)
+			if DeviceSpoofer.Enabled then
+				spoofedType = resolveInputType()
+				sendInputType(spoofedType)
+			end
+		end
+	})
+end)
 end)
