@@ -1748,6 +1748,47 @@ run(function()
 	local StrafeIncrease
 	local KillauraTarget
 	local ClickAim
+	local Shake
+
+	-- Shake nudges the aim off the target's RootPart by a random angle. Rolled as an
+	-- ANGLE rather than a world-space offset so the slider means the same thing at 3
+	-- studs as it does at 30 -- a fixed stud offset is a wild swing up close and nothing
+	-- at range.
+	--
+	-- The slider is a percentage of shakemax rather than raw degrees: past about five
+	-- degrees the aim is no longer pointed at anyone, so the useful range was crammed
+	-- into the bottom of a degree scale. 100% is shakemax and the two layers below are
+	-- budgeted to hit exactly that at the extreme, so the number on the slider is the
+	-- real fraction of full deflection.
+	--
+	-- Two layers, because either alone falls flat. The wander re-rolls a direction every
+	-- 15-45ms and is chased fast enough to nearly arrive before the next roll; on its own
+	-- it still traces a continuous path and reads as drift. The per-frame noise on top is
+	-- untracked white noise, and that is the layer that actually reads as jitter. Split
+	-- 60/40 so the pair tops out at the slider's percentage rather than 1.6x it.
+	local shakemax = 5 -- degrees of deflection at 100%
+	local rand = Random.new()
+	local shakeoffset, shaketarget, shakestamp = Vector2.zero, Vector2.zero, 0
+	local shakeapplied = CFrame.identity
+
+	local function shakeRotation(dt)
+		if Shake.Value <= 0 then
+			shakeoffset, shaketarget = Vector2.zero, Vector2.zero
+			return CFrame.identity
+		end
+		if os.clock() >= shakestamp then
+			-- the interval is itself random, so there is no steady beat to the wander
+			shakestamp = os.clock() + rand:NextNumber(0.015, 0.045)
+			shaketarget = Vector2.new(rand:NextNumber(-1, 1), rand:NextNumber(-1, 1))
+		end
+		-- dt-scaled so the chase rate is the same on 30fps and 240fps, clamped so a frame
+		-- spike can't overshoot past the target
+		shakeoffset = shakeoffset:Lerp(shaketarget, math.min(dt * 45, 1))
+		local noise = Vector2.new(rand:NextNumber(-1, 1), rand:NextNumber(-1, 1))
+		local offset = (shakeoffset * 0.6) + (noise * 0.4)
+		local amount = math.rad(shakemax * (Shake.Value / 100))
+		return CFrame.Angles(offset.Y * amount, offset.X * amount, 0)
+	end
 
 	-- Ignore decoy/NPC models named "Falcon" (e.g. workspace["Falcon-1"]).
 	-- A real player named Falcon still has a backing Player object AND a valid
@@ -1762,6 +1803,13 @@ run(function()
 	AimAssist = vape.Categories.Combat:CreateModule({
 		Name = 'AimAssist',
 		Function = function(callback)
+			if not callback then
+				-- nothing is going to strip it back off once we stop writing the camera,
+				-- and a stale one would be subtracted from a camera that no longer holds
+				-- it on the first frame after a re-enable
+				shakeapplied = CFrame.identity
+				shakeoffset, shaketarget = Vector2.zero, Vector2.zero
+			end
 			if callback then
 				AimAssist:Clean(runService.Heartbeat:Connect(function(dt)
 					if entitylib.isAlive and store.hand.toolType == 'sword' and ((not ClickAim.Enabled) or (os.clock() - bedwars.SwordController.lastSwing) < 0.4) then
@@ -1781,7 +1829,19 @@ run(function()
 							local angle = math.acos(localfacing:Dot((delta * Vector3.new(1, 0, 1)).Unit))
 							if angle >= (math.rad(AngleSlider.Value) / 2) then return end
 							targetinfo.Targets[ent] = tick() + 1
-							gameCamera.CFrame = gameCamera.CFrame:Lerp(CFrame.lookAt(gameCamera.CFrame.p, ent.RootPart.Position), (AimSpeed.Value + (StrafeIncrease.Enabled and (inputService:IsKeyDown(Enum.KeyCode.A) or inputService:IsKeyDown(Enum.KeyCode.D)) and 10 or 0)) * dt)
+							local aimspeed = AimSpeed.Value + (StrafeIncrease.Enabled and (inputService:IsKeyDown(Enum.KeyCode.A) or inputService:IsKeyDown(Enum.KeyCode.D)) and 10 or 0)
+							-- Strip last frame's shake, aim from that, then hang this frame's
+							-- off the result -- the shake sits OUTSIDE the aim lerp. Folded
+							-- into the lerp target it was a low-pass away from invisible: at
+							-- the default aim speed the camera closes only ~10% of the gap per
+							-- frame, so anything re-rolled faster than a few Hz averaged out
+							-- to almost nothing no matter what the slider said. Stripping it
+							-- first is also what keeps the leftovers from compounding frame
+							-- over frame into a slow wander.
+							local base = gameCamera.CFrame * shakeapplied:Inverse()
+							local aimed = base:Lerp(CFrame.lookAt(base.p, ent.RootPart.Position), aimspeed * dt)
+							shakeapplied = shakeRotation(dt)
+							gameCamera.CFrame = aimed * shakeapplied
 						end
 					end
 				end))
@@ -1823,6 +1883,14 @@ run(function()
 		Min = 1,
 		Max = 360,
 		Default = 70
+	})
+	Shake = AimAssist:CreateSlider({
+		Name = 'Shake',
+		Min = 0,
+		Max = 100,
+		Default = 0,
+		Suffix = '%',
+		Tooltip = 'Randomly wobbles the aim off-target\n0 aims dead centre, 100 is a full 5 degrees of deflection'
 	})
 	ClickAim = AimAssist:CreateToggle({
 		Name = 'Click Aim',
@@ -5478,11 +5546,19 @@ run(function()
 				if not AutoBuy.Enabled then return end
 				if BedwarsCheck.Enabled and not store.queueType:find('bedwars') then return end
 	
-				local lastupgrades
-				AutoBuy:Clean(vapeEvents.InventoryAmountChanged.Event:Connect(function()
-					if (npctick - tick()) > 1 then npctick = tick() end
-				end))
-	
+				-- A pass that bought nothing used to latch AutoBuy off entirely
+				-- (npctick = tick() + math.huge), leaving InventoryAmountChanged as the
+				-- only way back in. Anything that changes what you can afford without
+				-- changing your inventory left it asleep -- a teammate's upgrade
+				-- unlocking the next tier, store.shopLoaded flipping true after the
+				-- latch, a kit swap rewriting the sword table, an edit to the Item list
+				-- -- so standing at the shop with the currency already in hand bought
+				-- nothing until some unrelated pickup happened to poke it. Re-check on a
+				-- bounded interval instead, and only while actually in range of a
+				-- shopkeeper: one shop scan every 0.3s, worst case ~0.4s to buy.
+				local idlerecheck = 0.3
+				local lastupgrades, wasnear, buytick = nil, false, 0
+
 				repeat
 					local npc, shop, upgrades, newid = getShopNPC()
 					id = newid
@@ -5491,12 +5567,17 @@ run(function()
 							npc = nil
 						end
 					end
-	
-					if npc and lastupgrades ~= upgrades then
-						if (npctick - tick()) > 1 then npctick = tick() end
+
+					-- Walking into range (or swapping shopkeeper) buys on this pass rather
+					-- than sitting out whatever idle wait was left over. math.max keeps a
+					-- pending post-purchase cooldown intact, so stepping back into range
+					-- right after a buy can't re-fire it off a stale currencytable.
+					if npc and (not wasnear or lastupgrades ~= upgrades) then
+						npctick = math.max(tick(), buytick)
 						lastupgrades = upgrades
 					end
-	
+					wasnear = npc ~= nil
+
 					if npc and npctick <= tick() and store.matchState ~= 2 and store.shopLoaded then
 						local currencytable = {}
 						local waitcheck
@@ -5507,7 +5588,11 @@ run(function()
 								end
 							end
 						end
-						npctick = tick() + (waitcheck and 0.4 or math.huge)
+						-- 0.4s after a purchase so the next pass reads an inventory the
+						-- server has already updated: currencytable is rebuilt from it each
+						-- pass, and a stale read buys the same tier twice.
+						buytick = waitcheck and (tick() + 0.4) or buytick
+						npctick = tick() + (waitcheck and 0.4 or idlerecheck)
 					end
 	
 					task.wait(0.1)
@@ -7825,6 +7910,67 @@ run(function()
 		Name = 'Effects',
 		List = WinEffectName
 	})
+
+run(function()
+	local DeviceSpoofer
+	local Device
+	local spoofedType
+	local realInputType
+	local realGetUserInputType
+
+	local function sendInputType(inputType)
+		bedwars.Client:Get('SendUserInputType'):SendToServer({
+			userInputType = inputType
+		})
+	end
+
+	local function resolveInputType()
+		if Device.Value == 'Random' then
+			local types = {'MOBILE', 'PC', 'GAMEPAD'}
+			return types[math.random(#types)]
+		end
+		return Device.Value:upper()
+	end
+
+	DeviceSpoofer = vape.Categories.Utility:CreateModule({
+		Name = 'DeviceSpoofer',
+		Function = function(callback)
+			if callback then
+				realInputType = bedwars.UserInputController:getUserInputType()
+				realGetUserInputType = bedwars.UserInputController.getUserInputType
+				spoofedType = resolveInputType()
+
+				bedwars.UserInputController.getUserInputType = function()
+					return spoofedType
+				end
+
+				sendInputType(spoofedType)
+			else
+				bedwars.UserInputController.getUserInputType = realGetUserInputType
+				sendInputType(realInputType)
+				realGetUserInputType = nil
+			end
+		end,
+		ExtraText = function()
+			if Device.Value == 'Random' then
+				return 'Random'..(spoofedType and ' ('..spoofedType..')' or '')
+			end
+			return Device.Value
+		end,
+		Tooltip = 'Spoofs the device you show up as to the server'
+	})
+
+	Device = DeviceSpoofer:CreateDropdown({
+		Name = 'Device',
+		List = {'Mobile', 'PC', 'Gamepad', 'Random'},
+		Function = function(value)
+			if DeviceSpoofer.Enabled then
+				spoofedType = resolveInputType()
+				sendInputType(spoofedType)
+			end
+		end
+	})
+end)
 end)
 
 -- == bedwars module loader ==
