@@ -1882,6 +1882,7 @@ function mainapi:CreateBar()
 			if mainapi.VapeButton then
 				mainapi.VapeButton:Destroy()
 				mainapi.VapeButton = nil
+				mainapi.VapeButtonImage = nil
 			end
 
 			if mouse then
@@ -3267,9 +3268,15 @@ function mainapi:Load(skipgui, profile)
 		buttoncorner.CornerRadius = UDim.new(1, 0)
 		buttoncorner.Parent = button
 		self.VapeButton = button
+		self.VapeButtonImage = image
+		self.VapeButtonTransparency = button.BackgroundTransparency
 		-- Options are already loaded by this point, so honour the saved setting on the
 		-- button we just built -- the toggle's own Function ran before it existed.
-		button.Visible = not (self.HideVapeButton and self.HideVapeButton.Enabled)
+		-- Transparency rather than Visible: see HideVapeButton.
+		if self.HideVapeButton and self.HideVapeButton.Enabled then
+			button.BackgroundTransparency = 1
+			image.ImageTransparency = 1
+		end
 		button.MouseButton1Click:Connect(function()
 			if self.ThreadFix then
 				setthreadidentity(8)
@@ -4159,11 +4166,19 @@ scaleslider = topbar:CreateSlider({
 mainapi.HideVapeButton = topbar:CreateToggle({
 	Name = 'Hide Pistonware Mobile Button',
 	Function = function(callback)
+		-- Drops the transparencies rather than flipping Visible. An invisible
+		-- GuiObject stops hit-testing in Roblox, so hiding the button used to take
+		-- its tap target with it and the only way back into the GUI was the keybind
+		-- -- which mobile doesn't have. Fully transparent still receives input, so
+		-- the button keeps opening the menu from exactly where it always sat.
 		if mainapi.VapeButton then
-			mainapi.VapeButton.Visible = not callback
+			mainapi.VapeButton.BackgroundTransparency = callback and 1 or (mainapi.VapeButtonTransparency or 0)
+			if mainapi.VapeButtonImage then
+				mainapi.VapeButtonImage.ImageTransparency = callback and 1 or 0
+			end
 		end
 	end,
-	Tooltip = 'Hides the Pistonware button in the top right on mobile\nOpen the GUI with your keybind instead'
+	Tooltip = 'Makes the Pistonware button invisible on mobile\nIt still opens the GUI when tapped'
 })
 topbar:CreateDropdown({
 	Name = 'GUI Theme',
