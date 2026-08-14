@@ -469,6 +469,25 @@ local function waitForChildOfType(obj, name, timeout, prop)
 	return returned
 end
 
+-- Root part for a non-player entity. Prefers a rig's HumanoidRootPart over whatever
+-- the model names as its PrimaryPart, and settles for either.
+--
+-- Player dummies -- the tutorial ones included -- are character rigs, and a rig is
+-- under no obligation to name a PrimaryPart. Asking for PrimaryPart alone spent the
+-- whole timeout and then handed back nil, and a nil root is why the dummy never
+-- reached the entity list at all. Where a rig does name one it is often UpperTorso,
+-- which is the name the helper above already had to special-case; taking the root part
+-- directly sidesteps that too. Monsters that are not rigs at all -- crates, statues --
+-- have no HumanoidRootPart and still fall back to PrimaryPart.
+local function waitForRootPart(char, timeout)
+	local check = os.clock() + timeout
+	repeat
+		local root = char:FindFirstChild('HumanoidRootPart') or char.PrimaryPart
+		if root or check < os.clock() then return root end
+		task.wait()
+	until false
+end
+
 local frictionTable, oldfrict = {}, {}
 local frictionConnection
 local frictionState
@@ -539,8 +558,30 @@ local sortmethods = {
 
 run(function()
 	local oldstart = entitylib.start
+
+	-- A Practice room dummy, by either of the two things that mark one.
+	-- training-room-entity-controller watches the tag and then reads the attribute off
+	-- the instance; the attribute is the half that actually shows up on a dummy in the
+	-- explorer, so neither is trusted alone.
+	local function isTrainingDummy(ent)
+		return ent:HasTag('trainingRoomDummy') or ent:GetAttribute('TrainingRoomDummy') ~= nil
+	end
+
 	local function customEntity(ent)
-		if ent:HasTag('inventory-entity') and not ent:HasTag('Monster') then
+		-- Inventory entities are the shop keepers and other furniture standing around a
+		-- lobby, which is why they are skipped. But a dummy is one too -- it wears armor
+		-- and holds an item, so it has the same ArmorInvItem/HandInvItem rig a player
+		-- does -- and this guard was throwing away the only thing in the Practice room
+		-- worth hitting, no matter which tag found it.
+		if ent:HasTag('inventory-entity') and not (ent:HasTag('Monster') or isTrainingDummy(ent)) then
+			return
+		end
+
+		-- Monsters are watched under their own tag as well as 'entity' (see start
+		-- below), so anything carrying both arrives here twice and would be registered
+		-- twice -- two list entries for one character, counting double against Max
+		-- targets and drawing two of every box.
+		if entitylib.EntityThreads[ent] or entitylib.getEntity(ent) then
 			return
 		end
 
@@ -548,20 +589,47 @@ run(function()
 			local droneplr = playersService:GetPlayerByUserId(self.Character:GetAttribute('PlayerUserId'))
 			return not droneplr or lplr:GetAttribute('Team') ~= droneplr:GetAttribute('Team')
 		end or function(self)
-			return lplr:GetAttribute('Team') ~= self.Character:GetAttribute('Team')
+			-- Nothing without a team is anybody's teammate. Practice and tutorial
+			-- dummies carry no Team attribute, and in the lobby neither do we, so the
+			-- plain comparison had nil equal to nil and read every dummy as friendly --
+			-- untargetable in exactly the place where they are the only thing to hit.
+			-- In a real match this changes nothing: a team-less monster was already
+			-- targetable there, since our own team is set.
+			local theirteam = self.Character:GetAttribute('Team')
+			if theirteam == nil then return true end
+			return lplr:GetAttribute('Team') ~= theirteam
 		end)
 	end
+
+	-- Dummies are entities the 'entity' tag alone never reaches, and they come in two
+	-- kinds under two different tags:
+	--
+	--   Monster             tutorial dummies. The game's own entity-util resolves these
+	--                       through its inventory-entity branch, which returns before it
+	--                       ever asks whether the instance carries 'entity' -- so a
+	--                       player dummy is a full entity to the game while being
+	--                       invisible to a watcher that only knows the one tag. Monster
+	--                       is what the game itself watches for them, in
+	--                       player-dummy-controller and in the tutorial's kill tasks.
+	--   trainingRoomDummy   the Practice room's dummies, tagged and driven entirely by
+	--                       training-room-entity-controller.
+	--
+	-- customEntity dedupes, so anything holding more than one of these is still
+	-- registered once.
+	local ENTITY_TAGS = {'entity', 'Monster', 'trainingRoomDummy'}
 
 	entitylib.start = function()
 		oldstart()
 		if entitylib.Running then
-			for _, ent in collectionService:GetTagged('entity') do
-				customEntity(ent)
+			for _, tag in ENTITY_TAGS do
+				for _, ent in collectionService:GetTagged(tag) do
+					customEntity(ent)
+				end
+				table.insert(entitylib.Connections, collectionService:GetInstanceAddedSignal(tag):Connect(customEntity))
+				table.insert(entitylib.Connections, collectionService:GetInstanceRemovedSignal(tag):Connect(function(ent)
+					entitylib.removeEntity(ent)
+				end))
 			end
-			table.insert(entitylib.Connections, collectionService:GetInstanceAddedSignal('entity'):Connect(customEntity))
-			table.insert(entitylib.Connections, collectionService:GetInstanceRemovedSignal('entity'):Connect(function(ent)
-				entitylib.removeEntity(ent)
-			end))
 		end
 	end
 
@@ -602,7 +670,7 @@ run(function()
 				head = char:WaitForChild('Head', 10) or humrootpart
 			else
 				hum = {HipHeight = 0.5}
-				humrootpart = waitForChildOfType(char, 'PrimaryPart', 10, true)
+				humrootpart = waitForRootPart(char, 10)
 				head = humrootpart
 			end
 			local updateobjects = plr and plr ~= lplr and {
@@ -1258,6 +1326,29 @@ run(function()
 		end
 	end
 
+	-- Can a player standing here put a tool on this cell at all? At least one of its six
+	-- faces has to be open air AND has to point toward the player rather than away.
+	--
+	-- Sits between the two tests around it, both of which get this wrong in one direction.
+	-- calculatePath asks only "does any face touch air", which is what lets it aim at the
+	-- gap under a bed or the face on its far side and dig straight through the cover.
+	-- frontOf asks "is the single dominant-axis hop toward the player clear", which is the
+	-- opposite failure: a bed with an open top reads as covered the moment anything stands
+	-- beside it horizontally, even though standing over it and hitting the top is a shot
+	-- the game allows perfectly happily.
+	--
+	-- Only air counts as open. A NoBreak block sealing a face is not something you can
+	-- reach the cell through, so that face is not a way in.
+	local function openToPlayer(worldpos)
+		if not entitylib.isAlive then return true end
+		local toplayer = entitylib.character.RootPart.Position - worldpos
+		for _, side in sides do
+			if side:Dot(toplayer) <= 0 then continue end
+			if not getPlacedBlock(worldpos + side) then return true end
+		end
+		return false
+	end
+
 	-- Walks the block grid from a target cell back toward the player and returns the first
 	-- solid cell standing in the way -- i.e. what someone standing here could actually put a
 	-- tool on. calculatePath calls a cell diggable when ANY of its six faces touches air,
@@ -1309,21 +1400,39 @@ run(function()
 	-- autotool: pick the tool by selecting its hotbar slot (what the AutoTool module does)
 	--   instead of equipping it directly. The correct tool is equipped either way -- this
 	--   only decides which route gets used.
+	-- preferexposed: rank cells openToPlayer clears ahead of every one it does not, before
+	--   the metric is applied at all, and let blockcheck leave the winner alone. A bed sunk
+	--   into a wool wall is the case: its top is open, so it can be hit from above, but
+	--   'Distance' ranks purely on how close the dig spot is, and blockcheck's one-axis
+	--   walk sees the wool standing beside it and redirects onto that -- so the aura strips
+	--   the wall while the open face it could have hit sits there the whole time. 'Health'
+	--   mostly avoids the first half on its own since an exposed cell costs 0 hits, but the
+	--   redirect hits it just the same, so the tier applies to both.
 	-- The ranking matters: picking purely by hit count can settle on a spot on the far side
 	-- of the block, and the 30-stud guard below then aborts the break outright.
-	bedwars.breakBlock = function(block, effects, anim, customHealthbar, blockcheck, method, autotool)
+	bedwars.breakBlock = function(block, effects, anim, customHealthbar, blockcheck, method, autotool, preferexposed)
 		if lplr:GetAttribute('DenyBlockBreak') or not entitylib.isAlive then return end
 		local handler = bedwars.BlockController:getHandlerRegistry():getHandler(block.Name)
 		local cost, pos, target, path = math.huge
 		local selfpos = entitylib.character.RootPart.Position
 		local positions = (handler and handler:getContainedPositions(block)) or {block.Position / 3}
+		local exposed = false
 
 		for _, v in positions do
 			local dpos, dcost, dpath = calculatePath(block, v * 3)
 			if dpos then
+				local dexposed = (preferexposed and openToPlayer(dpos)) and true or false
 				local score = method == 'Distance' and (selfpos - dpos).Magnitude or dcost
-				if score < cost then
-					cost, pos, target, path = score, dpos, v * 3, dpath
+				-- Kept a strict boolean: with preferexposed off dexposed is always false
+				-- and this collapses to the original `score < cost`
+				local better
+				if dexposed ~= exposed then
+					better = dexposed
+				else
+					better = score < cost
+				end
+				if better then
+					cost, pos, target, path, exposed = score, dpos, v * 3, dpath, dexposed
 				end
 			end
 		end
@@ -1333,7 +1442,11 @@ run(function()
 		-- there is what reads as mining straight through the blocks. Step back along the line
 		-- to the player and take the first cell actually in the way, so the cover comes off
 		-- first from the side the player is standing on.
-		if blockcheck and pos then
+		-- Skipped for a cell openToPlayer already cleared: it has an open face on your side,
+		-- so there is nothing standing in the way for this step to strip off first, and
+		-- letting frontOf run anyway is what sent an exposed bed back onto the wool beside
+		-- it -- frontOf only ever looks along one axis and cannot see the open face.
+		if blockcheck and pos and not exposed then
 			local front = frontOf(pos)
 			if front ~= pos then
 				-- path described the old target; drop it so the visualiser stops drawing a
@@ -2242,6 +2355,7 @@ run(function()
 	local Time
 	local BlacklistBeds
 	local BlacklistOres
+	local BlacklistHive
 
 	-- The cooldown the game ships with, restored on disable and used as the "don't
 	-- speed this one up" value for blacklisted blocks.
@@ -2274,6 +2388,7 @@ run(function()
 		if name then
 			if BlacklistBeds.Enabled and name == 'bed' then return VANILLA_COOLDOWN end
 			if BlacklistOres.Enabled and isOre(name) then return VANILLA_COOLDOWN end
+			if BlacklistHive.Enabled and name == 'beehive' then return VANILLA_COOLDOWN end
 		end
 		return Time.Value
 	end
@@ -2283,12 +2398,12 @@ run(function()
 		Function = function(callback)
 			if callback then
 				repeat
-					-- With both blacklists off this is the original once-per-100ms
+					-- With every blacklist off this is the original once-per-100ms
 					-- setCooldown and costs exactly what it used to. With one on we need
-					-- to react the frame the crosshair moves onto a bed/ore, otherwise
-					-- the stale value lets a fast hit or two through before the next
-					-- poll catches up -- so tighten to per-frame only in that case.
-					local filtering = BlacklistBeds.Enabled or BlacklistOres.Enabled
+					-- to react the frame the crosshair moves onto a blacklisted block,
+					-- otherwise the stale value lets a fast hit or two through before the
+					-- next poll catches up -- so tighten to per-frame only in that case.
+					local filtering = BlacklistBeds.Enabled or BlacklistOres.Enabled or BlacklistHive.Enabled
 					bedwars.BlockBreakController.blockBreaker:setCooldown(filtering and currentCooldown() or Time.Value)
 					if filtering then
 						task.wait()
@@ -2311,12 +2426,16 @@ run(function()
 		Suffix = function(val) return 's' end
 	})
 	BlacklistBeds = FastBreak:CreateToggle({
-		Name = 'Blacklist Beds',
+		Name = 'Blacklist Bed',
 		Tooltip = 'Breaks beds at the normal speed instead'
 	})
 	BlacklistOres = FastBreak:CreateToggle({
-		Name = 'Blacklist Ores',
+		Name = 'Blacklist Ore',
 		Tooltip = 'Breaks ores at the normal speed instead'
+	})
+	BlacklistHive = FastBreak:CreateToggle({
+		Name = 'Blacklist Hive',
+		Tooltip = 'Breaks beehives at the normal speed instead'
 	})
 end)
 	
@@ -4119,6 +4238,17 @@ run(function()
 		Name = 'AutoKit',
 		Function = function(callback)
 			if callback then
+				-- Every kit loop below touches Instances and fires remotes, and this
+				-- thread is whatever enabled the module -- a profile apply on load, or a
+				-- GUI click -- neither of which carries the elevated identity. Without
+				-- this, farmer_cletus' harvest remote throws 'lacking capability Plugin'
+				-- on the first crop in range and takes the whole kit loop with it, since
+				-- nothing here is pcall'd. Set once for the thread rather than inside
+				-- the loops: it persists across task.wait, and every kit function runs
+				-- on this same thread.
+				if vape.ThreadFix then
+					setthreadidentity(8)
+				end
 				repeat task.wait(0.1) until store.equippedKit ~= '' and store.matchState ~= 0 or (not AutoKit.Enabled)
 				if AutoKit.Enabled and AutoKitFunctions[store.equippedKit] and Toggles[store.equippedKit].Enabled then
 					AutoKitFunctions[store.equippedKit]()
@@ -6489,143 +6619,6 @@ run(function()
 			end
 		end,
 		Tooltip = 'Drops items fast when you hold Q'
-	})
-end)
-	
-run(function()
-	local BedPlates
-	local Background
-	local Color = {}
-	local Reference = {}
-	local Folder = Instance.new('Folder')
-	Folder.Parent = vape.gui
-	
-	local function scanSide(self, start, tab)
-		for _, side in sides do
-			for i = 1, 15 do
-				local block = getPlacedBlock(start + (side * i))
-				if not block or block == self then break end
-				if not block:GetAttribute('NoBreak') and not table.find(tab, block.Name) then
-					table.insert(tab, block.Name)
-				end
-			end
-		end
-	end
-	
-	local function refreshAdornee(v)
-		for _, obj in v.Frame:GetChildren() do
-			if obj:IsA('ImageLabel') and obj.Name ~= 'Blur' then
-				obj:Destroy()
-			end
-		end
-	
-		local start = v.Adornee.Position
-		local alreadygot = {}
-		scanSide(v.Adornee, start, alreadygot)
-		scanSide(v.Adornee, start + Vector3.new(0, 0, 3), alreadygot)
-		table.sort(alreadygot, function(a, b)
-			return (bedwars.ItemMeta[a].block and bedwars.ItemMeta[a].block.health or 0) > (bedwars.ItemMeta[b].block and bedwars.ItemMeta[b].block.health or 0)
-		end)
-		v.Enabled = #alreadygot > 0
-	
-		for _, block in alreadygot do
-			local blockimage = Instance.new('ImageLabel')
-			blockimage.Size = UDim2.fromOffset(32, 32)
-			blockimage.BackgroundTransparency = 1
-			blockimage.Image = bedwars.getIcon({itemType = block}, true)
-			blockimage.Parent = v.Frame
-		end
-	end
-	
-	local function Added(v)
-		local billboard = Instance.new('BillboardGui')
-		billboard.Parent = Folder
-		billboard.Name = 'bed'
-		billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
-		billboard.Size = UDim2.fromOffset(36, 36)
-		billboard.AlwaysOnTop = true
-		billboard.ClipsDescendants = false
-		billboard.Adornee = v
-		local blur = addBlur(billboard)
-		blur.Visible = Background.Enabled
-		local frame = Instance.new('Frame')
-		frame.Size = UDim2.fromScale(1, 1)
-		frame.BackgroundColor3 = Color3.fromHSV(Color.Hue, Color.Sat, Color.Value)
-		frame.BackgroundTransparency = 1 - (Background.Enabled and Color.Opacity or 0)
-		frame.Parent = billboard
-		local layout = Instance.new('UIListLayout')
-		layout.FillDirection = Enum.FillDirection.Horizontal
-		layout.Padding = UDim.new(0, 4)
-		layout.VerticalAlignment = Enum.VerticalAlignment.Center
-		layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-		layout:GetPropertyChangedSignal('AbsoluteContentSize'):Connect(function()
-			billboard.Size = UDim2.fromOffset(math.max(layout.AbsoluteContentSize.X + 4, 36), 36)
-		end)
-		layout.Parent = frame
-		local corner = Instance.new('UICorner')
-		corner.CornerRadius = UDim.new(0, 4)
-		corner.Parent = frame
-		Reference[v] = billboard
-		refreshAdornee(billboard)
-	end
-	
-	local function refreshNear(data)
-		data = data.blockRef.blockPosition * 3
-		for i, v in Reference do
-			if (data - i.Position).Magnitude <= 30 then
-				refreshAdornee(v)
-			end
-		end
-	end
-	
-	BedPlates = vape.Categories.Minigames:CreateModule({
-		Name = 'BedPlates',
-		Function = function(callback)
-			if callback then
-				for _, v in collectionService:GetTagged('bed') do 
-					task.spawn(Added, v) 
-				end
-				BedPlates:Clean(vapeEvents.PlaceBlockEvent.Event:Connect(refreshNear))
-				BedPlates:Clean(vapeEvents.BreakBlockEvent.Event:Connect(refreshNear))
-				BedPlates:Clean(collectionService:GetInstanceAddedSignal('bed'):Connect(Added))
-				BedPlates:Clean(collectionService:GetInstanceRemovedSignal('bed'):Connect(function(v)
-					if Reference[v] then
-						Reference[v]:Destroy()
-						Reference[v]:ClearAllChildren()
-						Reference[v] = nil
-					end
-				end))
-			else
-				table.clear(Reference)
-				Folder:ClearAllChildren()
-			end
-		end,
-		Tooltip = 'Displays blocks over the bed'
-	})
-	Background = BedPlates:CreateToggle({
-		Name = 'Background',
-		Function = function(callback)
-			if Color.Object then 
-				Color.Object.Visible = callback 
-			end
-			for _, v in Reference do
-				v.Frame.BackgroundTransparency = 1 - (callback and Color.Opacity or 0)
-				v.Blur.Visible = callback
-			end
-		end,
-		Default = true
-	})
-	Color = BedPlates:CreateColorSlider({
-		Name = 'Background Color',
-		DefaultValue = 0,
-		DefaultOpacity = 0.5,
-		Function = function(hue, sat, val, opacity)
-			for _, v in Reference do
-				v.Frame.BackgroundColor3 = Color3.fromHSV(hue, sat, val)
-				v.Frame.BackgroundTransparency = 1 - opacity
-			end
-		end,
-		Darker = true
 	})
 end)
 	
