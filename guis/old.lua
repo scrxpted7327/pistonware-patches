@@ -141,6 +141,9 @@ local function addTooltip(gui, text)
 	end)
 	gui.MouseMoved:Connect(tooltipMoved)
 	gui.MouseLeave:Connect(function()
+		if mainapi.ThreadFix then
+			setthreadidentity(8)
+		end
 		tooltip.Visible = false
 	end)
 end
@@ -742,9 +745,15 @@ components = {
 			opSlider.Visible = satSlider.Visible
 		end)
 		expandbutton.MouseEnter:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			expand.ImageColor3 = color.Dark(uipallet.Text, 0.16)
 		end)
 		expandbutton.MouseLeave:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			expand.ImageColor3 = color.Dark(uipallet.Text, 0.43)
 		end)
 		expandbutton.MouseButton1Click:Connect(function()
@@ -861,9 +870,15 @@ components = {
 		end
 		
 		button.MouseEnter:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			button.BackgroundColor3 = uipallet.Main
 		end)
 		button.MouseLeave:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			button.BackgroundColor3 = color.Light(uipallet.Main, 0.14)
 		end)
 		button.MouseButton1Click:Connect(function()
@@ -892,9 +907,15 @@ components = {
 					dropdownoption.FontFace = uipallet.Font
 					dropdownoption.Parent = dropdownchildren
 					dropdownoption.MouseEnter:Connect(function()
+						if mainapi.ThreadFix then
+							setthreadidentity(8)
+						end
 						dropdownoption.BackgroundColor3 = color.Dark(dropdown.BackgroundColor3, 0.02)
 					end)
 					dropdownoption.MouseLeave:Connect(function()
+						if mainapi.ThreadFix then
+							setthreadidentity(8)
+						end
 						dropdownoption.BackgroundColor3 = dropdown.BackgroundColor3
 					end)
 					dropdownoption.MouseButton1Click:Connect(function()
@@ -2116,9 +2137,15 @@ function mainapi:CreateCategory(categorysettings)
 			dotsbutton.BackgroundColor3 = modulechildren.Visible and color.Dark(children.BackgroundColor3, 0.05) or color.Light(uipallet.Main, 0.02)
 		end)
 		modulebutton.MouseEnter:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			hover.Visible = true
 		end)
 		modulebutton.MouseLeave:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			hover.Visible = false
 		end)
 		modulebutton.MouseButton1Click:Connect(function()
@@ -2437,9 +2464,15 @@ function mainapi:CreateLegit(categorysettings)
 			dotsbutton.BackgroundColor3 = settingschildren.Visible and color.Dark(children.BackgroundColor3, 0.05) or color.Light(uipallet.Main, 0.02)
 		end)
 		modulebutton.MouseEnter:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			hover.Visible = true
 		end)
 		modulebutton.MouseLeave:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			hover.Visible = false
 		end)
 		modulebutton.MouseButton1Click:Connect(function()
@@ -3989,10 +4022,16 @@ do
 		configbuttons[name] = button
 
 		button.MouseEnter:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			if mainapi.Profile == name and not pending then return end
 			button.BackgroundColor3 = color.Dark(uipallet.Main, 0.14)
 		end)
 		button.MouseLeave:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			refreshConfigButtons()
 		end)
 		button.MouseButton1Click:Connect(function()
