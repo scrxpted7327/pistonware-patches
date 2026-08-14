@@ -1839,11 +1839,17 @@ function mainapi:CreateCategory(categorysettings)
 			end
 		end)
 		modulebutton.MouseEnter:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			tween:Tween(modulebutton, uipallet.Tween, {
 				BackgroundColor3 = color.Dark(uipallet.Main, 0.05)
 			})
 		end)
 		modulebutton.MouseLeave:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			tween:Tween(modulebutton, uipallet.Tween, {
 				BackgroundColor3 = color.Dark(uipallet.Main, 0.03)
 			})
@@ -3100,12 +3106,18 @@ do
 		configbuttons[name] = button
 
 		button.MouseEnter:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			if mainapi.Profile == name and not pending then return end
 			tween:Tween(button, uipallet.Tween, {
 				BackgroundColor3 = color.Light(uipallet.Main, 0.12)
 			})
 		end)
 		button.MouseLeave:Connect(function()
+			if mainapi.ThreadFix then
+				setthreadidentity(8)
+			end
 			if mainapi.Profile == name and not pending then return end
 			tween:Tween(button, uipallet.Tween, {
 				BackgroundColor3 = color.Light(uipallet.Main, 0.06)
