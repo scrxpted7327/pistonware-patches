@@ -133,7 +133,7 @@ run(function()
 		end,
 		Tooltip = 'Automatically opens lucky crates, piston inspired!'
 	})
-
+end)
 run(function()
 	local DeviceSpoofer
 	local Device
@@ -194,4 +194,135 @@ run(function()
 		end
 	})
 end)
+
+run(function()
+	local ClaimRewards
+	local DailyReward
+	local ClaimAchievements
+	local Milestones
+
+	local achievement
+	local milestoneRewards
+	local dailyAttempted = false
+	local milestoneAttempts = {}
+	local nextProfileRefresh = 0
+
+	local function getAchievement()
+		if not achievement then
+			local folder = replicatedStorage.TS.achievement
+			achievement = {
+				Id = require(folder['achievement-id']).AchievementId,
+				Meta = require(folder['achievement-meta']).AchievementsMeta,
+				Util = require(folder['achievement-util']).AchievementUtil
+			}
+		end
+		return achievement
+	end
+
+	local function getMilestones()
+		if not milestoneRewards then
+			milestoneRewards = require(replicatedStorage.TS.milestones.milestones).MilestoneRewards
+		end
+		return milestoneRewards
+	end
+
+	local function claimDaily()
+		local result = bedwars.Client:Get('DailyStoreRequestPurchase'):CallServer('BEDCOIN_100', 'Robux')
+		if type(result) == 'table' and result.success then
+			notif('ClaimRewards', 'Claimed the daily bedcoin reward', 5)
+		end
+	end
+
+	local function claimAchievements()
+		local data = getAchievement()
+
+		if os.clock() >= nextProfileRefresh then
+			nextProfileRefresh = os.clock() + 30
+			local profileData = bedwars.Client:Get('RequestProfileData'):CallServer(lplr)
+			if profileData then
+				bedwars.Store:dispatch({type = 'LobbySetProfileData', profileData = profileData})
+			end
+		end
+
+		local profileData = bedwars.Store:getState().Lobby.profileData
+		local achievements = profileData and profileData.achievements
+		if not achievements then return end
+
+		local claimed = 0
+		for _, id in data.Id do
+			local entry = achievements[id]
+			if entry and data.Meta[id] and data.Util.hasUnclaimedRewards(id, entry) then
+				bedwars.Client:Get('ClaimAchievementRewards'):SendToServer({id = id})
+				bedwars.Store:dispatch({type = 'LobbyClaimAchievementRewards', id = id})
+				claimed = claimed + 1
+				task.wait(0.2)
+			end
+		end
+
+		if claimed > 0 then
+			notif('ClaimRewards', 'Claimed '..claimed..' achievement reward'..(claimed == 1 and '' or 's'), 5)
+		end
+	end
+
+	local function claimMilestones()
+		local level = bedwars.Store:getState().Bedwars.playerLevel
+		local claimedList = bedwars.MilestonesController:getMilestoneRewardsClaimed()
+		if not (level and claimedList) then return end
+
+		for _, milestone in getMilestones() do
+			if level >= milestone.levelRequirement and not table.find(claimedList, milestone.id) and not milestoneAttempts[milestone.id] then
+				milestoneAttempts[milestone.id] = true
+				if bedwars.Client:Get('ClaimMilestoneReward'):CallServer(milestone.id) then
+					notif('ClaimRewards', 'Claimed milestone '..(milestone.description or milestone.id), 5)
+				end
+			end
+		end
+	end
+
+	ClaimRewards = vape.Categories.Minigames:CreateModule({
+		Name = 'ClaimRewards',
+		Function = function(callback)
+			if callback then
+				dailyAttempted = false
+				nextProfileRefresh = 0
+				table.clear(milestoneAttempts)
+
+				repeat
+					if DailyReward and DailyReward.Enabled and not dailyAttempted then
+						dailyAttempted = true
+						pcall(claimDaily)
+					end
+					if ClaimAchievements and ClaimAchievements.Enabled then
+						pcall(claimAchievements)
+					end
+					if Milestones and Milestones.Enabled then
+						pcall(claimMilestones)
+					end
+					task.wait(5)
+				until not ClaimRewards.Enabled
+			end
+		end,
+		Tooltip = 'Automatically claims your daily reward, achievement rewards and level milestones.'
+	})
+
+	DailyReward = ClaimRewards:CreateToggle({
+		Name = 'Daily Reward',
+		Default = true,
+		Function = function(state)
+			if not state then dailyAttempted = false end
+		end,
+		Tooltip = 'Claims the free daily store item (100 bedcoins) once per enable.'
+	})
+
+	ClaimAchievements = ClaimRewards:CreateToggle({
+		Name = 'Claim Achievements',
+		Default = true,
+		Tooltip = 'Claims the rewards of every achievement you have unlocked but not collected.'
+	})
+
+	Milestones = ClaimRewards:CreateToggle({
+		Name = 'Milestones',
+		Default = true,
+		Tooltip = 'Claims level milestone rewards as soon as they become available.'
+	})
 end)
