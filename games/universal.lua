@@ -8172,3 +8172,42 @@ end)
 			Tooltip = 'Disables all your animations completely.'
 		})
 	end)
+
+run(function()
+	local FPSUnlocker
+	local Cap
+
+	FPSUnlocker = vape.Legit:CreateModule({
+		Name = 'FPS Unlocker',
+		Function = function(callback)
+			if callback then
+				if not setfpscap then
+					notif('FPSUnlocker', 'This feature requires setfpscap! (your executor does not support it)', 10, 'warning')
+					FPSUnlocker:Toggle()
+					return
+				end
+				setfpscap(Cap.Value)
+			else
+				if setfpscap then
+					setfpscap(60)
+				end
+			end
+		end,
+		ExtraText = function()
+			return tostring(Cap.Value)
+		end,
+		Tooltip = 'Raises the framerate cap while enabled, restores 60 when turned off.'
+	})
+	Cap = FPSUnlocker:CreateSlider({
+		Name = 'FPS Cap',
+		Min = 30,
+		Max = 999,
+		Default = 999,
+		Function = function(val)
+			if FPSUnlocker.Enabled and setfpscap then
+				setfpscap(val)
+			end
+		end,
+		Tooltip = 'Framerate cap applied while the module is on'
+	})
+end)
