@@ -4579,6 +4579,9 @@ function mainapi:CreateCategoryList(categorysettings)
 				bindtext.FontFace = uipallet.Font
 				bindtext.Parent = bind
 				bind.MouseEnter:Connect(function()
+					if mainapi.ThreadFix then
+						setthreadidentity(8)
+					end
 					bindtext.Visible = false
 					bindicon.Visible = not bindtext.Visible
 					bindicon.Image = getcustomasset('pistonware/assets/new/edit.png')
@@ -4587,6 +4590,9 @@ function mainapi:CreateCategoryList(categorysettings)
 					end
 				end)
 				bind.MouseLeave:Connect(function()
+					if mainapi.ThreadFix then
+						setthreadidentity(8)
+					end
 					bindtext.Visible = #v.Bind > 0
 					bindicon.Visible = not bindtext.Visible
 					bindicon.Image = getcustomasset('pistonware/assets/new/bind.png')
@@ -4614,11 +4620,17 @@ function mainapi:CreateCategoryList(categorysettings)
 				bindcovertext.Parent = bindcover
 				bind.Parent = object
 				dotsbutton.MouseEnter:Connect(function()
+					if mainapi.ThreadFix then
+						setthreadidentity(8)
+					end
 					if v.Name ~= mainapi.Profile then
 						dots.ImageColor3 = uipallet.Text
 					end
 				end)
 				dotsbutton.MouseLeave:Connect(function()
+					if mainapi.ThreadFix then
+						setthreadidentity(8)
+					end
 					if v.Name ~= mainapi.Profile then
 						dots.ImageColor3 = color.Light(uipallet.Main, 0.37)
 					end
@@ -4632,6 +4644,9 @@ function mainapi:CreateCategoryList(categorysettings)
 					mainapi:SetProfile(v.Name)
 				end)
 				object.MouseEnter:Connect(function()
+					if mainapi.ThreadFix then
+						setthreadidentity(8)
+					end
 					bind.Visible = true
 					if v.Name ~= mainapi.Profile then
 						objectstroke.Enabled = true
@@ -4639,6 +4654,9 @@ function mainapi:CreateCategoryList(categorysettings)
 					end
 				end)
 				object.MouseLeave:Connect(function()
+					if mainapi.ThreadFix then
+						setthreadidentity(8)
+					end
 					bind.Visible = #v.Bind > 0
 					if v.Name ~= mainapi.Profile then
 						objectstroke.Enabled = false
