@@ -3280,7 +3280,10 @@ function mainapi:Load(skipgui, profile)
 		local button = Instance.new('TextButton')
 		button.Size = UDim2.fromOffset(110, 110)
 		button.AnchorPoint = Vector2.new(0.5, 0)
-		button.Position = UDim2.new(0.5, 0, 0, 12)
+		-- Sits below the top bar rather than on top of it: CreateBar anchors that at the
+		-- top edge with a 40px height, and the search button lives inside it, so at the
+		-- old y=12 this covered them. 50 leaves a 10px gap under the bar.
+		button.Position = UDim2.new(0.5, 0, 0, 50)
 		button.BackgroundColor3 = Color3.new()
 		button.Text = ''
 		-- Parented under scaledgui (which carries the `scale` UIScale), not the raw
