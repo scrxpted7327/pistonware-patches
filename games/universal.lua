@@ -48,6 +48,7 @@ local groupService = cloneref(game:GetService('GroupService'))
 local textChatService = cloneref(game:GetService('TextChatService'))
 local contextService = cloneref(game:GetService('ContextActionService'))
 local coreGui = cloneref(game:GetService('CoreGui'))
+local proxService = cloneref(game:GetService('ProximityPromptService'))
 
 local isnetworkowner = identifyexecutor and table.find({'AWP', 'Nihon'}, ({identifyexecutor()})[1]) and isnetworkowner or function()
 	return true
@@ -7962,6 +7963,89 @@ run(function()
 end)
 
 run(function()
+	local FastProxPrompt
+	local Mode
+	local Value
+	local modified = {}
+	local thread
+	
+	FastProxPrompt = vape.Categories.World:CreateModule({
+		Name = 'FastProxPrompt',
+		Function = function(callback)
+			if callback then
+				if Mode.Value == 'Signal' then
+					FastProxPrompt:Clean(proxService.PromptButtonHoldBegan:Connect(function(prompt, plr)
+						if plr == lplr then
+							thread = task.delay(prompt.HoldDuration * (Value.Value / 100), function()
+								fireproximityprompt(prompt)
+								thread = nil
+							end)
+						end
+					end))
+	
+					FastProxPrompt:Clean(proxService.PromptButtonHoldEnded:Connect(function(prompt, plr)
+						if plr == lplr and thread then
+							task.cancel(thread)
+							thread = nil
+						end
+					end))
+				else
+					FastProxPrompt:Clean(proxService.PromptShown:Connect(function(prompt)
+						if not modified[prompt] then
+							modified[prompt] = prompt.HoldDuration
+						end
+	
+						prompt.HoldDuration = modified[prompt] * (Value.Value / 100)
+					end))
+	
+					FastProxPrompt:Clean(proxService.PromptHidden:Connect(function(prompt)
+						if modified[prompt] then
+							prompt.HoldDuration = modified[prompt]
+							modified[prompt] = nil
+						end
+					end))
+				end
+			else
+				if thread then
+					task.cancel(thread)
+					thread = nil
+				end
+	
+				for i, v in modified do
+					i.HoldDuration = v
+				end
+	
+				table.clear(modified)
+			end
+		end,
+		Tooltip = 'Allow you to adjust the HoldDuration time of a ProximityPrompt'
+	})
+	Mode = FastProxPrompt:CreateDropdown({
+		Name = 'Mode',
+		List = {'Signal', 'Property'},
+		Tooltip = 'Signal - Uses fireproximityprompt after the calculated delay\nProperty - Sets the HoldDuration property',
+		Function = function()
+			if FastProxPrompt.Enabled then
+				FastProxPrompt:Toggle()
+				FastProxPrompt:Toggle()
+			end
+		end
+	})
+	Value = FastProxPrompt:CreateSlider({
+		Name = 'Modifier',
+		Min = 0,
+		Max = 100,
+		Default = 50,
+		Suffix = '%',
+		Function = function(val)
+			for i, v in modified do
+				i.HoldDuration = v * (val / 100)
+			end
+		end
+	})
+end)
+
+run(function()
     local Transparency
     local sliders = {}
     local HideArmor
@@ -8210,4 +8294,92 @@ run(function()
 		end,
 		Tooltip = 'Framerate cap applied while the module is on'
 	})
+
+run(function()
+	local ZoomUnlocker
+	local MaxZoom
+	local zoomConn
+
+	-- This place's StarterPlayer value, which is also what the game's own code writes
+	-- back when it finishes a temporary camera override (the zipline handler restores a
+	-- literal 14). Read off StarterPlayer at runtime so a place update carries the
+	-- restore value with it; the literal is only the fallback.
+	local FALLBACK_MAX_ZOOM = 14
+
+	local function defaultMaxZoom()
+		local ok, val = pcall(function()
+			return cloneref(game:GetService('StarterPlayer')).CameraMaxZoomDistance
+		end)
+		if ok and type(val) == 'number' and val > 0 then return val end
+		return FALLBACK_MAX_ZOOM
+	end
+
+	-- The game does not leave this property alone, so one write on enable will not hold:
+	-- the zipline handler sets 20 and then hard-restores 14, aiming down a scope sets
+	-- 6.5 and restores whatever it captured, and assorted menu/spectate paths write
+	-- 30/40/100. Re-apply whenever it moves out from under us.
+	--
+	-- Except while the game is PINNING the camera -- aiming and ziplining both set min
+	-- and max to the same value to lock the distance to one number. Fighting those
+	-- breaks the scope and the zipline ride, and there is nothing to fix afterwards:
+	-- both end by restoring a normal min < max, which is the edge that puts our value
+	-- back.
+	--
+	-- Deferred rather than handled inline because those paths write max and min as two
+	-- separate statements. Inline we would see the half-applied state (max = 20, min
+	-- still 0), read it as a normal range, and clobber the pin before it finished
+	-- landing. By the next resumption point both writes are in.
+	local pending = false
+
+	local function applyZoom()
+		pending = false
+		if not (ZoomUnlocker and ZoomUnlocker.Enabled) then return end
+		if lplr.CameraMinZoomDistance >= lplr.CameraMaxZoomDistance then return end
+		-- Guarded so our own write doesn't re-enter through the changed signal below.
+		if lplr.CameraMaxZoomDistance ~= MaxZoom.Value then
+			lplr.CameraMaxZoomDistance = MaxZoom.Value
+		end
+	end
+
+	local function queueZoom()
+		if pending then return end
+		pending = true
+		task.defer(applyZoom)
+	end
+
+	ZoomUnlocker = vape.Categories.Utility:CreateModule({
+		Name = 'ZoomUnlocker',
+		Function = function(callback)
+			if callback then
+				applyZoom()
+				zoomConn = lplr:GetPropertyChangedSignal('CameraMaxZoomDistance'):Connect(queueZoom)
+			else
+				if zoomConn then
+					pcall(function() zoomConn:Disconnect() end)
+					zoomConn = nil
+				end
+				pending = false
+				-- Back to the place default rather than whatever was there when the
+				-- module went on: enabling mid-scope would otherwise capture 6.5 and
+				-- restore that as if it were normal.
+				lplr.CameraMaxZoomDistance = defaultMaxZoom()
+			end
+		end,
+		Tooltip = 'Removes the camera zoom limit so you can zoom further out'
+	})
+
+	MaxZoom = ZoomUnlocker:CreateSlider({
+		Name = 'Max Zoom Distance',
+		Min = 14,
+		Max = 1000,
+		Default = 100,
+		Suffix = function(v) return v == 1 and 'stud' or 'studs' end,
+		Function = function()
+			if ZoomUnlocker and ZoomUnlocker.Enabled then
+				queueZoom()
+			end
+		end,
+		Tooltip = 'How far out the camera is allowed to go. 14 is the game default'
+	})
+end)
 end)
