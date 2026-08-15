@@ -934,17 +934,36 @@ mt.__namecall = function(self, ...)
             if ok and result ~= nil and result ~= false and type(result) ~= 'table' then
                 return
             end
-            -- The handler ran, so it may have made namecalls of its own -- and
-            -- getnamecallmethod() reports the LAST namecall made on this thread, not the
-            -- one we are inside. oldNamecall dispatches off exactly that, so forwarding
-            -- through it here would invoke whatever the handler happened to touch last, on
-            -- this instance. Index the method off self instead: __index carries the method
-            -- with it and cannot be clobbered. Only reached for watched pairs, so the
-            -- unwatched hot path below is untouched.
+            local replacement = (ok and type(result) == 'table') and result or nil
+
+            -- Forward as a NAMECALL wherever that is still correct, because the
+            -- index-and-call path below is observably different from the outside. It
+            -- turns one `remote:FireServer(x)` into an __index plus a direct call, so
+            -- anything instrumenting the method itself -- a remote spy, another
+            -- executor hook -- sees the call a second time and reports the remote as
+            -- firing twice. Only ever one packet reached the server, but the duplicate
+            -- is indistinguishable from a real double-send when you are debugging one,
+            -- and SwordHit is watched for rate limiting, so every sword swing hit it.
+            --
+            -- The original concern is real but narrower than it looks:
+            -- getnamecallmethod() reports the LAST namecall made on this thread, so if
+            -- the handler made namecalls of its own, oldNamecall would dispatch off
+            -- whatever it touched last. That is testable rather than assumed -- re-read
+            -- it and compare. Unchanged means no handler namecall clobbered it and
+            -- oldNamecall dispatches exactly what we entered with.
+            if not replacement and getnamecallmethod() == method then
+                return oldNamecall(self, ...)
+            end
+
+            -- Fallback for the two cases the above cannot cover: a handler that
+            -- rewrote the arguments (oldNamecall would forward the originals), and a
+            -- handler whose own namecalls moved getnamecallmethod() out from under us.
+            -- Indexing the method off self carries it with the value and cannot be
+            -- clobbered, at the cost of the duplicate observation described above.
             local fn = self[method]
             if type(fn) == 'function' then
-                if ok and type(result) == 'table' then
-                    return fn(self, table.unpack(result, 1, result.n or #result))
+                if replacement then
+                    return fn(self, table.unpack(replacement, 1, replacement.n or #replacement))
                 end
                 return fn(self, ...)
             end
@@ -2069,11 +2088,6 @@ run(function()
 		Name = 'Sprint',
 		Function = function(callback)
 			if callback then
-				if inputService.TouchEnabled then 
-					pcall(function()
-						lplr.PlayerGui.MobileUI['4'].Visible = false 
-					end)
-				end
 				old = bedwars.SprintController.stopSprinting
 				bedwars.SprintController.stopSprinting = function(...)
 					local call = old(...)
@@ -2087,11 +2101,6 @@ run(function()
 				end))
 				bedwars.SprintController:stopSprinting()
 			else
-				if inputService.TouchEnabled then 
-					pcall(function() 
-						lplr.PlayerGui.MobileUI['4'].Visible = true 
-					end) 
-				end
 				bedwars.SprintController.stopSprinting = old
 				bedwars.SprintController:stopSprinting()
 			end
@@ -4320,94 +4329,111 @@ end)
 run(function()
 	local AutoToxic
 	local GG
-	local Toggles, Lists, said, dead = {}, {}, {}
-	
-	local function sendMessage(name, obj, default)
-		local tab = Lists[name].ListEnabled
-		local custommsg = #tab > 0 and tab[math.random(1, #tab)] or default
-		if not custommsg then return end
-		if #tab > 1 and custommsg == said[name] then
-			repeat 
-				task.wait(0.1) 
-				custommsg = tab[math.random(1, #tab)] 
-			until custommsg ~= said[name]
-		end
-		said[name] = custommsg
-	
-		custommsg = custommsg and custommsg:gsub('<obj>', obj or '') or ''
-		if textChatService.ChatVersion == Enum.ChatVersion.TextChatService then
-			textChatService.ChatInputBarConfiguration.TargetTextChannel:SendAsync(custommsg)
-		else
-			replicatedStorage.DefaultChatSystemChatEvents.SayMessageRequest:FireServer(custommsg, 'All')
-		end
+	local Kill
+	local KillMessage
+	local Presets, PresetNames = {}, {}
+
+	local function normalise(str)
+		return (tostring(str):lower():gsub('^%s*(.-)%s*$', '%1'))
 	end
-	
+
+	local function sendChat(message)
+		if not message then return end
+
+		if textChatService.ChatVersion ~= Enum.ChatVersion.TextChatService then
+			replicatedStorage.DefaultChatSystemChatEvents.SayMessageRequest:FireServer(message, 'All')
+			return
+		end
+
+		local presetId = Presets[normalise(message)]
+		if not presetId then return end
+
+		local channel = textChatService.ChatInputBarConfiguration.TargetTextChannel
+		if not channel then return end
+
+		task.spawn(function()
+			pcall(function()
+				channel:SendPresetAsync(presetId)
+			end)
+		end)
+	end
+
 	AutoToxic = vape.Categories.Utility:CreateModule({
 		Name = 'AutoToxic',
 		Function = function(callback)
 			if callback then
-				AutoToxic:Clean(vapeEvents.BedwarsBedBreak.Event:Connect(function(bedTable)
-					if Toggles.BedDestroyed.Enabled and bedTable.brokenBedTeam.id == lplr:GetAttribute('Team') then
-						sendMessage('BedDestroyed', (bedTable.player.DisplayName or bedTable.player.Name), 'how dare you >:( | <obj>')
-					elseif Toggles.Bed.Enabled and bedTable.player.UserId == lplr.UserId then
-						local team = bedwars.QueueMeta[store.queueType].teams[tonumber(bedTable.brokenBedTeam.id)]
-						sendMessage('Bed', team and team.displayName:lower() or 'white', 'nice bed lul | <obj>')
+				AutoToxic:Clean(vapeEvents.MatchEndEvent.Event:Connect(function()
+					if GG.Enabled then
+						sendChat('Good game')
 					end
 				end))
 				AutoToxic:Clean(vapeEvents.EntityDeathEvent.Event:Connect(function(deathTable)
-					if deathTable.finalKill then
-						local killer = playersService:GetPlayerFromCharacter(deathTable.fromEntity)
-						local killed = playersService:GetPlayerFromCharacter(deathTable.entityInstance)
-						if not killed or not killer then return end
-						if killed == lplr then
-							if (not dead) and killer ~= lplr and Toggles.Death.Enabled then
-								dead = true
-								sendMessage('Death', (killer.DisplayName or killer.Name), 'my gaming chair subscription expired :( | <obj>')
-							end
-						elseif killer == lplr and Toggles.Kill.Enabled then
-							sendMessage('Kill', (killed.DisplayName or killed.Name), 'vxp on top | <obj>')
-						end
-					end
-				end))
-				AutoToxic:Clean(vapeEvents.MatchEndEvent.Event:Connect(function(winstuff)
-					if GG.Enabled then
-						if textChatService.ChatVersion == Enum.ChatVersion.TextChatService then
-							textChatService.ChatInputBarConfiguration.TargetTextChannel:SendAsync('gg')
-						else
-							replicatedStorage.DefaultChatSystemChatEvents.SayMessageRequest:FireServer('gg', 'All')
-						end
-					end
-					
-					local myTeam = bedwars.Store:getState().Game.myTeam
-					if myTeam and myTeam.id == winstuff.winningTeamId or lplr.Neutral then
-						if Toggles.Win.Enabled then 
-							sendMessage('Win', nil, 'yall garbage') 
-						end
+					if not Kill.Enabled then return end
+
+					local killer = playersService:GetPlayerFromCharacter(deathTable.fromEntity)
+					local killed = playersService:GetPlayerFromCharacter(deathTable.entityInstance)
+					if not killer or not killed then return end
+					if killer ~= lplr or killed == lplr then return end
+
+					if KillMessage.Value ~= 'None' then
+						sendChat(KillMessage.Value)
 					end
 				end))
 			end
 		end,
-		Tooltip = 'Says a message after a certain action'
+		Tooltip = 'Sends a quick chat message after a certain action'
 	})
 	GG = AutoToxic:CreateToggle({
 		Name = 'AutoGG',
 		Default = true
 	})
-	for _, v in {'Kill', 'Death', 'Bed', 'BedDestroyed', 'Win'} do
-		Toggles[v] = AutoToxic:CreateToggle({
-			Name = v..' ',
-			Function = function(callback)
-				if Lists[v] then
-					Lists[v].Object.Visible = callback
+	Kill = AutoToxic:CreateToggle({
+		Name = 'Kill',
+		Function = function(callback)
+			if KillMessage then
+				KillMessage.Object.Visible = callback
+			end
+		end
+	})
+	KillMessage = AutoToxic:CreateDropdown({
+		Name = 'Kill Message',
+		List = PresetNames,
+		Darker = true,
+		Visible = false,
+		Tooltip = 'Quick chat message sent after you kill someone'
+	})
+
+	local savedKillMessage
+	local loadDropdown = KillMessage.Load
+	function KillMessage:Load(tab)
+		savedKillMessage = tab.Value
+		loadDropdown(self, tab)
+	end
+	task.spawn(function()
+		if textChatService.ChatVersion ~= Enum.ChatVersion.TextChatService then return end
+
+		local success, presets = pcall(function()
+			return textChatService:GetPresetsAsync()
+		end)
+		if not success or type(presets) ~= 'table' then return end
+
+		for _, group in presets.categoryGroups or {} do
+			for _, category in group.categories or {} do
+				for _, message in category.messages or {} do
+					Presets[normalise(message.value)] = message.presetId
+					table.insert(PresetNames, message.value)
 				end
 			end
-		})
-		Lists[v] = AutoToxic:CreateTextList({
-			Name = v,
-			Darker = true,
-			Visible = false
-		})
-	end
+		end
+
+		table.sort(PresetNames)
+
+		if savedKillMessage and table.find(PresetNames, savedKillMessage) then
+			KillMessage:SetValue(savedKillMessage)
+		elseif KillMessage.Value == 'None' and PresetNames[1] then
+			KillMessage:SetValue(PresetNames[1])
+		end
+	end)
 end)
 	
 run(function()
@@ -7962,6 +7988,64 @@ run(function()
 				sendInputType(spoofedType)
 			end
 		end
+	})
+end)
+
+run(function()
+	local HideNametag
+	local nametagWatch = {}
+	local charConn
+
+	local function clearNametagWatch()
+		for _, c in nametagWatch do
+			pcall(function() c:Disconnect() end)
+		end
+		table.clear(nametagWatch)
+	end
+
+	local function eachNametag(char, fn)
+		if not char then return end
+		for _, v in char:GetDescendants() do
+			if v:IsA('BillboardGui') and v.Name == 'Nametag' then
+				pcall(fn, v)
+			end
+		end
+	end
+
+	local function setNametagEnabled(state, char)
+		clearNametagWatch()
+		char = char or lplr.Character
+		if not char then return end
+
+		eachNametag(char, function(v) v.Enabled = state end)
+		if state then return end
+
+		nametagWatch[#nametagWatch + 1] = char.DescendantAdded:Connect(function(v)
+			if v:IsA('BillboardGui') and v.Name == 'Nametag' then
+				pcall(function() v.Enabled = false end)
+			end
+		end)
+	end
+
+	HideNametag = vape.Categories.Utility:CreateModule({
+		Name = 'HideNametag',
+		Function = function(callback)
+			if callback then
+				setNametagEnabled(false)
+				charConn = lplr.CharacterAdded:Connect(function(char)
+					if HideNametag.Enabled then
+						setNametagEnabled(false, char)
+					end
+				end)
+			else
+				if charConn then
+					pcall(function() charConn:Disconnect() end)
+					charConn = nil
+				end
+				setNametagEnabled(true)
+			end
+		end,
+		Tooltip = 'Hides the nametag above your own character'
 	})
 end)
 end)
