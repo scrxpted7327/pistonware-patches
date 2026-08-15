@@ -5587,7 +5587,13 @@ function mainapi:Load(skipgui, profile)
 		local button = Instance.new('TextButton')
 		button.Size = UDim2.fromOffset(110, 110)
 		button.AnchorPoint = Vector2.new(0.5, 0)
-		button.Position = UDim2.new(0.5, 0, 0, 12)
+		-- Sits below the search bar rather than on top of it: CreateSearch puts that at
+		-- y=13 with a 37px collapsed height, both centered, and this button is 110 wide
+		-- against the bar's 220, so at the old y=12 it covered the field outright. 60
+		-- leaves a 10px gap under the collapsed bar. It does not clear the expanded
+		-- results list (that grows to 437) -- clearing it would push the button off the
+		-- bottom of a phone, and the list is only up while you are typing in it.
+		button.Position = UDim2.new(0.5, 0, 0, 60)
 		button.BackgroundColor3 = Color3.new()
 		button.BackgroundTransparency = 0.5
 		button.Text = ''
