@@ -2859,25 +2859,25 @@ local function downloadProfiles(commit)
 	end
 
 	-- Downloaded in parallel like the loader does, rather than one blocking request per file.
-	local synced, failed, waiting = 0, 0, #files
-	local done = Instance.new('BindableEvent')
+	local synced, failed = 0, 0
+	local total = #files
 	for _, v in files do
 		task.spawn(function()
-			if downloadProfileFile('pistonware/'.. ({v.path:gsub(' ', '%%20')})[1], commit) then
+			-- pcall'd so a worker that throws is still counted; see guis/new.lua. The
+			-- BindableEvent join this replaces had no timeout, so one erroring file froze the
+			-- sync button for the rest of the session.
+			local ok, got = pcall(downloadProfileFile, 'pistonware/'.. ({v.path:gsub(' ', '%%20')})[1], commit)
+			if ok and got then
 				synced += 1
 			else
 				failed += 1
 			end
-			waiting -= 1
-			if waiting <= 0 then
-				done:Fire()
-			end
 		end)
 	end
-	if waiting > 0 then
-		done.Event:Wait()
+	local deadline = os.clock() + 90
+	while synced + failed < total and os.clock() < deadline do
+		task.wait(0.05)
 	end
-	done:Destroy()
 
 	if synced <= 0 then
 		return nil, 'Profile sync failed (nothing downloaded).'
