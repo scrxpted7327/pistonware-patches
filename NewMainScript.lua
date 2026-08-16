@@ -78,24 +78,23 @@ pcall(function()
 				return cloneref(game:GetService('HttpService')):JSONDecode(res)
 			end)
 			if bodySuc and body and typeof(body) == 'table' then
-				local pending = 0
-				local done = Instance.new('BindableEvent')
+				local total, completed = 0, 0
 				for _, v in body do
 					if v.type == 'file' then
-						pending += 1
+						total += 1
 						task.spawn(function()
 							pcall(downloadFile, 'pistonware/'.. ({v.path:gsub(' ', '%%20')})[1])
-							pending -= 1
-							if pending <= 0 then
-								done:Fire()
-							end
+							completed += 1
 						end)
 					end
 				end
-				if pending > 0 then
-					done.Event:Wait()
+				-- Joined on the counter with a deadline, matching loader.lua and main.lua. The
+				-- BindableEvent this replaces had no timeout, so a worker that died before
+				-- firing parked the boot for the rest of the session.
+				local deadline = os.clock() + 90
+				while completed < total and os.clock() < deadline do
+					task.wait(0.05)
 				end
-				done:Destroy()
 			end
 		end
 	end
