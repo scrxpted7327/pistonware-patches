@@ -177,16 +177,69 @@ local function downloadFile(path, func)
 	return (func or readfile)(path)
 end
 
-local function fetchProfilesListing(ref)
-	local reqSuc, res = pcall(function()
-		return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/contents/profiles'..(ref and ('?ref='..ref) or ''), true)
+-- Every concurrent batch in this file joins through here.
+--
+-- What this replaces was `done.Event:Wait()` with no timeout, which parks the boot FOREVER if
+-- a worker dies before firing -- and workers could die, because the progress callback they
+-- called on their way out was not wrapped. That is the 'stuck on Injecting into ROBLOX' report:
+-- not a slow download, a batch that lost a worker and a join that waits for it regardless.
+--
+-- Fixed at both ends, because either alone still leaves a hole: the callbacks are pcall'd at
+-- their call sites now, AND this gives up on the clock no matter what killed the worker. A
+-- batch that loses one costs the files that worker had left, not the session.
+local function joinBatch(isDone, seconds)
+	local deadline = os.clock() + (seconds or 90)
+	while not isDone() and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	return isDone()
+end
+
+--[[
+	ONE GitHub API request per boot, shared by everything that used to make its own.
+
+	The loader used to spend up to four unauthenticated API calls before downloading a byte --
+	HEAD commit, recursive tree, profiles commit, profiles contents -- and main.lua spent one or
+	two more on the asset folders. Unauthenticated GitHub allows 60 requests per hour PER IP, and
+	mobile carriers put thousands of users behind a single address, so on a phone that budget is
+	routinely already gone. The symptom is not an error, because every one of these is pcall'd:
+	it is a boot that silently skips its update check and stalls on slow 403 responses first.
+
+	A recursive tree fetched by BRANCH NAME returns its own sha, so a single request answers all
+	of it -- the .lua manifest, the profiles listing, and the profiles fingerprint. The separate
+	commits call existed only to learn the sha this response already carries.
+]]
+local repoTree, repoTreeTried
+local function fetchRepoTree()
+	if repoTreeTried then return repoTree end
+	repoTreeTried = true
+	pcall(function()
+		local httpService = cloneref(game:GetService('HttpService'))
+		local body = httpService:JSONDecode(game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/git/trees/main?recursive=1', true))
+		if type(body) == 'table' and type(body.tree) == 'table' and type(body.sha) == 'string' then
+			repoTree = body
+			-- Handed to main.lua so its asset prefetch reads this instead of spending its own
+			-- contents/ calls. It only needs the paths, and they are all in here already.
+			shared.PistonwareRepoTree = body
+		end
 	end)
-	if not (reqSuc and res and res ~= '404: Not Found') then return nil end
-	local bodySuc, body = pcall(function()
-		return cloneref(game:GetService('HttpService')):JSONDecode(res)
-	end)
-	if not (bodySuc and body and typeof(body) == 'table') then return nil end
-	return body
+	return repoTree
+end
+
+-- Shaped like the old contents/ response ({type = 'file', path = ...}) so the downloader below
+-- did not have to change. Pinned by construction: a tree IS a snapshot, so there is no window
+-- where the listing and the file contents disagree.
+local function fetchProfilesListing()
+	local tree = fetchRepoTree()
+	if not tree then return nil end
+	local files = {}
+	for _, v in tree.tree do
+		if v.type == 'blob' and v.path:sub(1, 9) == 'profiles/' then
+			table.insert(files, {type = 'file', path = v.path})
+		end
+	end
+	if #files == 0 then return nil end
+	return files
 end
 
 local function mergeGuiState(path, incoming)
@@ -214,8 +267,7 @@ local function downloadProfilesListing(body, commit, onProgress)
 			table.insert(files, v)
 		end
 	end
-	local completed, pending, total = 0, #files, #files
-	local done = Instance.new('BindableEvent')
+	local completed, total = 0, #files
 	for _, v in files do
 		local relPath = ({v.path:gsub(' ', '%%20')})[1]
 		task.spawn(function()
@@ -237,46 +289,49 @@ local function downloadProfilesListing(body, commit, onProgress)
 			else
 				pcall(downloadFile, 'pistonware/'..relPath)
 			end
+			-- Counted first and reported second, both guarded: this worker's only remaining job
+			-- is to be counted, and a throwing progress callback used to stop that happening.
 			completed += 1
-			pending -= 1
 			if onProgress then
-				onProgress(completed, total)
-			end
-			if pending <= 0 then
-				done:Fire()
+				pcall(onProgress, completed, total)
 			end
 		end)
 	end
-	if pending > 0 then
-		done.Event:Wait()
-	end
-	done:Destroy()
+	joinBatch(function() return completed >= total end)
 end
 
-local function fetchProfilesCommit()
-	local reqSuc, res = pcall(function()
-		return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/commits?path=profiles&sha=main&per_page=1', true)
-	end)
-	if not (reqSuc and res and res ~= '404: Not Found') then return nil end
-	local bodySuc, body = pcall(function()
-		return cloneref(game:GetService('HttpService')):JSONDecode(res)
-	end)
-	if not (bodySuc and body and typeof(body) == 'table' and body[1] and body[1].sha) then return nil end
-	return body[1].sha
+-- Derived from the tree already in hand, so the sync check costs no request of its own. Only
+-- has to change when a profile changes and stay identical when nothing has, which the blob shas
+-- give exactly; djb2 over them keeps the stored value one short line instead of growing with
+-- the profile count. The 'p1-' prefix marks the scheme, so the migration in Step 2b can tell
+-- one of these from the 40-char git sha the old code wrote.
+local function profilesFingerprint()
+	local tree = fetchRepoTree()
+	if not tree then return nil end
+	local parts = {}
+	for _, v in tree.tree do
+		if v.type == 'blob' and v.path:sub(1, 9) == 'profiles/' then
+			table.insert(parts, v.path..':'..tostring(v.sha))
+		end
+	end
+	if #parts == 0 then return nil end
+	table.sort(parts)
+	local joined = table.concat(parts, '\n')
+	local h = 5381
+	for i = 1, #joined do
+		h = (h * 33 + string.byte(joined, i)) % 4294967296
+	end
+	return ('p1-%08x'):format(h)
 end
 
 local function updateCachedFiles(onProgress)
 	local httpService = cloneref(game:GetService('HttpService'))
 
-	local headSuc, headSha = pcall(function()
-		return httpService:JSONDecode(game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/commits?sha=main&per_page=1', true))[1].sha
-	end)
-	if not (headSuc and type(headSha) == 'string') then return end
-
-	local treeSuc, tree = pcall(function()
-		return httpService:JSONDecode(game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/git/trees/'..headSha..'?recursive=1', true))
-	end)
-	if not (treeSuc and type(tree) == 'table' and type(tree.tree) == 'table') then return end
+	-- The tree carries its own sha, so this is the whole API budget -- and it is memoised, so
+	-- the profiles listing and fingerprint below ride the same response.
+	local tree = fetchRepoTree()
+	if not tree then return end
+	local headSha = tree.sha
 
 	local manifest = {}
 	pcall(function()
@@ -328,9 +383,8 @@ local function updateCachedFiles(onProgress)
 		end
 	end
 
-	local completed, pending, total = 0, #toUpdate, #toUpdate
+	local completed, total = 0, #toUpdate
 	if total > 0 then
-		local done = Instance.new('BindableEvent')
 		for _, path in toUpdate do
 			task.spawn(function()
 				for attempt = 1, 4 do
@@ -348,20 +402,15 @@ local function updateCachedFiles(onProgress)
 						task.wait(attempt)
 					end
 				end
+				-- Counted first, reported second, the report guarded. See joinBatch: a throwing
+				-- progress callback here used to strand the join for the rest of the session.
 				completed += 1
-				pending -= 1
 				if onProgress then
-					onProgress(completed, total)
-				end
-				if pending <= 0 then
-					done:Fire()
+					pcall(onProgress, completed, total)
 				end
 			end)
 		end
-		if pending > 0 then
-			done.Event:Wait()
-		end
-		done:Destroy()
+		joinBatch(function() return completed >= total end)
 	end
 
 	if changed then
@@ -1570,6 +1619,29 @@ end
 -- Step 1: hold here until ROBLOX itself is ready. Everything after this touches game state
 -- (or hands off to main.lua, which does), so the shared.Vape* flags the injecting loadstring
 -- sets have to be in place and the place has to be loaded before we move on.
+-- Step 1b runs CONCURRENTLY with Step 1, not after it.
+--
+-- These two phases have nothing to do with each other: waiting on Roblox is pure dead time
+-- (seconds of it when someone injects at the loading screen) and the update check is pure
+-- network. Run in sequence, the boot paid for both. Started here, the update check happens
+-- inside the wait it used to follow, and on a warm cache it is finished before Roblox is.
+--
+-- Nothing in updateCachedFiles touches game state, which is what made the old ordering
+-- necessary in the first place -- it reads a GitHub tree and writes files into pistonware/.
+-- Both folders and authentication are already behind us, so the security ordering is intact:
+-- this still cannot start until a key has validated.
+local updateDone = isReload or isDeveloper
+if not updateDone then
+	task.spawn(function()
+		pcall(updateCachedFiles, function(completed, total)
+			console:SetLine('Updating files ('..completed..'/'..total..')...')
+			console:SetProgress(0.4 + 0.06 * (completed / math.max(total, 1)))
+		end)
+		updateDone = true
+	end)
+end
+
+-- Step 1: hold here until ROBLOX itself is ready.
 do
 	local playersService = cloneref(game:GetService('Players'))
 	local deadline = os.clock() + 120
@@ -1585,16 +1657,11 @@ do
 end
 if console:IsAborted() then deleteInstall() return end
 
--- Step 1b: bring every cached .lua file up to date BEFORE any of it runs. Skipped on
--- reloads (the first manual run this session already did it, and reinjects should stay
--- fast) and for developers (running local edits is the whole point of developer mode --
--- and their watermark-stripped files would be skipped anyway).
-if not isReload and not isDeveloper then
+-- Join the update check before anything reads a cached .lua file. Bounded for the same reason
+-- every other join in this file is: a stalled update must cost the update, not the boot.
+if not updateDone then
 	console:SetLine('Checking for updates...')
-	pcall(updateCachedFiles, function(completed, total)
-		console:SetLine('Updating files ('..completed..'/'..total..')...')
-		console:SetProgress(0.4 + 0.06 * (completed / math.max(total, 1)))
-	end)
+	joinBatch(function() return updateDone end, 60)
 	console:SetLine('')
 	if console:IsAborted() then deleteInstall() return end
 end
@@ -1655,7 +1722,7 @@ if firstRunProfiles and not declinedDownload and wantsDownload then
 	-- has changed on GitHub since (see the sync prompt below).
 	if downloadedConfigs then
 		pcall(function()
-			local commit = fetchProfilesCommit()
+			local commit = profilesFingerprint()
 			if commit then
 				writefile('pistonware/profiles/profilecommit.txt', commit)
 			end
@@ -1673,9 +1740,20 @@ if console:IsAborted() then deleteInstall() return end
 if not firstRunProfiles and not declinedDownload and not isReload then
 	local latestCommit, cachedCommit
 	pcall(function()
-		latestCommit = fetchProfilesCommit()
+		latestCommit = profilesFingerprint()
 		cachedCommit = isfile('pistonware/profiles/profilecommit.txt') and readfile('pistonware/profiles/profilecommit.txt'):gsub('%s', '') or nil
 	end)
+
+	-- Existing installs hold a 40-char git sha from the old scheme, which can never equal a
+	-- 'p1-' fingerprint. Adopt the new value silently rather than reading that mismatch as
+	-- "profiles changed": upgrading the loader is not a reason to ask every user in the world
+	-- to re-sync, and the prompt is the kind that gets clicked through once and distrusted
+	-- thereafter.
+	if latestCommit and cachedCommit and #cachedCommit == 40 and cachedCommit:match('^%x+$') then
+		pcall(writefile, 'pistonware/profiles/profilecommit.txt', latestCommit)
+		cachedCommit = latestCommit
+	end
+
 	if latestCommit and latestCommit ~= cachedCommit then
 		console:SetProgress(0.6)
 		local ok, wantsSync = pcall(function()
@@ -1728,9 +1806,13 @@ if not firstRunProfiles and not declinedDownload and not isReload then
 				end
 				-- Listing and file contents both pinned to latestCommit so a sync run right
 				-- after a push can't grab a stale CDN copy of the branch head.
-				local body = fetchProfilesListing(latestCommit)
-				if body then
-					downloadProfilesListing(body, latestCommit, function(completed, total)
+				-- The tree this listing came from is itself a pinned snapshot, so its sha is what
+				-- the file contents are fetched at -- no separate ref needed, and no window in
+				-- which the listing and the bodies can disagree.
+				local body = fetchProfilesListing()
+				local treeSha = repoTree and repoTree.sha
+				if body and treeSha then
+					downloadProfilesListing(body, treeSha, function(completed, total)
 						console:SetLine('Syncing configs ('..completed..'/'..total..')...')
 						console:SetProgress(0.6 + 0.13 * (completed / math.max(total, 1)))
 					end)
