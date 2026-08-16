@@ -1045,7 +1045,13 @@ local function safeGetProto(func, index)
     if success then
         return proto
     else
-        warn("function:", func, "index:", index)
+        -- Developer-only. This prints a raw function pointer and an index, which means nothing
+        -- to a user and fires on executors whose debug.getproto is simply missing -- so on
+        -- those it used to spray the console on every call for no reason. The caller already
+        -- handles nil.
+        if shared.PistonwareDeveloper then
+            warn('[pistonware] getproto failed -- function:', func, 'index:', index)
+        end
         return nil
     end
 end
@@ -4149,30 +4155,6 @@ run(function()
 			AutoKit:Clean(function()
 				bedwars.LaunchPadController.attemptLaunch = old
 			end)
-		end,
-		melody = function()
-			repeat
-				local mag, hp, ent = 30, math.huge
-				if entitylib.isAlive then
-					local localPosition = entitylib.character.RootPart.Position
-					for _, v in entitylib.List do
-						if v.Player and v.Player:GetAttribute('Team') == lplr:GetAttribute('Team') then
-							local newmag = (localPosition - v.RootPart.Position).Magnitude
-							if newmag <= mag and v.Health < hp and v.Health < v.MaxHealth then
-								mag, hp, ent = newmag, v.Health, v
-							end
-						end
-					end
-				end
-	
-				if ent and getItem('guitar') then
-					bedwars.Client:Get(remotes.GuitarHeal):SendToServer({
-						healTarget = ent.Character
-					})
-				end
-	
-				task.wait(0.1)
-			until not AutoKit.Enabled
 		end,
 		void_dragon = function()
 			local oldflap = bedwars.VoidDragonController.flapWings
