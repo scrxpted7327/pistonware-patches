@@ -36,6 +36,23 @@ local cloneref = cloneref or function(obj)
 end
 local playersService = cloneref(game:GetService('Players'))
 
+-- Telemetry the developer build prints and the public build does not.
+--
+-- Module counts and load timings are what you want in front of you while working on the loader,
+-- and noise in a paying user's console -- they are yellow, they say [pistonware], and they turn
+-- up at exactly the moment the script starts working, so they read as something having gone
+-- wrong. Real failures still use warn() directly and are unaffected.
+--
+-- Gated at runtime rather than at build time because main.lua is one file serving both builds.
+-- PUBLIC_BUILD nulls shared.PistonwareDeveloper and locks it behind a metatable, so this is off
+-- for everyone except the developer build by construction -- and the queued teleport script
+-- carries the flag across, so it stays on for a developer through a match join.
+local function debugWarn(...)
+	if shared.PistonwareDeveloper then
+		warn(...)
+	end
+end
+
 -- isfile is not the question. A zero-byte file reads back as PRESENT through every executor's
 -- real isfile, and only the fallback above treats empty as absent -- so on executors that ship
 -- one (most of them), an interrupted write leaves a truncated file that nothing ever repairs.
@@ -121,28 +138,63 @@ end
 
 -- Downloads every file in a repo folder concurrently instead of one HttpGet per getcustomasset call,
 -- so GUI construction reads already-cached files instead of blocking on ~190 sequential round trips.
-local function prefetchFolder(folder)
+-- Names of every file directly inside a repo folder.
+--
+-- Prefers the recursive tree the loader already fetched and parked in shared: unauthenticated
+-- GitHub allows 60 requests an hour PER IP and mobile carriers share one address across
+-- thousands of users, so the two contents/ calls this used to make were a real part of why
+-- boots stall on phones. Reading the tree costs nothing -- the paths are already in memory.
+--
+-- The contents/ request stays as the fallback, because main.lua is not only reached through the
+-- loader: the queued teleport script re-runs THIS file directly, and there is no tree in shared
+-- on the new server.
+local function listRepoFolder(folder)
+	local tree = shared.PistonwareRepoTree
+	if type(tree) == 'table' and type(tree.tree) == 'table' then
+		local names, prefix = {}, folder..'/'
+		for _, v in tree.tree do
+			if v.type == 'blob' and v.path:sub(1, #prefix) == prefix then
+				local name = v.path:sub(#prefix + 1)
+				-- Direct children only, matching what contents/ returned; a nested path would
+				-- otherwise be fetched into a folder that does not exist locally.
+				if name ~= '' and not name:find('/') then
+					table.insert(names, name)
+				end
+			end
+		end
+		if #names > 0 then return names end
+	end
+
 	local reqSuc, res = pcall(function()
 		return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/contents/'..folder, true)
 	end)
-	if not (reqSuc and res and res ~= '404: Not Found') then return end
+	if not (reqSuc and res and res ~= '404: Not Found') then return nil end
 	local bodySuc, body = pcall(function()
 		return cloneref(game:GetService('HttpService')):JSONDecode(res)
 	end)
-	if not (bodySuc and body and typeof(body) == 'table') then return end
+	if not (bodySuc and body and typeof(body) == 'table') then return nil end
+	local names = {}
+	for _, v in body do
+		if v.type == 'file' then table.insert(names, v.name) end
+	end
+	return names
+end
+
+local function prefetchFolder(folder)
+	local names = listRepoFolder(folder)
+	if not names then return end
 
 	local toFetch = {}
-	for _, v in body do
+	for _, name in names do
 		-- hasContent, not isfile: a truncated asset from an interrupted prefetch must be picked
 		-- up again here rather than skipped forever. See the note on hasContent.
-		if v.type == 'file' and not hasContent('pistonware/'..folder..'/'..v.name) then
-			table.insert(toFetch, v.name)
+		if not hasContent('pistonware/'..folder..'/'..name) then
+			table.insert(toFetch, name)
 		end
 	end
 	if #toFetch <= 0 then return end
 
 	local completed, total = 0, #toFetch
-	local done = Instance.new('BindableEvent')
 	updateDownloader('Downloading '..folder..' ('..completed..'/'..total..')')
 
 	-- A fixed pool rather than one task per file. assets/new alone holds 63 files, and a user
@@ -151,10 +203,13 @@ local function prefetchFolder(folder)
 	-- times. That is a large memory and socket spike at boot on a device that has not even
 	-- built the GUI yet. Same files, same order, same completion signal; just a ceiling on how
 	-- many are outstanding at once.
-	local PREFETCH_WORKERS = 6
+	-- Raised from 6. That number was chosen when each worker also cost a GitHub API call and
+	-- every file was spawned its own task; with the pool in place the ceiling is just how many
+	-- small PNG bodies are in flight at once, and 12 keeps the pipe full on the round-trip
+	-- latency that dominates here without the memory spike a task-per-file caused.
+	local PREFETCH_WORKERS = 12
 	local nextIndex = 1
 	local workers = math.min(PREFETCH_WORKERS, total)
-	local active = workers
 
 	for _ = 1, workers do
 		task.spawn(function()
@@ -168,24 +223,19 @@ local function prefetchFolder(folder)
 				pcall(downloadFile, 'pistonware/'..folder..'/'..toFetch[index])
 				completed += 1
 				-- pcall'd and after the counter: if this ever threw, the worker would die
-				-- before releasing the wait below and the boot would hang on a GUI error
+				-- before the join below could count it and the boot would hang on a GUI error
 				pcall(updateDownloader, 'Downloading '..folder..' ('..completed..'/'..total..')')
-			end
-			active -= 1
-			if active <= 0 then
-				done:Fire()
 			end
 		end)
 	end
-	-- Only wait when a worker is still outstanding. task.spawn runs each task inline until it
-	-- yields, so on executors where HttpGet does NOT yield the scheduler every worker drains
-	-- the whole queue inside the loop above -- done:Fire() then lands with nothing listening
-	-- yet, and an unconditional Wait() blocks forever with the label frozen at total/total.
-	-- Same guard the loader's downloaders already use.
-	if active > 0 then
-		done.Event:Wait()
+
+	-- Joined on the counter with a deadline rather than on a BindableEvent with none. A worker
+	-- that dies now costs the files it had left; it used to cost the whole boot, parked on
+	-- Wait() with nothing left alive to fire it.
+	local deadline = os.clock() + 120
+	while completed < total and os.clock() < deadline do
+		task.wait(0.05)
 	end
-	done:Destroy()
 end
 
 -- False while a game script is still registering its modules on its own thread. A fast game
@@ -294,7 +344,7 @@ local function finishLoading()
 		local how = shared.PistonwareBedwarsLoaded and 'payload signalled'
 			or gameScriptFinished and 'game script returned'
 			or 'TIMED OUT after 120s -- re-upload bedwars.lua to LuaArmor so it can signal when it is done'
-		warn(('[pistonware] %d modules in %.1fs (%s) -- applying profile'):format(count, os.clock() - started, how))
+		debugWarn(('[pistonware] %d modules in %.1fs (%s) -- applying profile'):format(count, os.clock() - started, how))
 	end
 
 	if gameScriptFinished then
@@ -383,9 +433,25 @@ end
 	if not isfolder('pistonware/assets/'..gui) then
 		makefolder('pistonware/assets/'..gui)
 	end
-	pcall(prefetchFolder, 'assets/'..gui)
+	-- Both folders at once. A user on any theme other than 'new' needs their own assets AND
+	-- assets/new (the fallback set the GUIs fall back to), and running the two in sequence made
+	-- them pay the full round-trip cost of each in turn for no reason -- they share nothing and
+	-- neither depends on the other's result.
 	if gui ~= 'new' then
-		pcall(prefetchFolder, 'assets/new')
+		local fallbackDone = false
+		task.spawn(function()
+			pcall(prefetchFolder, 'assets/new')
+			fallbackDone = true
+		end)
+		pcall(prefetchFolder, 'assets/'..gui)
+		-- Bounded like every other join: prefetchFolder already has its own deadline, so this
+		-- only ever waits out the tail of a folder that finished second.
+		local deadline = os.clock() + 130
+		while not fallbackDone and os.clock() < deadline do
+			task.wait(0.05)
+		end
+	else
+		pcall(prefetchFolder, 'assets/'..gui)
 	end
 	destroyDownloader()
 	vape = loadstring(downloadFile('pistonware/guis/'..gui..'.lua'), 'gui')()
@@ -470,7 +536,7 @@ if not shared.VapeIndependent then
 			-- instead of guessed at.
 			local elapsed = os.clock() - started
 			if elapsed > 5 then
-				warn(('[pistonware] %s finished in %.1fs -- its modules now have their saved settings'):format(chunkname, elapsed))
+				debugWarn(('[pistonware] %s finished in %.1fs -- its modules now have their saved settings'):format(chunkname, elapsed))
 			end
 			if not ok then
 				warn('[pistonware] '..chunkname..' errored: '..tostring(err))
