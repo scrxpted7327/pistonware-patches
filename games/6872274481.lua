@@ -48,7 +48,19 @@ local lightingService = cloneref(game:GetService('Lighting'))
 local teleportService = cloneref(game:GetService("TeleportService"))
 local virtualInputManager = cloneref(game:GetService('VirtualInputManager'))
 
-local isnetworkowner = identifyexecutor and table.find({'AWP', 'Nihon'}, ({identifyexecutor()})[1]) and isnetworkowner or function()
+-- identifyexecutor exists but THROWS on several mobile executors, and this runs at the top
+-- level of the file -- so an unguarded call here does not degrade one feature, it kills the
+-- whole game script before a single module registers. main.lua already carries a comment
+-- saying exactly this about its own call; these three never got the same treatment, and this
+-- is the file BedWars users load.
+local function executorName()
+	local ok, name = pcall(function()
+		return identifyexecutor and ({identifyexecutor()})[1] or nil
+	end)
+	return (ok and type(name) == 'string') and name or ''
+end
+
+local isnetworkowner = table.find({'AWP', 'Nihon'}, executorName()) and isnetworkowner or function()
 	return true
 end
 local gameCamera = workspace.CurrentCamera
