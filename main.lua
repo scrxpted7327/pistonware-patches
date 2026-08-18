@@ -36,6 +36,17 @@ local cloneref = cloneref or function(obj)
 end
 local playersService = cloneref(game:GetService('Players'))
 
+-- Whether the GUI will read asset files off disk at all.
+--
+-- guis/*.lua build getcustomasset as `not inputService.TouchEnabled and assetfunction and
+-- <disk version> or <table version>`, so on a touch device every icon comes from the uploaded
+-- rbxassetid table and the files on disk are never opened. Tested here with the IDENTICAL
+-- condition, so main.lua and the GUI can never disagree about whether those files are needed.
+local isTouchDevice = false
+pcall(function()
+	isTouchDevice = cloneref(game:GetService('UserInputService')).TouchEnabled and true or false
+end)
+
 -- Telemetry the developer build prints and the public build does not.
 --
 -- Module counts and load timings are what you want in front of you while working on the loader,
@@ -281,7 +292,7 @@ local function finishLoading()
 		inline until it yields, and only bedwars.lua yields), so this whole block runs
 		synchronously and behaves exactly as it always did.
 	]]
-	local function applyProfile()
+	local function applyProfile(moduleSetComplete)
 		-- A session LuaArmor refused registered no game modules at all (see the session
 		-- block at the top of bedwars.lua). Loading a profile against that empty set would
 		-- bring everything up on defaults, and the Save below would write those defaults
@@ -292,6 +303,28 @@ local function finishLoading()
 			return
 		end
 		vape:Load(nil, customProfile)
+
+		--[[
+			Loading an incomplete module set is fine: every module that exists gets its saved
+			settings, and the ones still registering simply arrive later. PERSISTING one is not
+			fine, and this is where mobile configs were being reset.
+
+			waitForModules only reports incomplete when it hit its 120s backstop. On desktop that
+			effectively never happens -- the payload signals long before. On a phone it happens
+			for real, because the LuaArmor VM is slow enough there to run past the deadline. What
+			followed was the destructive half: profileApplied went true, the autosave loop started
+			ten seconds later, and Save() serialised a module list that was still missing most of
+			BedWars -- writing every one of those settings out of the profile permanently.
+
+			So a timed-out load now applies and stops. Nothing is written, the file on disk stays
+			exactly as the user left it, and the modules that arrive late keep their saved values
+			because nothing overwrote them.
+		]]
+		if not moduleSetComplete then
+			warn('[pistonware] modules are still loading -- your config was applied but will NOT be saved this session, so nothing gets overwritten')
+			return
+		end
+
 		profileApplied = true
 		-- Persist the applied profile so a reinject before the first autosave tick still comes
 		-- back to the same config.
@@ -303,10 +336,15 @@ local function finishLoading()
 		-- revoked mid-session, and when that happens bedwars.lua switches every module off.
 		-- Catching the flag only once per cycle would leave up to ten seconds in which this
 		-- loop could persist that switched-off state over a good config.
+		-- Save() serialises every module and writes a file. On desktop that is imperceptible
+		-- every ten seconds; on a phone it is a visible hitch on the same cadence, and it is one
+		-- of the things people mean by 'it freezes a lot'. Thirty seconds there trades a little
+		-- more unsaved work in a crash for a GUI that stays smooth while you are using it.
+		local saveInterval = isTouchDevice and 30 or 10
 		task.spawn(function()
 			while vape.Loaded and not shared.PistonwareSessionRejected do
-				vape:Save()
-				for _ = 1, 10 do
+				pcall(function() vape:Save() end)
+				for _ = 1, saveInterval do
 					task.wait(1)
 					if not vape.Loaded or shared.PistonwareSessionRejected then break end
 				end
@@ -331,33 +369,41 @@ local function finishLoading()
 	--
 	-- The timeout is a backstop, not a mechanism. It only matters when the payload on LuaArmor
 	-- predates the completion flag; re-upload bedwars.lua and this returns the moment it lands.
+	-- Returns whether the module list is actually COMPLETE, which is not the same as whether
+	-- the wait finished. Hitting the backstop means the payload is still registering, and the
+	-- caller has to know that before it writes anything to disk.
 	local function waitForModules()
-		if gameScriptFinished then return end
+		if gameScriptFinished then return true end
 		local started = os.clock()
 		repeat
 			task.wait(0.1)
 		until gameScriptFinished
 			or shared.PistonwareBedwarsLoaded
 			or os.clock() - started > 120
+		local complete = (gameScriptFinished or shared.PistonwareBedwarsLoaded) and true or false
 		local count = 0
 		for _ in vape.Modules do count += 1 end
 		local how = shared.PistonwareBedwarsLoaded and 'payload signalled'
 			or gameScriptFinished and 'game script returned'
 			or 'TIMED OUT after 120s -- re-upload bedwars.lua to LuaArmor so it can signal when it is done'
 		debugWarn(('[pistonware] %d modules in %.1fs (%s) -- applying profile'):format(count, os.clock() - started, how))
+		return complete
 	end
 
 	if gameScriptFinished then
-		applyProfile()
+		applyProfile(true)
 	else
 		task.spawn(function()
-			waitForModules()
-			applyProfile()
+			applyProfile(waitForModules())
 		end)
 	end
 
 	local teleportedServers
-	vape:Clean(playersService.LocalPlayer.OnTeleport:Connect(function()
+	vape:Clean(playersService.LocalPlayer.OnTeleport:Connect(function(teleportState)
+		-- A failed teleport is ignored rather than consumed. OnTeleport fires for EVERY state
+		-- and the one-shot guard below does not look at which -- so an attempt that failed used
+		-- to burn it, and the teleport that actually went somewhere afterwards queued nothing.
+		if teleportState == Enum.TeleportState.Failed then return end
 		if (not teleportedServers) and (not shared.VapeIndependent) then
 			teleportedServers = true
 			-- Re-runs main.lua, not the loader. The loader is a full boot -- duplicate-run
@@ -397,18 +443,40 @@ local function finishLoading()
 			-- queueing before the payload has finished means vape.Profile is not set yet, and
 			-- without this the next server would be told to load 'default'.
 			teleportScript = 'shared.VapeCustomProfile = '..string.format('%q', vape.Profile or customProfile or 'default')..'\n'..teleportScript
-			-- Same rule as everywhere else: saving before the profile has been applied against the
-			-- full module set would write one missing every module still to appear. Queueing
-			-- straight into a match is exactly when that happens, so skip the save rather than
-			-- corrupt the config -- what is on disk is already correct, there is simply nothing
-			-- new worth recording yet.
-			if profileApplied then
-				vape:Save()
-			end
+			--[[
+				Queue FIRST, and guard everything after it.
+
+				The queue call used to be LAST, sitting behind an unguarded vape:Save(). Two
+				things were wrong with that, and together they are the crash people hit when
+				queueing from one match straight into another:
+
+				  * Save() serialises every module and writes a file. This callback runs while
+				    the client is already tearing down for the teleport, and a blocking disk
+				    write in that window is what takes the game down with it -- worst on mobile,
+				    where storage is slowest and the window is shortest.
+				  * Save() was not pcall'd. If it threw, queue_on_teleport never ran at all, so
+				    the script silently failed to come back on the new server. A failure to save
+				    became a failure to re-inject.
+
+				Queueing first makes the re-injection independent of everything that follows.
+				Nothing below can cost you the script any more.
+			]]
+			pcall(queue_on_teleport, teleportScript)
+
 			if not hasQueueOnTeleport then
-				vape:CreateNotification('Pistonware', 'queue_on_teleport is not supported by your executor -- Vape will not re-inject automatically after this teleport (e.g. queueing into a match). You will need to re-run your loadstring manually.', 15, 'alert')
+				pcall(function()
+					vape:CreateNotification('Pistonware', 'queue_on_teleport is not supported by your executor -- Vape will not re-inject automatically after this teleport (e.g. queueing into a match). You will need to re-run your loadstring manually.', 15, 'alert')
+				end)
 			end
-			queue_on_teleport(teleportScript)
+
+			-- Best effort, and last. Same rule as everywhere else: saving before the profile has
+			-- been applied against the full module set would write one missing every module still
+			-- to appear. Queueing straight into a match is exactly when that happens, so skip the
+			-- save rather than corrupt the config -- what is on disk is already correct, there is
+			-- simply nothing new worth recording yet.
+			if profileApplied then
+				pcall(function() vape:Save() end)
+			end
 		end
 	end))
 
@@ -433,11 +501,31 @@ end
 	if not isfolder('pistonware/assets/'..gui) then
 		makefolder('pistonware/assets/'..gui)
 	end
-	-- Both folders at once. A user on any theme other than 'new' needs their own assets AND
-	-- assets/new (the fallback set the GUIs fall back to), and running the two in sequence made
-	-- them pay the full round-trip cost of each in turn for no reason -- they share nothing and
-	-- neither depends on the other's result.
-	if gui ~= 'new' then
+	--[[
+		Skipped entirely on touch devices, because they never open these files.
+
+		The GUIs build getcustomasset as `not inputService.TouchEnabled and assetfunction and
+		<disk version> or <table version>`. On a phone that is the table version: every icon
+		resolves to an uploaded rbxassetid and nothing is ever read from pistonware/assets. But
+		main.lua downloaded the whole tree regardless -- roughly 190 HTTP requests, 190 disk
+		writes and the memory to hold the bodies, on the device least able to afford any of it,
+		producing files nothing would ever open.
+
+		That is a large part of why mobile is slow to load and stutters while loading, and on a
+		bad connection it is why it sometimes never finishes at all: every one of those requests
+		can retry four times, and the join waits up to two minutes for them.
+
+		isTouchDevice is read with the identical condition the GUIs use, so the two cannot
+		disagree about whether the files are wanted. A desktop with a touchscreen takes this path
+		too -- correctly, because its GUI will also use the table.
+	]]
+	if isTouchDevice then
+		debugWarn('[pistonware] touch device -- skipping asset prefetch, icons come from uploaded ids')
+	elseif gui ~= 'new' then
+		-- Both folders at once. A user on any theme other than 'new' needs their own assets AND
+		-- assets/new (the fallback set the GUIs fall back to), and running the two in sequence
+		-- made them pay the full round-trip cost of each in turn for no reason -- they share
+		-- nothing and neither depends on the other's result.
 		local fallbackDone = false
 		task.spawn(function()
 			pcall(prefetchFolder, 'assets/new')
