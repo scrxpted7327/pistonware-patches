@@ -65,10 +65,27 @@ for _, v in {'AntiRagdoll', 'TriggerBot', 'SilentAim', 'AutoRejoin', 'Rejoin', '
 	vape:Remove(v)
 end
 
-for _, v in vape.Modules do
-	if v.Category == 'Combat' or v.Category == 'Minigames' then
-		vape:Remove(i)
+-- Two bugs in the three lines this replaces, and they hid each other.
+--
+-- It called vape:Remove(i), and `i` is not declared anywhere in this file -- it was an
+-- undeclared global, so every call was Remove(nil). Remove looks its argument up in
+-- self.Modules and bails when it finds nothing, so the loop silently did nothing at all and the
+-- lobby kept showing the combat modules this is meant to strip.
+--
+-- The second bug is why it cannot simply be corrected in place: Remove ends with `tab[obj] =
+-- nil`, so fixing the argument would have it deleting keys out of vape.Modules while this loop
+-- is still walking vape.Modules. Removing a key other than the one `next` is currently sitting
+-- on is undefined in Lua -- in practice it skips entries or errors mid-iteration.
+--
+-- Collect first, remove after: the walk finishes before anything is mutated.
+local toRemove = {}
+for name, module in vape.Modules do
+	if module.Category == 'Combat' or module.Category == 'Minigames' then
+		table.insert(toRemove, name)
 	end
+end
+for _, name in toRemove do
+	vape:Remove(name)
 end
 
 run(function()
