@@ -19,6 +19,20 @@ end
 
 local isDeveloper = (not PUBLIC_BUILD) and shared.PistonwareDeveloper and true or false
 
+-- Developer-only boot timing. The console shows ONE line -- 'Injecting into ROBLOX...' -- from
+-- the moment the key validates until main.lua starts, and the status chip reads INJECTING right
+-- through main.lua on top of that. So every wait in between (Roblox loading, the GitHub tree,
+-- the GUI build, the payload) looks identical from outside: 'stuck on injecting'. These marks
+-- put a number on each one instead, in the executor output, for the build that is allowed to
+-- care. Off entirely in the public build -- isDeveloper is false there by construction.
+local phaseClock = os.clock()
+local function phase(name)
+	if not isDeveloper then return end
+	local now = os.clock()
+	warn(('[pistonware] boot: %s took %.2fs'):format(name, now - phaseClock))
+	phaseClock = now
+end
+
 if shared.PistonwareLoaderBoot and os.clock() - shared.PistonwareLoaderBoot < 180 then
 	warn('[pistonware] loader is already running, ignoring duplicate execution')
 	return
@@ -209,9 +223,19 @@ end
 	of it -- the .lua manifest, the profiles listing, and the profiles fingerprint. The separate
 	commits call existed only to learn the sha this response already carries.
 ]]
-local repoTree, repoTreeTried
+local repoTree, repoTreeTried, repoTreeDone
 local function fetchRepoTree()
-	if repoTreeTried then return repoTree end
+	if repoTreeTried then
+		-- Joined, not returned. repoTreeTried is set on ENTRY, so a second caller arriving
+		-- while the first request is still in flight used to be handed nil and read that as
+		-- 'no tree' -- silently skipping whatever it wanted the tree for. Harmless while the
+		-- only concurrent caller was the update task, but the prefetch below makes a
+		-- concurrent second caller the normal case.
+		if not repoTreeDone then
+			joinBatch(function() return repoTreeDone end, 30)
+		end
+		return repoTree
+	end
 	repoTreeTried = true
 	pcall(function()
 		local httpService = cloneref(game:GetService('HttpService'))
@@ -223,6 +247,7 @@ local function fetchRepoTree()
 			shared.PistonwareRepoTree = body
 		end
 	end)
+	repoTreeDone = true
 	return repoTree
 end
 
@@ -1601,6 +1626,7 @@ do
 	end
 
 	-- Authenticated: hand the console back to the boot it was holding up.
+	phase('key gate')
 	console:SetStatus('INJECTING')
 	console:SetLine('Injecting into ROBLOX...')
 	console:SetProgress(0.12)
@@ -1639,6 +1665,23 @@ if not updateDone then
 		end)
 		updateDone = true
 	end)
+else
+	-- Skipping the update check is not the same as needing no tree. The profile-sync check in
+	-- Step 2b calls profilesFingerprint() -> fetchRepoTree() either way, and with the update
+	-- task never started that call is COLD -- a synchronous, unbounded api.github.com request
+	-- made on the boot thread, while the console still reads 'Injecting into ROBLOX...' and
+	-- nothing on screen changes for the duration. That is a stall the public build does not
+	-- have, because there the update task has already warmed the memo by the time Step 2b runs.
+	--
+	-- Warmed here instead, inside the game:IsLoaded wait below, so Step 2b reads a finished
+	-- memo. Nothing joins this: fetchRepoTree parks a late caller on its own bounded join now,
+	-- and every consumer already treats a missing tree as 'skip the check'.
+	--
+	-- Not started on a reload -- Step 2b is skipped outright there (`not isReload`), so the
+	-- request would be pure cost.
+	if not isReload then
+		task.spawn(fetchRepoTree)
+	end
 end
 
 -- Step 1: hold here until ROBLOX itself is ready.
@@ -1655,6 +1698,7 @@ do
 	end
 	console:SetProgress(0.4)
 end
+phase('waiting for ROBLOX')
 if console:IsAborted() then deleteInstall() return end
 
 -- Join the update check before anything reads a cached .lua file. Bounded for the same reason
@@ -1665,6 +1709,7 @@ if not updateDone then
 	console:SetLine('')
 	if console:IsAborted() then deleteInstall() return end
 end
+phase('update check')
 console:SetProgress(0.46)
 
 -- Detect the very first run (empty/near-empty profiles folder) BEFORE downloading, so we
@@ -1837,6 +1882,7 @@ if not firstRunProfiles and not declinedDownload and not isReload then
 		-- until the user agrees to sync once.
 	end
 end
+phase('config download/sync')
 console:SetProgress(0.73)
 
 -- Step 3: after the shipped configs finish downloading, ask which one should load by default
@@ -1862,6 +1908,7 @@ if downloadedConfigs then
 	end
 end
 
+phase('config prompt')
 console:SetProgress(0.8)
 console:SetLine('Loading pistonware...')
 -- Creeps the last couple of rows in while main.lua downloads and builds the GUI, so the face
@@ -1885,6 +1932,7 @@ local ok, result = pcall(function()
 	return loadstring(downloadFile('pistonware/main.lua'), 'main')()
 end)
 injecting = false
+phase('main.lua')
 -- Consumed only now: main.lua reads the flag itself while loading (it suppresses the 'Finished
 -- Loading' notification on a reload). Left set it would leak into the rest of the session,
 -- since main.lua never clears it and the next teleport/reinject sets it again anyway.
