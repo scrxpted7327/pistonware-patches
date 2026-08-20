@@ -34,6 +34,63 @@ local guiService = cloneref(game:GetService('GuiService'))
 local runService = cloneref(game:GetService('RunService'))
 local httpService = cloneref(game:GetService('HttpService'))
 
+--[[
+	What this Roblox client can actually do.
+
+	Mobile executors ship an older Roblox build than the desktop ones -- Delta is a repackaged
+	client, not the live app -- and the rewritten GUI reaches for UI features that only exist on
+	recent versions. Instance.new on a class the client does not have THROWS, and so does
+	assigning a property it does not have. Both happen while the GUI is being built, outside any
+	pcall, so one missing feature took the whole menu down rather than degrading.
+
+	Asked once here, and the answers are constants from then on -- these cannot change mid-session.
+]]
+local function classExists(className)
+	local ok, obj = pcall(Instance.new, className)
+	if ok and typeof(obj) == 'Instance' then
+		obj:Destroy()
+		return true
+	end
+	return false
+end
+
+local function propertyExists(className, property, value)
+	local ok, obj = pcall(Instance.new, className)
+	if not (ok and typeof(obj) == 'Instance') then return false end
+	local set = pcall(function() obj[property] = value end)
+	obj:Destroy()
+	return set
+end
+
+local hasUIShadow = classExists('UIShadow')
+local hasCornerRadii = propertyExists('UICorner', 'TopLeftRadius', UDim.new(0, 4))
+local hasBorderOffset = propertyExists('UIStroke', 'BorderOffset', UDim.new(0, 1))
+
+local gameCamera = workspace.CurrentCamera
+
+-- Viewport in GUI units. The camera answers immediately; a ScreenGui's AbsoluteSize is (0, 0)
+-- until it has rendered at least one frame, which on a phone is after the GUI has already been
+-- built and scaled -- so reading the GUI gave the floor value on the first pass every time.
+local function viewportWidth()
+	local camera = gameCamera or workspace.CurrentCamera
+	local width = camera and camera.ViewportSize.X or 0
+	if width <= 0 and gui then
+		width = gui.AbsoluteSize.X
+	end
+	return width
+end
+
+-- The old GUI's rescale, restored exactly: never below half size, never above 1:1.
+--
+-- The rewrite had math.max(width / 1920, 0.6) -- no upper bound at all. Phones report their
+-- render resolution here, so a 2400-wide handset asked for a 1.25x menu on the smallest screen
+-- in the lineup, and the window ran off the edge with no way to drag it back.
+local function autoScaleValue()
+	local width = viewportWidth()
+	if width <= 0 then return 1 end
+	return math.clamp(width / 1920, 0.5, 1)
+end
+
 local fontsize = Instance.new('GetTextBoundsParams')
 fontsize.Width = math.huge
 local notifications
@@ -401,9 +458,24 @@ vape.Libraries = {
 	getfontsize = getfontbounds,
 }
 
+--[[
+	UIShadow is a real blur the GPU computes every frame, and there are 14 of these -- one behind
+	every window, the tooltip, the search box and the target-info panel.
+
+	Two problems on a phone. It does not exist at all on the older client mobile executors ship,
+	where Instance.new('UIShadow') throws and takes the window being built with it; and where it
+	does exist, a dozen live blurs is exactly the kind of per-frame GPU work that makes a mobile
+	client stutter and then die on memory pressure.
+
+	So: real blur on desktop when the client has it, and otherwise the pre-baked blur PNG the old
+	GUI used for all 14 of these. It is one ImageLabel, drawn once, and it looks near enough the
+	same -- callers that already asked for it by passing `old` were using it for that reason.
+]]
+local useRealBlur = hasUIShadow and not inputService.TouchEnabled
+
 local function addBlur(parent, notif, old)
 	local blur
-	if old then
+	if old or not useRealBlur then
 		blur = Instance.new('ImageLabel')
 		blur.Name = 'Blur'
 		blur.Size = UDim2.new(1, 89, 1, 52)
@@ -861,21 +933,54 @@ function vape:Load(skipgui, profile)
 
 	self.Loaded = canSave
 
+	--[[
+		The mobile open button, restored to what the old GUI shipped.
+
+		The rewrite put a 32x32 button at a fixed offset in the top-right corner of the raw
+		ScreenGui. Two things wrong with that on a phone, and they are the same complaint:
+
+		Offset sizes only track the viewport for descendants of the scaled frame, because that is
+		what carries the UIScale. Parented straight to `gui` it was 32 physical pixels on every
+		device -- a speck on a modern handset, and no amount of rescaling the menu changed it.
+
+		And at (1, -90) it sat under the Roblox chat and menu buttons on most phones, so the tap
+		either did nothing or opened Roblox's own UI.
+
+		Back under scaledgui, back to 110x110 centre-anchored below the search bar, which is
+		where it was when it worked. The image is fromScale so it tracks the button rather than
+		needing its own offsets.
+	]]
 	if inputService.TouchEnabled and not skipgui then
 		local button = Instance.new('TextButton')
+		button.AnchorPoint = Vector2.new(0.5, 0)
 		button.BackgroundColor3 = Color3.new()
-		button.BackgroundTransparency = 0.2
-		button.Position = UDim2.new(1, -90, 0, 4)
-		button.Size = UDim2.fromOffset(32, 32)
+		button.BackgroundTransparency = 0.5
+		-- Below the search bar, not on top of it: that is centred at y=13 with a 37px collapsed
+		-- height, and this is 110 wide against its 220, so anything higher covered the field.
+		button.Position = UDim2.new(0.5, 0, 0, 60)
+		button.Size = UDim2.fromOffset(110, 110)
 		button.Text = ''
-		button.Parent = gui
+		-- scaledgui, not gui. This is the whole point: scaledgui carries the UIScale.
+		button.Parent = scaledgui
 		local image = Instance.new('ImageLabel')
+		image.AnchorPoint = Vector2.new(0.5, 0.5)
 		image.BackgroundTransparency = 1
 		image.Image = getvapeasset('pistonware/assets/new/vape.png')
-		image.Position = UDim2.fromOffset(6, 6)
-		image.Size = UDim2.fromOffset(20, 20)
+		image.Position = UDim2.fromScale(0.5, 0.5)
+		image.Size = UDim2.fromScale(0.8, 0.8)
 		image.Parent = button
 		addCorner(button, UDim.new(1, 0))
+		self.VapeButton = button
+		self.VapeButtonImage = image
+		self.VapeButtonTransparency = button.BackgroundTransparency
+
+		-- Options have already loaded by here, so the saved setting has to be applied to the
+		-- button now -- the toggle's own Function ran before this existed. Transparency rather
+		-- than Visible, so the button still takes the tap while hidden.
+		if self.HideVapeButton and self.HideVapeButton.Enabled then
+			button.BackgroundTransparency = 1
+			image.ImageTransparency = 1
+		end
 
 		button.MouseButton1Click:Connect(function()
 			self.GUIBind.Triggered:Fire(true)
@@ -906,8 +1011,22 @@ function vape:LoadGUI()
 	if vape.ThreadFix then
 		local holder = Instance.new('Folder')
 		holder.Parent = cloneref(game:GetService('CoreGui'))
-		gui.OnTopOfCoreBlur = true
-		gui.Parent = (gethui and gethui()) or cloneref(game:GetService('CoreGui'))
+		-- Recent property; older clients throw on the assignment rather than ignoring it.
+		pcall(function() gui.OnTopOfCoreBlur = true end)
+		--[[
+			CoreGui on touch devices, gethui elsewhere.
+
+			The old GUI had gethui commented out entirely, with CoreGui forced in its place --
+			deliberately, and it is the mobile executors that are the reason. Their gethui hands
+			back a hidden container the client itself owns and reclaims: it gets emptied out from
+			under the script, and a ScreenGui whose parent is destroyed underneath it is a
+			straightforward way to take the client with it.
+
+			Kept on desktop, where it works and is the more discreet parent of the two, and where
+			nothing has been reported against it.
+		]]
+		local hidden = (not inputService.TouchEnabled) and gethui and select(2, pcall(gethui)) or nil
+		gui.Parent = (typeof(hidden) == 'Instance' and hidden) or cloneref(game:GetService('CoreGui'))
 		vape.holder = holder
 	else
 		gui.Parent = cloneref(game:GetService('Players')).LocalPlayer.PlayerGui
@@ -965,7 +1084,7 @@ function vape:LoadGUI()
 	toolblur = addBlur(tooltip)
 	addCorner(tooltip)
 	scale = Instance.new('UIScale')
-	scale.Scale = math.max(gui.AbsoluteSize.X / 1920, 0.6)
+	scale.Scale = autoScaleValue()
 	scale.Parent = scaledgui
 	scaledgui.Size = UDim2.fromScale(1 / scale.Scale, 1 / scale.Scale)
 	components.GUI({})
@@ -1334,7 +1453,10 @@ function vape:LoadGUI()
 		Function = function(callback)
 			ScaleSlider.Object.Visible = not callback
 			if callback then
-				--scale.Scale = math.max(gui.AbsoluteSize.X / 1920, 0.6)
+				-- Was commented out in the rewrite, so turning Auto rescale back on did
+				-- nothing at all until the next resize -- and on a phone there is no next
+				-- resize. The menu just stayed at whatever the manual slider left it on.
+				scale.Scale = autoScaleValue()
 			else
 				scale.Scale = ScaleSlider.Value
 			end
@@ -1355,6 +1477,27 @@ function vape:LoadGUI()
 		Default = 1,
 		Darker = true,
 		Visible = false
+	})
+	
+	--[[
+		Carried over from the old GUI, and only meaningful on a phone.
+
+		Drops the transparencies rather than flipping Visible. An invisible GuiObject stops
+		hit-testing in Roblox, so hiding the button used to take its tap target with it -- and
+		the only way back into the menu after that is the keybind, which a phone does not have.
+		Fully transparent still receives input, so it keeps opening the menu from where it sat.
+	]]
+	vape.HideVapeButton = guipane:CreateToggle({
+		Name = 'Hide Pistonware Mobile Button',
+		Function = function(callback)
+			if vape.VapeButton then
+				vape.VapeButton.BackgroundTransparency = callback and 1 or (vape.VapeButtonTransparency or 0)
+				if vape.VapeButtonImage then
+					vape.VapeButtonImage.ImageTransparency = callback and 1 or 0
+				end
+			end
+		end,
+		Tooltip = 'Makes the Pistonware button invisible on mobile\nIt still opens the GUI when tapped'
 	})
 	
 	vape.RainbowSpeed = guipane:CreateSlider({
@@ -1947,15 +2090,21 @@ function vape:LoadGUI()
 						local bottom = (not Labels[index + 1] or (Labels[index + 1].Size.X.Offset < label.Size.X.Offset)) and 4 or 0
 		
 						label.Color.Parent.Line.Visible = index ~= 1
-						label.Color.UICorner.TopLeftRadius = isRight and UDim.new() or UDim.new(0, index == 1 and 4 or 0)
-						label.Color.UICorner.TopRightRadius = isRight and UDim.new(0, index == 1 and 4 or 0) or UDim.new()
-						label.Color.UICorner.BottomLeftRadius = isRight and UDim.new() or UDim.new(0, index == #Labels and 4 or 0)
-						label.Color.UICorner.BottomRightRadius = isRight and UDim.new(0, index == #Labels and 4 or 0) or UDim.new()
 		
-						label.Background.UICorner.TopLeftRadius = UDim.new(0, top)
-						label.Background.UICorner.TopRightRadius = UDim.new(0, top)
-						label.Background.UICorner.BottomLeftRadius = UDim.new(0, bottom)
-						label.Background.UICorner.BottomRightRadius = UDim.new(0, bottom)
+						-- Per-corner radii are recent; older clients only have CornerRadius. This
+						-- runs on the Text GUI's redraw, so on a client without them it was not
+						-- one error -- it threw on every single refresh, forever.
+						if hasCornerRadii then
+							label.Color.UICorner.TopLeftRadius = isRight and UDim.new() or UDim.new(0, index == 1 and 4 or 0)
+							label.Color.UICorner.TopRightRadius = isRight and UDim.new(0, index == 1 and 4 or 0) or UDim.new()
+							label.Color.UICorner.BottomLeftRadius = isRight and UDim.new() or UDim.new(0, index == #Labels and 4 or 0)
+							label.Color.UICorner.BottomRightRadius = isRight and UDim.new(0, index == #Labels and 4 or 0) or UDim.new()
+		
+							label.Background.UICorner.TopLeftRadius = UDim.new(0, top)
+							label.Background.UICorner.TopRightRadius = UDim.new(0, top)
+							label.Background.UICorner.BottomLeftRadius = UDim.new(0, bottom)
+							label.Background.UICorner.BottomRightRadius = UDim.new(0, bottom)
+						end
 					end
 		
 					label.Object.LayoutOrder = index
@@ -2301,11 +2450,29 @@ function vape:LoadGUI()
 		end
 	end)
 	
-	vape:Clean(gui:GetPropertyChangedSignal('AbsoluteSize'):Connect(function()
-		if vape.Scale.Enabled then
-			scale.Scale = math.max(gui.AbsoluteSize.X / 1920, 0.6)
+	--[[
+		Rescale on a resize, and on a rotation.
+
+		Watching the ScreenGui's AbsoluteSize alone was not enough on mobile: it is (0, 0) until
+		the GUI first renders, so the initial scale above was always the floor value, and a
+		device that reports the same AbsoluteSize through a rotation never fired at all. The
+		camera's ViewportSize is the thing that actually changes, and it is the signal the old
+		GUI watched.
+	]]
+	local function applyAutoScale()
+		if vape.Scale and vape.Scale.Enabled then
+			scale.Scale = autoScaleValue()
 		end
+	end
+
+	if gameCamera then
+		vape:Clean(gameCamera:GetPropertyChangedSignal('ViewportSize'):Connect(applyAutoScale))
+	end
+	vape:Clean(workspace:GetPropertyChangedSignal('CurrentCamera'):Connect(function()
+		gameCamera = workspace.CurrentCamera
+		applyAutoScale()
 	end))
+	vape:Clean(gui:GetPropertyChangedSignal('AbsoluteSize'):Connect(applyAutoScale))
 	
 	vape:Clean(notifications.ChildRemoved:Connect(function()
 		for index, notif in notifications:GetChildren() do
@@ -2320,9 +2487,14 @@ function vape:LoadGUI()
 	vape:Clean(scale:GetPropertyChangedSignal('Scale'):Connect(function()
 		scaledgui.Size = UDim2.fromScale(1 / scale.Scale, 1 / scale.Scale)
 	
-		for _, obj in scaledgui:QueryDescendants('GuiObject >> [Visible = true]') do
-			obj.Visible = false
-			obj.Visible = true
+		-- GetDescendants, not QueryDescendants. The selector-query API is recent and simply is
+		-- not there on the client mobile executors ship, and this runs on every scale change --
+		-- which on a phone is every rotation. Same objects, same nudge.
+		for _, obj in scaledgui:GetDescendants() do
+			if obj:IsA('GuiObject') and obj.Visible then
+				obj.Visible = false
+				obj.Visible = true
+			end
 		end
 	end))
 	
@@ -2512,6 +2684,13 @@ function vape:Uninject()
 
 	gui:ClearAllChildren()
 	gui:Destroy()
+	-- The ThreadFix branch of LoadGUI parents a Folder into CoreGui and nothing ever removed it,
+	-- so every inject left one behind. That matters here because a queued teleport re-injects on
+	-- each new server: a phone that hops matches all session accumulated a folder per hop.
+	if self.holder and self.holder ~= gui then
+		pcall(function() self.holder:Destroy() end)
+	end
+	self.holder = nil
 	table.clear(self.Connections)
 	table.clear(self.Libraries)
 	loopClean(self)
@@ -5856,7 +6035,10 @@ components = {
 		editbox.Size = UDim2.fromOffset(8, 8)
 		editbox.Parent = edit
 		local editborder = Instance.new('UIStroke')
-		editborder.BorderOffset = UDim.new(0, 1)
+		-- Cosmetic, and absent on older clients. Purely a 1px outset on the edit outline.
+		if hasBorderOffset then
+			editborder.BorderOffset = UDim.new(0, 1)
+		end
 		editborder.LineJoinMode = Enum.LineJoinMode.Miter
 		editborder.Parent = editbox
 		props.Function = props.Function or function() end
