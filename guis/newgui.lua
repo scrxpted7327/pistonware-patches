@@ -960,54 +960,21 @@ function vape:Load(skipgui, profile)
 
 	self.Loaded = canSave
 
-	--[[
-		The mobile open button, restored to what the old GUI shipped.
-
-		The rewrite put a 32x32 button at a fixed offset in the top-right corner of the raw
-		ScreenGui. Two things wrong with that on a phone, and they are the same complaint:
-
-		Offset sizes only track the viewport for descendants of the scaled frame, because that is
-		what carries the UIScale. Parented straight to `gui` it was 32 physical pixels on every
-		device -- a speck on a modern handset, and no amount of rescaling the menu changed it.
-
-		And at (1, -90) it sat under the Roblox chat and menu buttons on most phones, so the tap
-		either did nothing or opened Roblox's own UI.
-
-		Back under scaledgui, back to 110x110 centre-anchored below the search bar, which is
-		where it was when it worked. The image is fromScale so it tracks the button rather than
-		needing its own offsets.
-	]]
 	if inputService.TouchEnabled and not skipgui then
 		local button = Instance.new('TextButton')
-		button.AnchorPoint = Vector2.new(0.5, 0)
 		button.BackgroundColor3 = Color3.new()
-		button.BackgroundTransparency = 0.5
-		-- Below the search bar, not on top of it: that is centred at y=13 with a 37px collapsed
-		-- height, and this is 110 wide against its 220, so anything higher covered the field.
-		button.Position = UDim2.new(0.5, 0, 0, 60)
-		button.Size = UDim2.fromOffset(110, 110)
+		button.BackgroundTransparency = 0.2
+		button.Position = UDim2.new(1, -90, 0, 4)
+		button.Size = UDim2.fromOffset(32, 32)
 		button.Text = ''
-		-- scaledgui, not gui. This is the whole point: scaledgui carries the UIScale.
-		button.Parent = scaledgui
+		button.Parent = gui
 		local image = Instance.new('ImageLabel')
-		image.AnchorPoint = Vector2.new(0.5, 0.5)
 		image.BackgroundTransparency = 1
 		image.Image = getvapeasset('pistonware/assets/new/vape.png')
-		image.Position = UDim2.fromScale(0.5, 0.5)
-		image.Size = UDim2.fromScale(0.8, 0.8)
+		image.Position = UDim2.fromOffset(6, 6)
+		image.Size = UDim2.fromOffset(20, 20)
 		image.Parent = button
 		addCorner(button, UDim.new(1, 0))
-		self.VapeButton = button
-		self.VapeButtonImage = image
-		self.VapeButtonTransparency = button.BackgroundTransparency
-
-		-- Options have already loaded by here, so the saved setting has to be applied to the
-		-- button now -- the toggle's own Function ran before this existed. Transparency rather
-		-- than Visible, so the button still takes the tap while hidden.
-		if self.HideVapeButton and self.HideVapeButton.Enabled then
-			button.BackgroundTransparency = 1
-			image.ImageTransparency = 1
-		end
 
 		button.MouseButton1Click:Connect(function()
 			self.GUIBind.Triggered:Fire(true)
@@ -1504,27 +1471,6 @@ function vape:LoadGUI()
 		Default = 1,
 		Darker = true,
 		Visible = false
-	})
-	
-	--[[
-		Carried over from the old GUI, and only meaningful on a phone.
-
-		Drops the transparencies rather than flipping Visible. An invisible GuiObject stops
-		hit-testing in Roblox, so hiding the button used to take its tap target with it -- and
-		the only way back into the menu after that is the keybind, which a phone does not have.
-		Fully transparent still receives input, so it keeps opening the menu from where it sat.
-	]]
-	vape.HideVapeButton = guipane:CreateToggle({
-		Name = 'Hide Pistonware Mobile Button',
-		Function = function(callback)
-			if vape.VapeButton then
-				vape.VapeButton.BackgroundTransparency = callback and 1 or (vape.VapeButtonTransparency or 0)
-				if vape.VapeButtonImage then
-					vape.VapeButtonImage.ImageTransparency = callback and 1 or 0
-				end
-			end
-		end,
-		Tooltip = 'Makes the Pistonware button invisible on mobile\nIt still opens the GUI when tapped'
 	})
 	
 	vape.RainbowSpeed = guipane:CreateSlider({
