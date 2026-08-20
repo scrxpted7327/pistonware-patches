@@ -495,6 +495,33 @@ local function addBlur(parent, notif, old)
 	return blur
 end
 
+--[[
+	addBlur returns one of two different things, and they are toggled differently.
+
+	A UIShadow is switched with .Enabled. The blur PNG is an ImageLabel, which has no Enabled
+	property at all -- assigning one throws 'Enabled is not a valid member of ImageLabel' and
+	fails the injection. Every caller that turns a blur on or off goes through these instead of
+	guessing which kind it got.
+
+	ClassName rather than IsA, so this never depends on the client knowing the UIShadow class.
+]]
+local function setBlurEnabled(blur, enabled)
+	if not blur then return end
+	if blur.ClassName == 'UIShadow' then
+		blur.Enabled = enabled
+	else
+		blur.Visible = enabled
+	end
+end
+
+local function blurEnabled(blur)
+	if not blur then return false end
+	if blur.ClassName == 'UIShadow' then
+		return blur.Enabled
+	end
+	return blur.Visible
+end
+
 local function addCorner(parent, radius)
 	local corner = Instance.new('UICorner')
 	corner.CornerRadius = radius or UDim.new(0, 5)
@@ -613,7 +640,7 @@ local function addTooltip(gui, text, customText, visCheck)
 			((y + 11) - (tooltip.Size.Y.Offset / 2)) / scale.Scale
 		)
 
-		tooltip.Visible = toolblur.Enabled
+		tooltip.Visible = blurEnabled(toolblur)
 	end
 
 	local function callback()
@@ -1428,7 +1455,7 @@ function vape:LoadGUI()
 		Name = 'Show tooltips',
 		Function = function(enabled)
 			tooltip.Visible = false
-			toolblur.Enabled = enabled
+			setBlurEnabled(toolblur, enabled)
 		end,
 		Default = true,
 		Tooltip = 'Toggles visibility of these'
@@ -2198,7 +2225,7 @@ function vape:LoadGUI()
 		HurtFlash.Parent = Headshot
 		addCorner(HurtFlash)
 		local HeadshotBlur = addBlur(Headshot)
-		HeadshotBlur.Enabled = false
+		setBlurEnabled(HeadshotBlur, false)
 		local Name = Instance.new('TextLabel')
 		Name.Size = UDim2.fromOffset(145, 20)
 		Name.Position = UDim2.fromOffset(54, 20)
@@ -2249,7 +2276,7 @@ function vape:LoadGUI()
 			Armor.Visible = Armor.Size.X.Scale > 0.01
 		end)
 		local HealthBlur = addBlur(HealthBKG)
-		HealthBlur.Enabled = false
+		setBlurEnabled(HealthBlur, false)
 		local Stroke = Instance.new('UIStroke')
 		Stroke.Enabled = false
 		Stroke.Color = Color3.fromHSV(0.44, 1, 1)
@@ -2272,8 +2299,8 @@ function vape:LoadGUI()
 				Holder.BackgroundTransparency = callback and BackgroundTransparency.Value or 1
 				NameShadow.Visible = not callback
 				BlurHolder.Visible = callback
-				HealthBlur.Enabled = not callback
-				HeadshotBlur.Enabled = not callback
+				setBlurEnabled(HealthBlur, not callback)
+				setBlurEnabled(HeadshotBlur, not callback)
 				BackgroundTransparency.Object.Visible = callback
 			end,
 			Default = true
@@ -6435,7 +6462,7 @@ components = {
 		end
 		
 		function component:Expand(visCheck)
-			if visCheck and not blur.Enabled then return end
+			if visCheck and not blurEnabled(blur) then return end
 		
 			self.Expanded = not self.Expanded
 			children.Visible = self.Expanded
@@ -6491,7 +6518,7 @@ components = {
 			if clickgui.Visible then
 				window.Size = UDim2.fromOffset(window.Size.X.Offset, 41)
 				window.BackgroundTransparency = 0
-				blur.Enabled = true
+				setBlurEnabled(blur, true)
 				stroke.Enabled = true
 				icon.Visible = true
 				title.Visible = true
@@ -6500,7 +6527,7 @@ components = {
 			else
 				window.Size = UDim2.fromOffset(window.Size.X.Offset, 0)
 				window.BackgroundTransparency = 1
-				blur.Enabled = false
+				setBlurEnabled(blur, false)
 				stroke.Enabled = false
 				icon.Visible = false
 				title.Visible = false
