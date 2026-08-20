@@ -10,9 +10,16 @@ local vape = {
 	Loaded = false,
 	Libraries = {},
 	Modules = {},
+	-- Maintained on insert and remove so nothing has to WALK vape.Modules to size it.
+	-- main.lua polls this while the payload is still registering, and iterating a table another
+	-- thread is growing is the crash described on vape:Save. Reading a number is not.
+	ModuleCount = 0,
 	Place = game.PlaceId,
 	Profile = 'default',
 	RainbowSliders = {},
+	-- Flipped on by main.lua once the module list has stopped changing. Until then nothing may
+	-- walk vape.Modules -- see the note on vape:Save.
+	SaveReady = false,
 	Settings = {},
 	SettingToggleNotifications = {},
 	ThreadFix = setthreadidentity and true or false,
@@ -2679,11 +2686,28 @@ function vape:Remove(obj)
 		container[obj] = nil
 
 		if isModule then
+			self.ModuleCount = math.max((self.ModuleCount or 1) - 1, 0)
 			self:SortCategories()
 		end
 	end
 end
 
+--[[
+	A plain write of the modules that exist, exactly as the old GUI did it.
+
+	A merge-with-disk version of this was tried so that saving during a partial load could not
+	delete the modules that had not registered yet. It fixed the truncation and reintroduced the
+	crash, because truncation was never the only reason not to save early:
+
+	the loops below walk self.Modules with `next`, and while the payload is still loading the
+	LuaArmor VM is INSERTING into that same table from another thread. Growing a table that is
+	being iterated is undefined in Lua -- a rehash part-way through the walk takes the VM with it,
+	which is a client crash rather than a catchable error. Snapshotting first does not help; the
+	snapshot has to walk the same live table to build itself.
+
+	There is no way to iterate a table another thread is growing. So the rule is the old one:
+	nothing here runs until the module set has stopped changing. main.lua owns that decision.
+]]
 function vape:Save(newProfile)
 	if not self.Loaded then
 		return
@@ -2714,43 +2738,37 @@ function vape:Save(newProfile)
 		module:Save(mainData.Legit)
 	end
 
-	--[[
-		Merge with what is already on disk instead of replacing it.
-
-		Save serialises the modules that exist RIGHT NOW. In BedWars they do not all exist at the
-		same time: the payload is a LuaArmor VM that registers modules for ~30s (much longer on a
-		phone), so a save taken before it finishes wrote a profile with every unregistered module
-		simply absent -- deleting those settings permanently.
-
-		The old defence was to refuse to save at all until the module list was known complete,
-		which traded one failure for another: if the payload never signals completion -- and it
-		only signals it if the copy uploaded to LuaArmor is current -- nothing gets saved for the
-		entire session, and every change made in that match is lost. That is a config that never
-		saves rather than a config that gets truncated.
-
-		Merging removes the need to choose. A module gets written from memory when this session
-		actually owns its state, which means either the profile was applied to it (Applied) or the
-		user has toggled it since (Touched). Anything else keeps whatever the file already held,
-		so a module that registered too late to be loaded cannot be written out on defaults.
-	]]
-	local profilePath = 'pistonware/profiles/'..self.Profile..self.Place..'.txt'
-	local previous = isfile(profilePath) and loadJson(profilePath) or nil
-	if previous then
-		for _, pair in {{previous.Modules, mainData.Modules, self.Modules}, {previous.Legit, mainData.Legit, self.Legit.Modules}} do
-			local savedData, newData, container = pair[1], pair[2], pair[3]
-			if type(savedData) == 'table' then
-				for name, data in savedData do
-					local module = container[name]
-					if module == nil or not (module.Applied or module.Touched) then
-						newData[name] = data
-					end
-				end
-			end
-		end
-	end
-
 	writefile('pistonware/profiles/'..game.GameId..'.gui.txt', httpService:JSONEncode(guiData))
-	writefile(profilePath, httpService:JSONEncode(mainData))
+	writefile('pistonware/profiles/'..self.Profile..self.Place..'.txt', httpService:JSONEncode(mainData))
+end
+
+--[[
+	Write the profile now, because something actually changed.
+
+	Toggling a module used to sit in memory until the next autosave tick, so anything you changed
+	in the last few seconds before a crash, a teleport or an executor kill was simply gone.
+
+	Two guards, and both are load-bearing:
+
+	SaveReady is false until main.lua decides the module list has stopped changing. Saving before
+	that walks vape.Modules while the payload is still inserting into it, which is the crash.
+	Applying a profile also toggles modules, and that happens before SaveReady is set, so a load
+	cannot trigger a save of itself.
+
+	The delay coalesces. Switching profile toggles every module in the config, and a save per
+	toggle would be a hundred full serialisations back to back -- exactly the pile-up that made
+	the teleport path fall over. One pending write, however many changes arrive.
+]]
+function vape:RequestSave()
+	if not (self.SaveReady and self.Loaded) then return end
+	if self.SaveThread then return end
+
+	self.SaveThread = task.delay(0.4, function()
+		self.SaveThread = nil
+		if self.SaveReady and self.Loaded then
+			pcall(function() self:Save() end)
+		end
+	end)
 end
 
 function vape:SaveOptions(obj)
@@ -5828,7 +5846,6 @@ components = {
 		end
 		
 		function component:Load(data)
-			self.Applied = true
 			vape:LoadOptions(self, data.Options)
 		
 			if self.Enabled ~= data.Enabled then
@@ -5852,7 +5869,6 @@ components = {
 		end
 		
 		function component:Toggle()
-			self.Touched = true
 			self.Enabled = not self.Enabled
 			if self.Children then
 				self.Children.Visible = self.Enabled
@@ -5876,6 +5892,7 @@ components = {
 				table.clear(self.Connections)
 			end
 		
+			vape:RequestSave()
 			task.spawn(props.Function, self.Enabled)
 		end
 		
@@ -6278,9 +6295,6 @@ components = {
 		end
 		
 		function component:Load(data)
-			-- This session owns this module's state from here on: it was present when the
-			-- profile was applied, so what is in memory is what the file said. See vape:Save.
-			self.Applied = true
 			vape:LoadOptions(self, data.Options)
 			self.Bind:Load(data.Bind)
 		
@@ -6318,9 +6332,6 @@ components = {
 				setthreadidentity(8)
 			end
 		
-			-- Toggled by hand counts as owning it too, even for a module that registered too
-			-- late to have the profile applied to it. See vape:Save.
-			self.Touched = true
 			self.Enabled = not self.Enabled
 			divider.Visible = self.Enabled
 			gradient.Enabled = self.Enabled
@@ -6350,6 +6361,7 @@ components = {
 				vape:UpdateTextGUI()
 			end
 		
+			vape:RequestSave()
 			task.spawn(props.Function, self.Enabled)
 		end
 		
@@ -6496,6 +6508,7 @@ components = {
 		end
 		
 		vape.Modules[props.Name] = component
+		vape.ModuleCount += 1
 		vape:SortCategories()
 		
 		return component
