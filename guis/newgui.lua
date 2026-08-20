@@ -66,6 +66,39 @@ local hasUIShadow = classExists('UIShadow')
 local hasCornerRadii = propertyExists('UICorner', 'TopLeftRadius', UDim.new(0, 4))
 local hasBorderOffset = propertyExists('UIStroke', 'BorderOffset', UDim.new(0, 1))
 
+--[[
+	TextLabel.ContentText -- the rich-text markup stripped out of Text -- is read-only, so it has
+	to be probed by READING it. Reading a property a class does not have throws exactly the same
+	way assigning one does.
+
+	This is the one that only bites after a profile is applied. The Text GUI reads ContentText
+	when it builds a module label, and it only builds labels for modules that are ENABLED -- so
+	an install with no profile draws no labels and never touches it, while the first profile that
+	switches modules on throws on the first label and takes the GUI down with it.
+
+	The old GUI never used the property; it stripped the tags itself, which is what the fallback
+	below does.
+]]
+local hasContentText = (function()
+	local ok, obj = pcall(Instance.new, 'TextLabel')
+	if not (ok and typeof(obj) == 'Instance') then return false end
+	local readable = pcall(function() return obj.ContentText end)
+	obj:Destroy()
+	return readable
+end)()
+
+local function removeTags(str)
+	str = str:gsub('<br%s*/>', '\n')
+	return (str:gsub('<[^<>]->', ''))
+end
+
+local function contentText(obj)
+	if hasContentText then
+		return obj.ContentText
+	end
+	return removeTags(obj.Text)
+end
+
 local gameCamera = workspace.CurrentCamera
 
 -- Viewport in GUI units. The camera answers immediately; a ScreenGui's AbsoluteSize is (0, 0)
@@ -646,7 +679,7 @@ local function addTooltip(gui, text, customText, visCheck)
 	local function callback()
 		local newText = customText()
 		tooltip.Text = newText
-		local tooltipSize = getfontbounds(tooltip.ContentText, tooltip.TextSize, uipallet.Font)
+		local tooltipSize = getfontbounds(contentText(tooltip), tooltip.TextSize, uipallet.Font)
 		tooltip.Size = UDim2.fromOffset(tooltipSize.X + 10, tooltipSize.Y + 10)
 	end
 
@@ -656,7 +689,7 @@ local function addTooltip(gui, text, customText, visCheck)
 		end
 
 		tooltip.Text = text
-		local tooltipSize = getfontbounds(tooltip.ContentText, tooltip.TextSize, uipallet.Font)
+		local tooltipSize = getfontbounds(contentText(tooltip), tooltip.TextSize, uipallet.Font)
 		tooltip.Size = UDim2.fromOffset(tooltipSize.X + 10, tooltipSize.Y + 10)
 		tooltipMoved(x, y)
 
@@ -1896,7 +1929,7 @@ function vape:LoadGUI()
 		end)
 		
 		LabelCustom:GetPropertyChangedSignal('Text'):Connect(function()
-			LabelCustomShadow.Text = LabelCustom.ContentText
+			LabelCustomShadow.Text = contentText(LabelCustom)
 		end)
 		
 		LabelCustom:GetPropertyChangedSignal('Size'):Connect(function()
@@ -1933,7 +1966,7 @@ function vape:LoadGUI()
 				LabelHolder.Position = UDim2.fromOffset(isRight and 3 or 0, 11 + (Logo.Visible and Logo.Size.Y.Offset or 0) + (LabelCustom.Visible and 28 or 0) + (Background.Enabled and 3 or 0))
 		
 				if LabelCustom.Visible then
-					local size = getfontbounds(LabelCustom.ContentText, LabelCustom.TextSize, LabelCustom.FontFace)
+					local size = getfontbounds(contentText(LabelCustom), LabelCustom.TextSize, LabelCustom.FontFace)
 					LabelCustom.Size = UDim2.fromOffset(size.X, size.Y)
 					LabelCustom.Position = UDim2.new(isRight and 1 / Scale.Scale or 0, isRight and -size.X or 0, 0, (Logo.Visible and 32 or 8))
 				end
@@ -2001,17 +2034,29 @@ function vape:LoadGUI()
 						label.BorderSizePixel = 0
 						label.FontFace = FontOption.Value
 						label.Position = UDim2.fromOffset(isRight and 5 or 9, 2)
-						label.Text = name..(module.ExtraText and " <font color='#A8A8A8'>"..module.ExtraText()..'</font>' or '')
+						-- ExtraText belongs to the game script, not to this file, and it is called
+						-- here for every enabled module on every redraw. A module whose state is
+						-- not ready yet -- which is exactly the moment a profile switches a batch
+						-- of them on -- would otherwise throw and abort the whole rebuild, leaving
+						-- the Text GUI half-destroyed with its label list already cleared.
+						local extra = ''
+						if module.ExtraText then
+							local ok, text = pcall(module.ExtraText)
+							if ok and text ~= nil and text ~= '' then
+								extra = " <font color='#A8A8A8'>"..tostring(text)..'</font>'
+							end
+						end
+						label.Text = name..extra
 						label.TextSize = 18
 						label.RichText = true
 		
-						local size = getfontbounds(label.ContentText, label.TextSize, label.FontFace)
+						local size = getfontbounds(contentText(label), label.TextSize, label.FontFace)
 						label.Size = UDim2.fromOffset(size.X, size.Y)
 		
 						if Shadow.Enabled then
 							local shadowlabel = label:Clone()
 							shadowlabel.Position = UDim2.fromOffset(label.Position.X.Offset + 1, label.Position.Y.Offset + 1)
-							shadowlabel.Text = label.ContentText
+							shadowlabel.Text = contentText(label)
 							shadowlabel.TextColor3 = Color3.new()
 							shadowlabel.Parent = holder
 						end
