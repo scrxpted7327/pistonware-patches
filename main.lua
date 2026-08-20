@@ -201,9 +201,24 @@ local function finishLoading()
 			exactly as the user left it, and the modules that arrive late keep their saved values
 			because nothing overwrote them.
 		]]
+		--[[
+			A timed-out load no longer forbids saving for the rest of the session.
+
+			It used to return here, and that is why nothing you changed in a BedWars match ever
+			persisted. The wait only reports complete when the payload SIGNALS completion, and it
+			signals it from the last line of bedwars.lua -- so a copy on LuaArmor that predates
+			that line can never report complete, the 120s backstop is hit every single time, and
+			this return fired every single time. The lobby was unaffected because an ordinary game
+			script returns normally, which is exactly the asymmetry: settings held in the lobby and
+			vanished in the match.
+
+			The reason for the ban was real -- Save serialised only the modules that existed, so
+			saving early deleted the ones still registering. vape:Save merges with the file on disk
+			now and will not write a module this session never owned, so an incomplete list costs
+			nothing. The warning stays, because a payload that never signals is still worth fixing.
+		]]
 		if not moduleSetComplete then
-			warn('[pistonware] modules are still loading -- your config was applied but will NOT be saved this session, so nothing gets overwritten')
-			return
+			warn('[pistonware] the payload never signalled completion -- re-upload games/bedwars.lua to LuaArmor. Saving anyway; settings for modules that never registered are preserved from disk.')
 		end
 
 		debugWarn('[pistonware] profile applied -- starting autosave')
