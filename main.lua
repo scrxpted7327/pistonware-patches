@@ -36,12 +36,11 @@ local cloneref = cloneref or function(obj)
 end
 local playersService = cloneref(game:GetService('Players'))
 
--- Whether the GUI will read asset files off disk at all.
+-- Phones and tablets. Used to pace the autosave loop, which is the expensive recurring job on a
+-- device with slow storage.
 --
--- guis/*.lua build getcustomasset as `not inputService.TouchEnabled and assetfunction and
--- <disk version> or <table version>`, so on a touch device every icon comes from the uploaded
--- rbxassetid table and the files on disk are never opened. Tested here with the IDENTICAL
--- condition, so main.lua and the GUI can never disagree about whether those files are needed.
+-- It used to gate the asset prefetch too, because only the desktop GUI read icons off disk. Both
+-- platforms take icons from uploaded ids now, so there is no prefetch left to gate.
 local isTouchDevice = false
 pcall(function()
 	isTouchDevice = cloneref(game:GetService('UserInputService')).TouchEnabled and true or false
@@ -68,12 +67,10 @@ end
 -- real isfile, and only the fallback above treats empty as absent -- so on executors that ship
 -- one (most of them), an interrupted write leaves a truncated file that nothing ever repairs.
 --
--- That is not hypothetical: cancelling, crashing or teleporting during the concurrent asset
--- prefetch below leaves a half-written PNG. From then on prefetchFolder skips it, downloadFile
--- skips it, getcustomasset hands the corrupt file to the client, and the resulting invalid
--- content id throws 'ContentId formatting failed' at the assignment -- taking the whole GUI
--- chunk with it. Every route that could have fixed it asked isfile and was told the file was
--- fine, which is why the only known remedy was reinstalling the entire script.
+-- That is not hypothetical: cancelling, crashing or teleporting mid-download leaves a
+-- half-written file, and from then on every cache-first route skips it forever. For a .lua file
+-- that means a chunk that never loads. Every route that could have fixed it asked isfile and was
+-- told the file was fine, which is why the only known remedy was reinstalling the whole script.
 --
 -- Treating empty as missing makes it repair itself on the next run instead.
 local function hasContent(path)
@@ -121,133 +118,14 @@ local function downloadFile(path, func)
 	return (func or readfile)(path)
 end
 
--- Standalone progress label for the prefetch phase, since it runs before the GUI framework
--- (and its own downloader label) exists yet.
-local downloaderGui, downloaderLabel
-local function updateDownloader(text)
-	if not downloaderGui then
-		downloaderGui = Instance.new('ScreenGui')
-		downloaderGui.Name = 'PistonwareDownloader'
-		downloaderGui.ResetOnSpawn = false
-		downloaderGui.Parent = cloneref(game:GetService('CoreGui'))
-		downloaderLabel = Instance.new('TextLabel')
-		downloaderLabel.Size = UDim2.new(1, 0, 0, 40)
-		downloaderLabel.BackgroundTransparency = 1
-		downloaderLabel.TextStrokeTransparency = 0
-		downloaderLabel.TextSize = 20
-		downloaderLabel.TextColor3 = Color3.new(1, 1, 1)
-		downloaderLabel.Parent = downloaderGui
-	end
-	downloaderLabel.Text = text
-end
-local function destroyDownloader()
-	if downloaderGui then
-		downloaderGui:Destroy()
-		downloaderGui, downloaderLabel = nil, nil
-	end
-end
-
--- Downloads every file in a repo folder concurrently instead of one HttpGet per getcustomasset call,
--- so GUI construction reads already-cached files instead of blocking on ~190 sequential round trips.
--- Names of every file directly inside a repo folder.
+-- The repo-folder listing and the concurrent prefetch that used to live here are gone.
 --
--- Prefers the recursive tree the loader already fetched and parked in shared: unauthenticated
--- GitHub allows 60 requests an hour PER IP and mobile carriers share one address across
--- thousands of users, so the two contents/ calls this used to make were a real part of why
--- boots stall on phones. Reading the tree costs nothing -- the paths are already in memory.
---
--- The contents/ request stays as the fallback, because main.lua is not only reached through the
--- loader: the queued teleport script re-runs THIS file directly, and there is no tree in shared
--- on the new server.
-local function listRepoFolder(folder)
-	local tree = shared.PistonwareRepoTree
-	if type(tree) == 'table' and type(tree.tree) == 'table' then
-		local names, prefix = {}, folder..'/'
-		for _, v in tree.tree do
-			if v.type == 'blob' and v.path:sub(1, #prefix) == prefix then
-				local name = v.path:sub(#prefix + 1)
-				-- Direct children only, matching what contents/ returned; a nested path would
-				-- otherwise be fetched into a folder that does not exist locally.
-				if name ~= '' and not name:find('/') then
-					table.insert(names, name)
-				end
-			end
-		end
-		if #names > 0 then return names end
-	end
-
-	local reqSuc, res = pcall(function()
-		return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/contents/'..folder, true)
-	end)
-	if not (reqSuc and res and res ~= '404: Not Found') then return nil end
-	local bodySuc, body = pcall(function()
-		return cloneref(game:GetService('HttpService')):JSONDecode(res)
-	end)
-	if not (bodySuc and body and typeof(body) == 'table') then return nil end
-	local names = {}
-	for _, v in body do
-		if v.type == 'file' then table.insert(names, v.name) end
-	end
-	return names
-end
-
-local function prefetchFolder(folder)
-	local names = listRepoFolder(folder)
-	if not names then return end
-
-	local toFetch = {}
-	for _, name in names do
-		-- hasContent, not isfile: a truncated asset from an interrupted prefetch must be picked
-		-- up again here rather than skipped forever. See the note on hasContent.
-		if not hasContent('pistonware/'..folder..'/'..name) then
-			table.insert(toFetch, name)
-		end
-	end
-	if #toFetch <= 0 then return end
-
-	local completed, total = 0, #toFetch
-	updateDownloader('Downloading '..folder..' ('..completed..'/'..total..')')
-
-	-- A fixed pool rather than one task per file. assets/new alone holds 63 files, and a user
-	-- on any other theme prefetches their theme AND assets/new -- so spawning per file put
-	-- 60+ HttpGets in flight at once, each holding its response body, each able to retry four
-	-- times. That is a large memory and socket spike at boot on a device that has not even
-	-- built the GUI yet. Same files, same order, same completion signal; just a ceiling on how
-	-- many are outstanding at once.
-	-- Raised from 6. That number was chosen when each worker also cost a GitHub API call and
-	-- every file was spawned its own task; with the pool in place the ceiling is just how many
-	-- small PNG bodies are in flight at once, and 12 keeps the pipe full on the round-trip
-	-- latency that dominates here without the memory spike a task-per-file caused.
-	local PREFETCH_WORKERS = 12
-	local nextIndex = 1
-	local workers = math.min(PREFETCH_WORKERS, total)
-
-	for _ = 1, workers do
-		task.spawn(function()
-			while true do
-				-- Claiming an index takes no yield between the read and the increment, so
-				-- two workers can never be handed the same file.
-				local index = nextIndex
-				nextIndex += 1
-				if index > total then break end
-
-				pcall(downloadFile, 'pistonware/'..folder..'/'..toFetch[index])
-				completed += 1
-				-- pcall'd and after the counter: if this ever threw, the worker would die
-				-- before the join below could count it and the boot would hang on a GUI error
-				pcall(updateDownloader, 'Downloading '..folder..' ('..completed..'/'..total..')')
-			end
-		end)
-	end
-
-	-- Joined on the counter with a deadline rather than on a BindableEvent with none. A worker
-	-- that dies now costs the files it had left; it used to cost the whole boot, parked on
-	-- Wait() with nothing left alive to fire it.
-	local deadline = os.clock() + 120
-	while completed < total and os.clock() < deadline do
-		task.wait(0.05)
-	end
-end
+-- Both existed for one reason: to get pistonware/assets/new onto disk before the GUI started
+-- reading it. The GUI resolves its icons to uploaded rbxassetids now and never opens those
+-- files, so the prefetch was downloading 105 files nothing would read, and the listing spent a
+-- GitHub API call (60/hour, shared per IP, and mobile carriers put thousands of users behind
+-- one) to find out what they were. The handful of paths that still have no uploaded id are
+-- fetched lazily by the GUI, and only if a module that draws one is ever built.
 
 -- False while a game script is still registering its modules on its own thread. A fast game
 -- script sets this back to true before runGameScript even returns, so the common path never
@@ -486,63 +364,61 @@ local function finishLoading()
 	end
 
 	if not shared.vapereload then
-		if not vape.Categories then return end
-		if vape.Categories.Main.Options['GUI bind indicator'].Enabled then
-			vape:CreateNotification('Pistonware | Finished Loading', vape.VapeButton and 'Press the button in the top right to open GUI' or 'Press '..table.concat(vape.Keybind, ' + '):upper()..' to open GUI', 5)
-		end
+		-- Cosmetic, and entirely inside a pcall, because the rewrite moved every field it reads.
+		-- 'GUI bind indicator' left Categories.Main.Options for Settings.GUI.Options, the keybind
+		-- list became GUIBind.Keys instead of a flat vape.Keybind, and vape.VapeButton no longer
+		-- exists at all. A finished-loading toast is not worth risking finishLoading over if any
+		-- of that moves again.
+		pcall(function()
+			if not vape.Categories then return end
+			local indicator = vape.Settings and vape.Settings.GUI and vape.Settings.GUI.Options['GUI bind indicator']
+			if not (indicator and indicator.Enabled) then return end
+			local keys = vape.GUIBind and vape.GUIBind.Keys
+			local how = (keys and #keys > 0)
+				and ('Press '..table.concat(keys, ' + '):upper()..' to open GUI')
+				or 'Open the GUI with your keybind'
+			vape:CreateNotification('Pistonware | Finished Loading', how, 5)
+		end)
 	end
 end
 
-	if not isfile('pistonware/profiles/gui.txt') then
-		writefile('pistonware/profiles/gui.txt', 'new')
-	end
-	local gui = readfile('pistonware/profiles/gui.txt')
-
-	if not isfolder('pistonware/assets/'..gui) then
-		makefolder('pistonware/assets/'..gui)
-	end
 	--[[
-		Skipped entirely on touch devices, because they never open these files.
+		One GUI now.
 
-		The GUIs build getcustomasset as `not inputService.TouchEnabled and assetfunction and
-		<disk version> or <table version>`. On a phone that is the table version: every icon
-		resolves to an uploaded rbxassetid and nothing is ever read from pistonware/assets. But
-		main.lua downloaded the whole tree regardless -- roughly 190 HTTP requests, 190 disk
-		writes and the memory to hold the bodies, on the device least able to afford any of it,
-		producing files nothing would ever open.
+		guis/old.lua and guis/rise.lua are discontinued and deleted, so the gui.txt theme
+		indirection has nothing left to choose between -- every value it could hold except one
+		names a file that would 404. Reading it to decide which GUI to load was a way to break the
+		install, not a feature, so the choice is made here instead.
 
-		That is a large part of why mobile is slow to load and stutters while loading, and on a
-		bad connection it is why it sometimes never finishes at all: every one of those requests
-		can retry four times, and the join waits up to two minutes for them.
-
-		isTouchDevice is read with the identical condition the GUIs use, so the two cannot
-		disagree about whether the files are wanted. A desktop with a touchscreen takes this path
-		too -- correctly, because its GUI will also use the table.
+		The asset folder keeps its own separate name: 'new' is the path the GUI itself asks for
+		(pistonware/assets/new/...), and that is unrelated to what the GUI file is called.
 	]]
-	if isTouchDevice then
-		debugWarn('[pistonware] touch device -- skipping asset prefetch, icons come from uploaded ids')
-	elseif gui ~= 'new' then
-		-- Both folders at once. A user on any theme other than 'new' needs their own assets AND
-		-- assets/new (the fallback set the GUIs fall back to), and running the two in sequence
-		-- made them pay the full round-trip cost of each in turn for no reason -- they share
-		-- nothing and neither depends on the other's result.
-		local fallbackDone = false
-		task.spawn(function()
-			pcall(prefetchFolder, 'assets/new')
-			fallbackDone = true
-		end)
-		pcall(prefetchFolder, 'assets/'..gui)
-		-- Bounded like every other join: prefetchFolder already has its own deadline, so this
-		-- only ever waits out the tail of a folder that finished second.
-		local deadline = os.clock() + 130
-		while not fallbackDone and os.clock() < deadline do
-			task.wait(0.05)
-		end
-	else
-		pcall(prefetchFolder, 'assets/'..gui)
+	local GUI_FILE = 'newgui'
+	local ASSET_FOLDER = 'new'
+
+	-- Still written, so anything else reading gui.txt sees something current rather than a
+	-- stale 'rise'/'old' left over from before those were removed.
+	pcall(function() writefile('pistonware/profiles/gui.txt', GUI_FILE) end)
+
+	--[[
+		No asset prefetch, and nothing to prefetch for.
+
+		The GUI now resolves every icon it draws to an uploaded rbxassetid and never opens a file
+		under pistonware/assets. This used to download the whole folder -- 105 files, 105 HTTP
+		requests and 105 disk writes -- on the critical path of the first run, on every platform,
+		and the desktop GUI then read each of those files back twice per icon.
+
+		A few paths that only game modules ask for still have no uploaded id, so the GUI keeps a
+		lazy fallback for exactly those: downloaded the first time a module that draws one is
+		built, not here, and not for anyone who never opens it. Prefetching 105 files to serve
+		five of them was the expensive way round.
+
+		The folder is still created, because that lazy fallback writes into it.
+	]]
+	if not isfolder('pistonware/assets/'..ASSET_FOLDER) then
+		makefolder('pistonware/assets/'..ASSET_FOLDER)
 	end
-	destroyDownloader()
-	vape = loadstring(downloadFile('pistonware/guis/'..gui..'.lua'), 'gui')()
+	vape = loadstring(downloadFile('pistonware/guis/'..GUI_FILE..'.lua'), 'gui')()
 	shared.vape = vape
 
 if not shared.VapeIndependent then
