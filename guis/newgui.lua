@@ -3639,6 +3639,12 @@ components = {
 		props.Function = props.Function or function() end
 		
 		function component:CreateProfile(value, data)
+			-- Names are the identity here: GetValue, ChangeValue and the profile file on disk all
+			-- key off them, so two entries with the same name are two rows fighting over one file.
+			if type(value) ~= 'string' or value == '' or self:GetValue(value) then
+				return
+			end
+		
 			local profile = {
 				Name = value
 			}
@@ -3941,8 +3947,27 @@ components = {
 			end
 		
 			if props.Profiles then
+				--[[
+					Rebuilt, not appended to.
+
+					CreateProfile pushes onto self.List unconditionally, and this loop feeds it the
+					whole saved list every time. A second Load in the same session -- which is what
+					a reinject does, and what arriving on a new server does before the old instance
+					has finished tearing down -- therefore doubled the list, and every duplicate
+					brought its own Bind into vape.ActiveBinds and its own row of GUI objects.
+					Save then wrote the doubled list back out, so it persisted and doubled again.
+				]]
+				for _, profile in self.List do
+					if profile.Bind and profile.Bind.Destroy then
+						pcall(function() profile.Bind:Destroy() end)
+					end
+				end
+				table.clear(self.List)
+		
 				for _, profile in data.List do
-					self:CreateProfile(profile.Name, profile.Bind)
+					if type(profile) == 'table' and type(profile.Name) == 'string' then
+						self:CreateProfile(profile.Name, profile.Bind)
+					end
 				end
 		
 				self:ChangeValue(nil, true)
