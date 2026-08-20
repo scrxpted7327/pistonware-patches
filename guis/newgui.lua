@@ -2624,6 +2624,7 @@ function vape:Remove(obj)
 	local container = (self.Modules[obj] and self.Modules or self.Legit.Modules[obj] and self.Legit.Modules or self.Categories)
 	if container and container[obj] then
 		local component = container[obj]
+		local isModule = component.Type == 'Module'
 		if self.ThreadFix then
 			setthreadidentity(8)
 		end
@@ -2643,6 +2644,10 @@ function vape:Remove(obj)
 
 		loopClean(component)
 		container[obj] = nil
+
+		if isModule then
+			self:SortCategories()
+		end
 	end
 end
 
@@ -2691,6 +2696,33 @@ function vape:SaveOptions(obj)
 	end
 
 	return data
+end
+
+--[[
+	Reassigns every module's LayoutOrder alphabetically within its category.
+
+	The order has to be a property of the whole set, not of insertion: a module dropdown is
+	positioned from its LayoutOrder, so a category whose orders are stale puts a module's
+	settings panel above the module instead of below it.
+
+	Lifted out of module creation so removal can call it too. vape:Remove used to leave the
+	surviving modules holding the indexes they had when the removed one was still there.
+]]
+function vape:SortCategories()
+	local sorting = {}
+	for _, module in self.Modules do
+		sorting[module.Category] = sorting[module.Category] or {}
+		table.insert(sorting[module.Category], module.Name)
+	end
+
+	for _, sort in sorting do
+		table.sort(sort)
+		for index, name in sort do
+			self.Modules[name].Index = index
+			self.Modules[name].Object.LayoutOrder = index
+			self.Modules[name].Children.LayoutOrder = index
+		end
+	end
 end
 
 function vape:Uninject()
@@ -2805,7 +2837,7 @@ end
 components = {
 	Bind = function(props, children, api)
 		local component = {
-			Hold = false,
+			Hold = props.Hold or false,
 			Keys = {},
 			Triggered = createSignal(),
 			Type = 'Bind'
@@ -6024,6 +6056,10 @@ components = {
 			Index = getTableSize(vape.Modules),
 			Name = props.Name,
 			Options = {},
+			-- Every other component in this table declares its Type; this one never did, so
+			-- vape:Remove's `component.Type == 'Module'` test could not have matched and the
+			-- resort after a removal would have been dead code.
+			Type = 'Module',
 			Visible = true
 		}
 		
@@ -6359,21 +6395,7 @@ components = {
 		end
 		
 		vape.Modules[props.Name] = component
-		
-		local sorting = {}
-		for _, module in vape.Modules do
-			sorting[module.Category] = sorting[module.Category] or {}
-			table.insert(sorting[module.Category], module.Name)
-		end
-		
-		for _, sort in sorting do
-			table.sort(sort)
-			for index, name in sort do
-				vape.Modules[name].Index = index
-				vape.Modules[name].Object.LayoutOrder = index
-				vape.Modules[name].Children.LayoutOrder = index
-			end
-		end
+		vape:SortCategories()
 		
 		return component
 	end,
