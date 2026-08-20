@@ -1025,6 +1025,18 @@ function vape:Load(skipgui, profile)
 
 		self:UpdateTextGUI(true)
 	else
+		--[[
+			No file for this profile yet, so write one from the current state.
+
+			Save() opens with `if not self.Loaded then return end`, and Loaded is not assigned
+			until further down this function -- so this branch has always been a silent no-op.
+			A profile selected for the first time got no file at all, and stayed unwritten until
+			something else happened to save later.
+
+			Loaded is set to exactly the same value a few lines below; this just brings it forward
+			to the point where the branch actually needs it.
+		]]
+		self.Loaded = canSave
 		self:Save()
 	end
 
