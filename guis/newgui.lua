@@ -88,7 +88,7 @@ end
 local function autoScaleValue()
 	local width = viewportWidth()
 	if width <= 0 then return 1 end
-	return math.clamp(width / 1920, 0.5, 1)
+	return math.clamp(width / 1920, 0.4, 1)
 end
 
 local fontsize = Instance.new('GetTextBoundsParams')
