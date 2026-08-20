@@ -812,11 +812,30 @@ local function removeTags(text)
 	return text:gsub('<[^<>]->', '')
 end
 
+--[[
+	The only native call this GUI makes, and it fires exactly when the menu opens.
+
+	SetRobloxGuiFocused hands the client a flag that switches on its OWN full-screen blur behind
+	the core UI. That is not a Roblox instance being drawn -- it is a GPU pass the engine runs
+	every frame over the whole framebuffer, and it is the one thing in the open path capable of
+	killing a client outright rather than throwing a Lua error. A Lua error prints red and the
+	game carries on; a crash on open is native, and this is the only native surface here.
+
+	Skipped on touch devices, where the cost is highest and the benefit is a cosmetic backdrop
+	nobody asked for. The toggle also defaults off there, so the setting matches the behaviour
+	rather than claiming a blur that is not happening.
+
+	pcall'd on top: the method is executor- and client-version dependent, and a throw here used
+	to abort whichever handler called it -- which includes the one that opens the menu.
+]]
 function vape:BlurCheck()
-	if self.ThreadFix then
-		setthreadidentity(8)
+	if not self.ThreadFix then return end
+	if inputService.TouchEnabled then return end
+
+	setthreadidentity(8)
+	pcall(function()
 		runService:SetRobloxGuiFocused((clickgui.Visible or guiService:GetErrorType() ~= Enum.ConnectionError.OK) and self.Blur.Enabled)
-	end
+	end)
 end
 
 function vape:CreateCategory(props)
@@ -1468,7 +1487,9 @@ function vape:LoadGUI()
 		Function = function()
 			vape:BlurCheck()
 		end,
-		Default = true,
+		-- Off by default on a phone. See BlurCheck: this drives a full-screen GPU pass, and it
+		-- is the only thing the menu does on open that a client can die on rather than error on.
+		Default = not inputService.TouchEnabled,
 		Tooltip = 'Blur the background of the GUI'
 	})
 	
