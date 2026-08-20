@@ -1029,21 +1029,28 @@ function RunLoops:UnbindFromHeartbeat(name)
     end
 end
 
+-- Substring match of an instance name against a TextList's switched-on entries.
+--
+-- Reads ListEnabled, not Objects. Objects holds the list window's row BUTTONS, and
+-- every one of them has Text = '' (the visible text lives on a child TextLabel) and
+-- the default Name 'TextButton' -- so the old version compared every name against
+-- the literal string "textbutton" and matched nothing, ever. Objects is also the
+-- wrong set even when read correctly: it holds every entry, including the ones the
+-- user switched off. ListEnabled is the enabled subset and is what the rest of the
+-- script reads.
+--
+-- Plain-text find, since item names carry '-' and '(' which read as pattern syntax
+-- and would either mis-match or throw.
 local function entryMatches(objName, list)
-    if not list or not list.Objects then return false end
+    if type(objName) ~= "string" or type(list) ~= "table" then return false end
+    -- A bare array of strings is accepted too, so callers can pass List.ListEnabled.
+    local entries = list.ListEnabled or list.List or list
+    if type(entries) ~= "table" then return false end
     local lowerName = objName:lower()
-    for _, entry in pairs(list.Objects) do
-        local nameString
-        if typeof(entry) == "string" then
-            nameString = entry
-        elseif entry:IsA("TextButton") or entry:IsA("TextLabel") then
-            nameString = entry.Text ~= "" and entry.Text or entry.Name
-        else
-            nameString = entry.Name
-        end
-        if nameString then
-            nameString = nameString:lower():gsub("^%s*(.-)%s*$", "%1")
-            if nameString ~= "" and lowerName:find(nameString) then
+    for _, entry in pairs(entries) do
+        if type(entry) == "string" then
+            local nameString = entry:lower():gsub("^%s*(.-)%s*$", "%1")
+            if nameString ~= "" and lowerName:find(nameString, 1, true) then
                 return true
             end
         end
@@ -1293,7 +1300,7 @@ run(function()
 		return OldBreak(self, breakTable, plr)
 	end
 
-	local cache, blockhealthbar = {}, {blockHealth = -1, breakingBlockPosition = Vector3.zero}
+	local blockhealthbar = {blockHealth = -1, breakingBlockPosition = Vector3.zero}
 	store.blockPlacer = bedwars.BlockPlacer.new(bedwars.BlockEngine, 'wool_white')
 
 	local function getBlockHealth(block, blockpos)
@@ -1309,113 +1316,220 @@ run(function()
 		return getBlockHealth(block, bedwars.BlockController:getBlockPosition(blockpos)) / tool
 	end
 
+	-- Published for the same reason breakBlock and placeBlock are: Breaker's 'Health' mode
+	-- ranks the blocks around you and has to measure them the way the dig-spot ranking
+	-- inside breakBlock already does, or the two disagree about what is cheapest.
+	bedwars.getBlockHits = getBlockHits
+
 	--[[
 		Pathfinding using a luau version of dijkstra's algorithm
 		Source: https://stackoverflow.com/questions/39355587/speeding-up-dijkstras-algorithm-to-solve-a-3d-maze
+
+		Walks outward through solid blocks from the target and answers with the cheapest cell
+		that touches air -- the spot someone could stand at and put a tool on.
+
+		Two things used to make that answer expensive, and together they are the 'the bed is
+		wide open and Breaker sits there for three seconds before it starts' delay:
+
+		* The queue was drained in insertion order, so nothing about the search ever knew it
+		  was finished. Every call explored the whole mass of blocks connected to the target
+		  -- on an island that is thousands of cells, and each one costs six getPlacedBlock
+		  lookups plus a getBlockHits that reads block data back out of the game -- and only
+		  then picked a winner out of everything it had seen.
+		* Popping was table.remove(unvisited, 1), which shifts the entire array down one slot
+		  every time. With a queue that long that is the quadratic half of the cost.
+
+		Both go away by popping the cheapest node instead of the oldest. Breaking a block never
+		costs a negative number of hits, so once an air-touching cell comes off a min-heap,
+		nothing still queued behind it can be cheaper, and the search only has to finish the
+		cost it is on rather than everything reachable. An exposed bed is answered on the first
+		pop, at zero cost, instead of after a full sweep of everything joined to it.
+
+		Finishing that one cost band is the part worth keeping deliberately. Ties are the
+		normal case here, not an edge case -- every cell of a one-layer cover is the same one
+		block from the target -- and which of them the answer names decides where the break
+		actually lands. The nearest to the player wins it; see the loop.
+
+		Nothing is cached, and that is a decision rather than an omission. There used to be a
+		table of answers keyed by target cell, from when a call cost a full sweep and paying it
+		every pass was unthinkable. It has to go now that the cost is made of block HEALTH:
+		health falls with every hit landed, changes nothing about the layout and fires no event
+		anybody can listen for, so a cached cost is wrong the moment anyone starts breaking
+		anything -- and 'which of these is cheapest' is precisely the question Breaker's Health
+		mode is asking. A stale answer there means watching it chew on a full block while a
+		one-hit block sits next to it. The invalidation grew a rule per bug (blocks placed,
+		blocks broken, the player walking round to the other side) and this was simply the next
+		one, so the table went instead. A search that stops at the first cost band is cheap
+		enough to run every pass, and Breaker's pass is a quarter of a second long.
 	]]
 	local function calculatePath(target, blockpos)
-		if cache[blockpos] then
-			return unpack(cache[blockpos])
+		local origin = entitylib.isAlive and entitylib.character.RootPart.Position or Vector3.zero
+		local visited, distances, path = {}, {[blockpos] = 0}, {}
+		local heap, heapsize = {{0, blockpos}}, 1
+
+		local function push(cost, node)
+			heapsize += 1
+			heap[heapsize] = {cost, node}
+			local child = heapsize
+			while child > 1 do
+				local parent = child // 2
+				if heap[parent][1] <= heap[child][1] then break end
+				heap[parent], heap[child] = heap[child], heap[parent]
+				child = parent
+			end
 		end
-		local visited, unvisited, distances, air, path = {}, {{0, blockpos}}, {[blockpos] = 0}, {}, {}
 
+		local function pop()
+			if heapsize == 0 then return nil end
+			local top = heap[1]
+			heap[1] = heap[heapsize]
+			heap[heapsize] = nil
+			heapsize -= 1
+
+			local parent = 1
+			while true do
+				local left, right = parent * 2, parent * 2 + 1
+				local smallest = parent
+				if left <= heapsize and heap[left][1] < heap[smallest][1] then smallest = left end
+				if right <= heapsize and heap[right][1] < heap[smallest][1] then smallest = right end
+				if smallest == parent then break end
+				heap[parent], heap[smallest] = heap[smallest], heap[parent]
+				parent = smallest
+			end
+
+			return top
+		end
+
+		-- Cheapest wins, and the nearest of the cheapest wins the tie.
+		--
+		-- The tie is not an edge case, it is the normal case: every cell of a one-layer cover
+		-- costs the same one block to get through, so the top of the pile, the far side and
+		-- the face you are standing at are all equally cheap, and picking whichever the queue
+		-- happened to reach first is picking at random. Which of them the answer names decides
+		-- where the break lands, and a spot on the wrong side of a structure is one Block Check
+		-- then has to walk all the way back -- when it can, and it could not always.
+		local best, bestcost, bestrange
 		for _ = 1, 10000 do
-			local _, node = next(unvisited)
+			local node = pop()
 			if not node then break end
-			table.remove(unvisited, 1)
-			visited[node[2]] = true
 
+			local cost, current = node[1], node[2]
+			-- Nodes come off cheapest first, so once one costs more than the answer already
+			-- in hand, nothing still queued can beat it. The slack is for float noise: two
+			-- routes through the same blocks can add up in different orders.
+			if best and cost > bestcost + 0.0001 then break end
+			-- A cell can sit in the heap more than once, from before its distance was
+			-- improved; the first pop is the good one and the rest are stale.
+			if visited[current] then continue end
+			visited[current] = true
+
+			local touchesair = false
 			for _, side in sides do
-				side = node[2] + side
+				side = current + side
 				if visited[side] then continue end
 
 				local block = getPlacedBlock(side)
 				if not block or block:GetAttribute('NoBreak') or block == target then
 					if not block then
-						air[node[2]] = true
+						touchesair = true
 					end
 					continue
 				end
 
-				local curdist = getBlockHits(block, side) + node[1]
+				local curdist = getBlockHits(block, side) + cost
 				if curdist < (distances[side] or math.huge) then
-					table.insert(unvisited, {curdist, side})
 					distances[side] = curdist
-					path[side] = node[2]
+					path[side] = current
+					push(curdist, side)
+				end
+			end
+
+			if touchesair then
+				local range = (origin - current).Magnitude
+				if not best or range < bestrange then
+					best, bestcost, bestrange = current, cost, range
 				end
 			end
 		end
 
-		local pos, cost = nil, math.huge
-		for node in air do
-			if distances[node] < cost then
-				pos, cost = node, distances[node]
-			end
-		end
-
-		if pos then
-			cache[blockpos] = {
-				pos,
-				cost,
-				path
-			}
-			return pos, cost, path
+		if best then
+			return best, bestcost, path
 		end
 	end
 
-	-- Can a player standing here put a tool on this cell at all? At least one of its six
-	-- faces has to be open air AND has to point toward the player rather than away.
+	-- Where does the line from the player to this dig spot first meet a block? That block is
+	-- what someone standing here would actually hit swinging at it, and it is what has to come
+	-- off before anything behind it can be reached. calculatePath calls a cell diggable when
+	-- ANY of its six faces touches air, including the face underneath it or the one on the far
+	-- side, so its answer on its own happily digs a covered bed straight through its cover.
 	--
-	-- Sits between the two tests around it, both of which get this wrong in one direction.
-	-- calculatePath asks only "does any face touch air", which is what lets it aim at the
-	-- gap under a bed or the face on its far side and dig straight through the cover.
-	-- frontOf asks "is the single dominant-axis hop toward the player clear", which is the
-	-- opposite failure: a bed with an open top reads as covered the moment anything stands
-	-- beside it horizontally, even though standing over it and hitting the top is a shot
-	-- the game allows perfectly happily.
-	--
-	-- Only air counts as open. A NoBreak block sealing a face is not something you can
-	-- reach the cell through, so that face is not a way in.
-	local function openToPlayer(worldpos)
-		if not entitylib.isAlive then return true end
-		local toplayer = entitylib.character.RootPart.Position - worldpos
-		for _, side in sides do
-			if side:Dot(toplayer) <= 0 then continue end
-			if not getPlacedBlock(worldpos + side) then return true end
-		end
-		return false
-	end
-
-	-- Walks the block grid from a target cell back toward the player and returns the first
-	-- solid cell standing in the way -- i.e. what someone standing here could actually put a
-	-- tool on. calculatePath calls a cell diggable when ANY of its six faces touches air,
-	-- including the face underneath it or the one on the far side, so its answer on its own
-	-- happily digs a covered bed straight through its cover.
+	-- Marched cell by cell along the whole line. It used to hop one cell at a time along
+	-- whichever axis dominated, which is blind in exactly the case that matters: a dig spot up
+	-- on a mound has air beside it on that axis, so the very first hop found nothing, the walk
+	-- stopped, and the spot reported itself as the thing in the way -- Block Check waving
+	-- through a break into the middle of a structure with the wall in front of the player
+	-- untouched. A march cannot miss it: the wall is on the line whether or not it happens to
+	-- lie along the dominant axis.
 	--
 	-- Done against the block store rather than with a raycast: blocks render through chunked
 	-- geometry, so a ray reports chunk parts instead of the block the store hands back and
 	-- cannot tell a target apart from whatever covers it.
+	--
+	-- t runs 0 at the player to 1 at the dig spot: next* is the t at which the march crosses
+	-- into the following cell on that axis, delta* is the t one whole cell costs there, and an
+	-- axis the line does not move along never comes up for its turn.
+	local function boundary(index, component, delta)
+		if delta == 0 then
+			return 0, math.huge, math.huge
+		end
+		local step = delta > 0 and 1 or -1
+		return step, ((((index + (step * 0.5)) * 3) - component) / delta), (3 / math.abs(delta))
+	end
+
 	local function frontOf(worldpos)
 		if not entitylib.isAlive then return worldpos end
-		local origin = entitylib.character.RootPart.Position
-		for _ = 1, 12 do
-			local direction = origin - worldpos
-			-- close enough to be the cell we are standing in; nothing left in the way
-			if direction.Magnitude <= 3 then break end
-			local ax, ay, az = math.abs(direction.X), math.abs(direction.Y), math.abs(direction.Z)
-			local step
-			if ax >= ay and ax >= az then
-				step = Vector3.new(direction.X > 0 and 3 or -3, 0, 0)
-			elseif ay >= az then
-				step = Vector3.new(0, direction.Y > 0 and 3 or -3, 0)
+
+		-- From the head, not the root: it is the eye line that decides what is reachable, and
+		-- a root at foot height reads a floor block as cover when nothing is in the way.
+		local head = entitylib.character.Head
+		local origin = (head and head.Position) or entitylib.character.RootPart.Position
+		local direction = worldpos - origin
+		local start, finish = bedwars.BlockController:getBlockPosition(origin), bedwars.BlockController:getBlockPosition(worldpos)
+		local x, y, z = start.X, start.Y, start.Z
+
+		local stepx, nextx, deltax = boundary(x, origin.X, direction.X)
+		local stepy, nexty, deltay = boundary(y, origin.Y, direction.Y)
+		local stepz, nextz, deltaz = boundary(z, origin.Z, direction.Z)
+
+		-- 30 studs of reach is ten cells, and a diagonal line crosses at most one boundary per
+		-- axis per cell, so this cannot run out before the spot does.
+		for _ = 1, 40 do
+			-- every axis past its last boundary: the spot itself is the next thing on the line
+			if nextx > 1 and nexty > 1 and nextz > 1 then break end
+
+			if nextx <= nexty and nextx <= nextz then
+				x, nextx = x + stepx, nextx + deltax
+			elseif nexty <= nextz then
+				y, nexty = y + stepy, nexty + deltay
 			else
-				step = Vector3.new(0, 0, direction.Z > 0 and 3 or -3)
+				z, nextz = z + stepz, nextz + deltaz
 			end
-			local nextblock = getPlacedBlock(worldpos + step)
-			-- open air on the way to the player: the current cell is the exposed one
-			if not nextblock or nextblock:GetAttribute('NoBreak') then break end
-			worldpos = worldpos + step
+
+			local cell = Vector3.new(x, y, z)
+			if cell == finish then break end
+
+			local block = getPlacedBlock(cell * 3)
+			if block then
+				-- Something unbreakable on the line means there is no shot at this spot at
+				-- all, and naming it would only send the break at a block that never yields.
+				-- Hand the spot back unchanged, and say so: 'nothing in the way' and 'no way
+				-- through' arrive as the same spot otherwise, and the caller has to tell a
+				-- clear shot from a sealed one.
+				if block:GetAttribute('NoBreak') then return worldpos, true end
+				return cell * 3
+			end
 		end
+
 		return worldpos
 	end
 
@@ -1437,53 +1551,58 @@ run(function()
 	-- autotool: pick the tool by selecting its hotbar slot (what the AutoTool module does)
 	--   instead of equipping it directly. The correct tool is equipped either way -- this
 	--   only decides which route gets used.
-	-- preferexposed: rank cells openToPlayer clears ahead of every one it does not, before
-	--   the metric is applied at all, and let blockcheck leave the winner alone. A bed sunk
-	--   into a wool wall is the case: its top is open, so it can be hit from above, but
-	--   'Distance' ranks purely on how close the dig spot is, and blockcheck's one-axis
-	--   walk sees the wool standing beside it and redirects onto that -- so the aura strips
-	--   the wall while the open face it could have hit sits there the whole time. 'Health'
-	--   mostly avoids the first half on its own since an exposed cell costs 0 hits, but the
-	--   redirect hits it just the same, so the tier applies to both.
 	-- The ranking matters: picking purely by hit count can settle on a spot on the far side
 	-- of the block, and the 30-stud guard below then aborts the break outright.
-	bedwars.breakBlock = function(block, effects, anim, customHealthbar, blockcheck, method, autotool, preferexposed)
+	bedwars.breakBlock = function(block, effects, anim, customHealthbar, blockcheck, method, autotool)
 		if lplr:GetAttribute('DenyBlockBreak') or not entitylib.isAlive then return end
 		local handler = bedwars.BlockController:getHandlerRegistry():getHandler(block.Name)
 		local cost, pos, target, path = math.huge
 		local selfpos = entitylib.character.RootPart.Position
 		local positions = (handler and handler:getContainedPositions(block)) or {block.Position / 3}
-		local exposed = false
+		local direct = false
 
 		for _, v in positions do
-			local dpos, dcost, dpath = calculatePath(block, v * 3)
+			local cell = v * 3
+			local dpos, dcost, dpath = calculatePath(block, cell)
 			if dpos then
-				local dexposed = (preferexposed and openToPlayer(dpos)) and true or false
+				-- Does this candidate land on the block itself rather than on something
+				-- covering it? calculatePath answers with the cell it started from when that
+				-- cell already touches air, so dpos == cell IS 'this side of the block is
+				-- open'. Preferred outright, because aiming at the target beats aiming at its
+				-- cover and 'Distance' would otherwise rank a nearer cover cell above an open
+				-- bed. It is only a preference: blockcheck still gets the last word below, and
+				-- sends the break back onto the cover when the open side cannot be reached
+				-- from where the player stands.
+				local ddirect = dpos == cell
 				local score = method == 'Distance' and (selfpos - dpos).Magnitude or dcost
-				-- Kept a strict boolean: with preferexposed off dexposed is always false
-				-- and this collapses to the original `score < cost`
+				-- Kept a strict boolean: a single-celled block offers one candidate, so for
+				-- every caller but a bed this collapses to the original `score < cost`
 				local better
-				if dexposed ~= exposed then
-					better = dexposed
+				if ddirect ~= direct then
+					better = ddirect
 				else
 					better = score < cost
 				end
 				if better then
-					cost, pos, target, path, exposed = score, dpos, v * 3, dpath, dexposed
+					cost, pos, target, path, direct = score, dpos, cell, dpath, ddirect
 				end
 			end
 		end
 
 		-- Block Check. The spot chosen above is picked by the selected metric, but it can sit
-		-- behind the cover (an air face under the bed, or one on its far side) and hitting it
-		-- there is what reads as mining straight through the blocks. Step back along the line
-		-- to the player and take the first cell actually in the way, so the cover comes off
-		-- first from the side the player is standing on.
-		-- Skipped for a cell openToPlayer already cleared: it has an open face on your side,
-		-- so there is nothing standing in the way for this step to strip off first, and
-		-- letting frontOf run anyway is what sent an exposed bed back onto the wool beside
-		-- it -- frontOf only ever looks along one axis and cannot see the open face.
-		if blockcheck and pos and not exposed then
+		-- behind the cover (an air face under the bed, or one on its far side, or a cell up on
+		-- top of a mound) and hitting it there is what reads as mining straight through the
+		-- blocks. Take the first cell the eye line actually runs into instead, so the cover
+		-- comes off from the side the player is standing on.
+		--
+		-- No exceptions, and that is the point of it. Everything that used to be waved through
+		-- here -- a face pointing your way is open, the target itself is exposed somewhere --
+		-- turned out to mean 'exposed' in a sense that had nothing to do with being reachable
+		-- from where the player is standing, and each one came back as a break going through a
+		-- wall. There is nothing to lose by asking every time: a spot already at the front of
+		-- the line is what the march meets first, so it hands back exactly that spot. An open
+		-- bed you can see is hit; the same bed with wool in front of it gets the wool stripped.
+		if blockcheck and pos then
 			local front = frontOf(pos)
 			if front ~= pos then
 				-- path described the old target; drop it so the visualiser stops drawing a
@@ -1495,7 +1614,17 @@ run(function()
 		if pos then
 			if (entitylib.character.RootPart.Position - pos).Magnitude > 30 then return end
 			local dblock, dpos = getPlacedBlock(pos)
+			-- Nothing standing where the path said to dig: the world moved under the answer
+			-- between working it out and acting on it. Next pass works out a fresh one.
 			if not dblock then return end
+
+			-- Never swing at something the game marks unbreakable for our own team, whatever
+			-- the caller thought it was aiming at. The dig spot is routinely NOT the block that
+			-- was ranked -- Block Check redirects it onto whatever stands in the way -- so a
+			-- caller's own filtering says nothing about what ends up taking the damage, and the
+			-- one thing that must never take damage is our own bed. One attribute read, the
+			-- same one the game marks it with.
+			if dblock:GetAttribute('Team'..(lplr:GetAttribute('Team') or -1)..'NoBreak') ~= nil then return end
 
 			-- The recent-swing gate keeps the sword in hand mid-fight for callers that
 			-- pass autotool=false. When the caller explicitly asked for AutoTool it has
@@ -1748,16 +1877,9 @@ run(function()
 				},
 				player = select(5, ...)
 			}
-			for i, v in cache do
-				if ((data.blockRef.blockPosition * 3) - v[1]).Magnitude <= 30 then
-					table.clear(v[3])
-					table.clear(v)
-					cache[i] = nil
-				end
-			end
 			vapeEvents[event]:Fire(data)
 		end))
-	end	
+	end
 
 	store.blocks = collection('block', gui)
 	store.shop = collection({'BedwarsItemShop', 'TeamUpgradeShopkeeper'}, gui, function(tab, obj)
@@ -1869,15 +1991,10 @@ run(function()
 		for _, v in vapeEvents do
 			v:Destroy()
 		end
-		for _, v in cache do
-			table.clear(v[3])
-			table.clear(v)
-		end
 		table.clear(store.blockPlacer)
 		table.clear(vapeEvents)
 		table.clear(bedwars)
 		table.clear(store)
-		table.clear(cache)
 		table.clear(sides)
 		table.clear(remotes)
 		storeChanged:disconnect()
@@ -1997,7 +2114,7 @@ run(function()
 				end))
 			end
 		end,
-		Tooltip = 'Smoothly aims to closest valid target with sword'
+		Tooltip = 'Smoothly pulls your aim onto the closest target while you have a sword out'
 	})
 	Targets = AimAssist:CreateTargets({
 		Players = true,
@@ -2040,7 +2157,7 @@ run(function()
 		Max = 100,
 		Default = 0,
 		Suffix = '%',
-		Tooltip = 'Randomly wobbles the aim off-target\n0 aims dead centre, 100 is a full 5 degrees of deflection'
+		Tooltip = 'Adds a bit of random wobble to your aim.\n0 is dead centre, 100 is a full 5 degrees off.'
 	})
 	ClickAim = AimAssist:CreateToggle({
 		Name = 'Click Aim',
@@ -2068,7 +2185,7 @@ run(function()
 				bedwars.SwordController.isClickingTooFast = old
 			end
 		end,
-		Tooltip = 'Remove the CPS cap'
+		Tooltip = 'Takes the CPS cap off'
 	})
 end)
 	
@@ -2080,7 +2197,7 @@ run(function()
 		Function = function(callback)
 			bedwars.CombatConstant.RAYCAST_SWORD_CHARACTER_DISTANCE = callback and Value.Value + 2 or 14.4
 		end,
-		Tooltip = 'Extends attack reach'
+		Tooltip = 'Lets you hit from further away'
 	})
 	Value = Reach:CreateSlider({
 		Name = 'Range',
@@ -2123,7 +2240,7 @@ run(function()
 				bedwars.SprintController:stopSprinting()
 			end
 		end,
-		Tooltip = 'Sets your sprinting to true.'
+		Tooltip = 'Keeps you sprinting without holding the key.'
 	})
 end)
 	
@@ -2167,7 +2284,7 @@ run(function()
 				until not TriggerBot.Enabled
 			end
 		end,
-		Tooltip = 'Automatically swings when hovering over a entity'
+		Tooltip = 'Swings on its own when your cursor is over someone'
 	})
 	CPS = TriggerBot:CreateTwoSlider({
 		Name = 'CPS',
@@ -2212,7 +2329,7 @@ run(function()
 				bedwars.KnockbackUtil.applyKnockback = old
 			end
 		end,
-		Tooltip = 'Reduces knockback taken'
+		Tooltip = 'Takes some of the knockback off you'
 	})
 	Horizontal = Velocity:CreateSlider({
 		Name = 'Horizontal',
@@ -2338,7 +2455,7 @@ run(function()
 				AntiFallDirection = nil
 			end
 		end,
-		Tooltip = 'Help\'s you with your Parkinson\'s\nPrevents you from falling into the void.'
+		Tooltip = 'Helps you with your Parkinsons.\nCatches you before you go into the void.'
 	})
 	Mode = AntiFall:CreateDropdown({
 		Name = 'Move Mode',
@@ -2348,7 +2465,7 @@ run(function()
 				AntiFallPart.CanCollide = val == 'Collide'
 			end
 		end,
-	Tooltip = 'Normal - Smoothly moves you towards the nearest safe point\nVelocity - Launches you upward after touching\nCollide - Allows you to walk on the part'
+	Tooltip = 'Normal - eases you back to the nearest safe spot\nVelocity - throws you upward the moment you touch it\nCollide - just lets you walk on the part'
 	})
 	local materials = {'ForceField'}
 	for _, v in Enum.Material:GetEnumItems() do
@@ -2442,7 +2559,7 @@ run(function()
 				bedwars.BlockBreakController.blockBreaker:setCooldown(VANILLA_COOLDOWN)
 			end
 		end,
-		Tooltip = 'Decreases block hit cooldown'
+		Tooltip = 'Cuts down the cooldown between block hits'
 	})
 	Time = FastBreak:CreateSlider({
 		Name = 'Break speed',
@@ -2454,15 +2571,15 @@ run(function()
 	})
 	BlacklistBeds = FastBreak:CreateToggle({
 		Name = 'Blacklist Bed',
-		Tooltip = 'Breaks beds at the normal speed instead'
+		Tooltip = 'Leaves beds at normal breaking speed'
 	})
 	BlacklistOres = FastBreak:CreateToggle({
 		Name = 'Blacklist Ore',
-		Tooltip = 'Breaks ores at the normal speed instead'
+		Tooltip = 'Leaves ores at normal breaking speed'
 	})
 	BlacklistHive = FastBreak:CreateToggle({
 		Name = 'Blacklist Hive',
-		Tooltip = 'Breaks beehives at the normal speed instead'
+		Tooltip = 'Leaves beehives at normal breaking speed'
 	})
 end)
 	
@@ -2644,7 +2761,7 @@ run(function()
 				table.clear(objects)
 			end
 		end,
-		Tooltip = 'Expands attack hitbox'
+		Tooltip = 'Grows the hitbox you attack into'
 	})
 	Mode = HitBoxes:CreateDropdown({
 		Name = 'Mode',
@@ -2655,7 +2772,7 @@ run(function()
 				HitBoxes:Toggle()
 			end
 		end,
-		Tooltip = 'Sword - Increases the range around you to hit entities\nPlayer - Increases the players hitbox'
+		Tooltip = 'Sword - widens the range you can hit people from\nPlayer - grows the players own hitboxes'
 	})
 	Expand = HitBoxes:CreateSlider({
 		Name = 'Expand amount',
@@ -2687,7 +2804,7 @@ run(function()
 			debug.setconstant(bedwars.SprintController.startSprinting, 5, callback and 'blockSprinting' or 'blockSprint')
 			bedwars.SprintController:stopSprinting()
 		end,
-		Tooltip = 'Lets you sprint with a speed potion.'
+		Tooltip = 'Lets you keep sprinting while a speed potion is up.'
 	})
 end)
 
@@ -2731,7 +2848,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Prevents you from walking off the edge of parts'
+		Tooltip = 'Stops you walking off the edge of a block'
 	})
 end)
 
@@ -2761,7 +2878,7 @@ run(function()
 				old = nil
 			end
 		end,
-		Tooltip = 'Prevents slowing down when using items.'
+		Tooltip = 'Keeps you at full speed while youre using items.'
 	})
 end)
 	
@@ -2817,7 +2934,7 @@ run(function()
 		ExtraText = function()
 			return 'Heatseeker'
 		end,
-		Tooltip = 'Increases your movement with various methods.'
+		Tooltip = 'Speeds you up. Pick whichever method works best for you.'
 	})
 	Value = Speed:CreateSlider({
 		Name = 'Speed',
@@ -2904,7 +3021,7 @@ run(function()
 				table.clear(Reference)
 			end
 		end,
-		Tooltip = 'Render Beds through walls'
+		Tooltip = 'Shows beds through walls'
 	})
 end)
 	
@@ -2932,7 +3049,7 @@ run(function()
 				end))
 			end
 		end,
-		Tooltip = 'Displays your health in the center of your screen.'
+		Tooltip = 'Puts your health right in the middle of your screen.'
 	})
 end)
 	
@@ -3118,7 +3235,7 @@ run(function()
                 clearTracked()
             end
         end,
-        Tooltip = 'ESP for certain kit related objects'
+        Tooltip = 'ESP for the kit objects lying around the map'
     })
 
     Background = KitESP:CreateToggle({
@@ -3756,7 +3873,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Renders nametags on entities through walls.'
+		Tooltip = 'Draws nametags through walls.'
 	})
 	Targets = NameTags:CreateTargets({
 		Players = true,
@@ -3846,7 +3963,7 @@ run(function()
 				NameTags:Toggle()
 			end
 		end,
-		Tooltip = 'Shows the ranked division icon above the nametag'
+		Tooltip = 'Puts their ranked division icon above the nametag'
 	})
 	Enchant = NameTags:CreateToggle({
 		Name = 'Show Enchant',
@@ -3856,7 +3973,7 @@ run(function()
 				NameTags:Toggle()
 			end
 		end,
-		Tooltip = 'Shows the player\'s active enchant icon above the nametag (Drawing mode has no icons)'
+		Tooltip = 'Puts their active enchant above the nametag. Drawing mode doesnt have the icons.'
 	})
 	Device = NameTags:CreateToggle({
 		Name = 'Show Device',
@@ -3866,7 +3983,7 @@ run(function()
 				NameTags:Toggle()
 			end
 		end,
-		Tooltip = 'Shows 🎮 / 🖥️ / 📱 for the input device the player is on'
+		Tooltip = 'Shows 🎮 / 🖥️ / 📱 depending on what theyre playing on'
 	})
 	DisplayName = NameTags:CreateToggle({
 		Name = 'Use Displayname',
@@ -4018,7 +4135,7 @@ run(function()
 				Folder:ClearAllChildren()
 			end
 		end,
-		Tooltip = 'Displays items in chests'
+		Tooltip = 'Shows you whats in a chest without opening it'
 	})
 	List = StorageESP:CreateTextList({
 		Name = 'Item',
@@ -4087,7 +4204,7 @@ run(function()
 				until not AutoBalloon.Enabled
 			end
 		end,
-		Tooltip = 'Inflates when you fall into the void'
+		Tooltip = 'Inflates when you go over the edge'
 	})
 end)
 	
@@ -4258,7 +4375,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Automatically uses kit abilities.'
+		Tooltip = 'Uses your kit abilities for you.'
 	})
 	Legit = AutoKit:CreateToggle({Name = 'Legit Range'})
 	local sortTable = {}
@@ -4312,11 +4429,11 @@ run(function()
 				AutoPlay:Clean(vapeEvents.MatchEndEvent.Event:Connect(joinQueue))
 			end
 		end,
-		Tooltip = 'Automatically queues after the match ends.'
+		Tooltip = 'Queues you up again once the match ends.'
 	})
 	Random = AutoPlay:CreateToggle({
 		Name = 'Random',
-		Tooltip = 'Chooses a random mode'
+		Tooltip = 'Picks a random mode for you'
 	})
 end)
 	
@@ -4375,7 +4492,7 @@ run(function()
 				end))
 			end
 		end,
-		Tooltip = 'Sends a quick chat message after a certain action'
+		Tooltip = 'Fires off a quick chat message after certain things happen'
 	})
 	GG = AutoToxic:CreateToggle({
 		Name = 'AutoGG',
@@ -4394,7 +4511,7 @@ run(function()
 		List = PresetNames,
 		Darker = true,
 		Visible = false,
-		Tooltip = 'Quick chat message sent after you kill someone'
+		Tooltip = 'What to say after you kill someone'
 	})
 
 	local savedKillMessage
@@ -4475,12 +4592,12 @@ run(function()
 				until not AutoVoidDrop.Enabled
 			end
 		end,
-		Tooltip = 'Drops resources when you fall into the void'
+		Tooltip = 'Dumps your resources if you fall into the void'
 	})
 	OwlCheck = AutoVoidDrop:CreateToggle({
 		Name = 'Owl check',
 		Default = true,
-		Tooltip = 'Refuses to drop items if being picked up by an owl'
+		Tooltip = 'Holds onto your items if an owl is coming for them'
 	})
 end)
 	
@@ -4521,7 +4638,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Spawns and teleports a missile to a player\nnear your mouse.'
+		Tooltip = 'Spawns a missile and sends it at whoever is\nnearest your mouse.'
 	})
 end)
 
@@ -4590,7 +4707,7 @@ run(function()
 				table.clear(pickups)
 			end
 		end,
-		Tooltip = 'Picks up items from a farther distance'
+		Tooltip = 'Grabs items from further away'
 	})
 	Range = PickupRange:CreateSlider({
 		Name = 'Range',
@@ -4608,7 +4725,7 @@ run(function()
 		Default = 1,
 		Decimal = 10,
 		Suffix = function(val) return 's' end,
-		Tooltip = 'How long before the same drop is requested again.\nOnly applies to retries -- a drop is always requested\nthe moment it is spotted. Lower it and a floor full of\nitems can outrun the 299/min the server allows.'
+		Tooltip = 'How long before it retries the same drop. New drops are\nalways grabbed the moment they show up, so this only\naffects retries. Go too low and a floor full of items\nwill blow past the 299/min the server allows.'
 	})
 	Network = PickupRange:CreateToggle({
 		Name = 'Network TP',
@@ -4655,7 +4772,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Spawns and teleports a raven to a player\nnear your mouse.'
+		Tooltip = 'Spawns a raven and sends it at whoever is\nnearest your mouse.'
 	})
 end)
 	
@@ -4870,7 +4987,7 @@ run(function()
 				matchRunningSince = nil
 			end
 		end,
-		Tooltip = 'Detects people with a staff rank ingame'
+		Tooltip = 'Lets you know when someone with a staff rank is in the server'
 	})
 	Mode = StaffDetector:CreateDropdown({
 		Name = 'Mode',
@@ -4910,7 +5027,7 @@ end)
 run(function()
 	TrapDisabler = vape.Categories.Utility:CreateModule({
 		Name = 'TrapDisabler',
-		Tooltip = 'Disables Snap Traps'
+		Tooltip = 'Turns off snap traps'
 	})
 end)
 	
@@ -4937,7 +5054,7 @@ run(function()
 				})
 			end
 		end,
-		Tooltip = 'Lets you stay ingame without getting kicked'
+		Tooltip = 'Keeps you in the game instead of getting kicked for idling'
 	})
 end)
 	
@@ -4995,7 +5112,7 @@ run(function()
 				until not AutoSuffocate.Enabled
 			end
 		end,
-		Tooltip = 'Places blocks on nearby confined entities'
+		Tooltip = 'Boxes in anyone stuck nearby'
 	})
 	Range = AutoSuffocate:CreateSlider({
 		Name = 'Range',
@@ -5054,7 +5171,7 @@ run(function()
 				old = nil
 			end
 		end,
-		Tooltip = 'Automatically selects the correct tool'
+		Tooltip = 'Grabs the right tool for you'
 	})
 end)
 	
@@ -5120,7 +5237,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Automatically places strong blocks around the bed.'
+		Tooltip = 'Walls your bed in with the strongest blocks you have.'
 	})
 end)
 	
@@ -5203,7 +5320,7 @@ run(function()
 				table.clear(Delays)
 			end
 		end,
-		Tooltip = 'Grabs items from near chests.'
+		Tooltip = 'Pulls items out of the chests near you.'
 	})
 	Range = ChestSteal:CreateSlider({
 		Name = 'Range',
@@ -5221,7 +5338,7 @@ run(function()
 		Default = 0.5,
 		Decimal = 10,
 		Suffix = function(val) return 's' end,
-		Tooltip = 'How long before the same chest is tried again.\nRaise it if looting stops partway through a round --\ntwo remotes go out per pass against a 299/min budget.'
+		Tooltip = 'How long before it tries the same chest again.\nRaise it if looting dies off mid round, each pass\ncosts two remotes out of a 299/min budget.'
 	})
 	Open = ChestSteal:CreateToggle({Name = 'GUI Check'})
 	Skywars = ChestSteal:CreateToggle({
@@ -5435,7 +5552,7 @@ run(function()
 				table.clear(parts)
 			end
 		end,
-		Tooltip = 'Save and load placements of buildings'
+		Tooltip = 'Save your builds and drop them back down later'
 	})
 	File = Schematica:CreateTextBox({
 		Name = 'File',
@@ -5507,7 +5624,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Puts on / takes off armor when toggled for baiting.'
+		Tooltip = 'Swaps your armor on and off for baiting.'
 	})
 	Mode = ArmorSwitch:CreateDropdown({
 		Name = 'Mode',
@@ -5751,7 +5868,7 @@ run(function()
 				npctick = tick()
 			end
 		end,
-		Tooltip = 'Automatically buys items when you go near the shop'
+		Tooltip = 'Buys your items for you when you walk up to the shop'
 	})
 	Sword = AutoBuy:CreateToggle({
 		Name = 'Buy Sword',
@@ -5855,7 +5972,7 @@ run(function()
 	SmartCheck = AutoBuy:CreateToggle({
 		Name = 'Smart check',
 		Default = true,
-		Tooltip = 'Buys iron armor before iron axe'
+		Tooltip = 'Gets iron armor before the iron axe'
 	})
 	AutoBuy:CreateTextList({
 		Name = 'Item',
@@ -5945,7 +6062,7 @@ run(function()
 				consumeCheck()
 			end
 		end,
-		Tooltip = 'Automatically heals for you when health or shield is under threshold.'
+		Tooltip = 'Heals you once your health or shield drops under the threshold.'
 	})
 	Health = AutoConsume:CreateSlider({
 		Name = 'Health Percent',
@@ -6315,7 +6432,9 @@ run(function()
 				table.clear(v.Hotbar)
 			end
 			table.clear(self.Hotbars)
-			for _, v in savetab.Hotbars do
+			-- `or {}`: a profile written before HotbarList worked has no hotbar array,
+			-- and indexing nil here would take the whole profile load down with it.
+			for _, v in savetab.Hotbars or {} do
 				self:AddHotbar(v)
 			end
 			self.Selected = savetab.Selected or 1
@@ -6533,7 +6652,7 @@ run(function()
 				AutoHotbar:Clean(vapeEvents.InventoryAmountChanged.Event:Connect(sortCallback))
 			end
 		end,
-		Tooltip = 'Automatically arranges hotbar to your liking.'
+		Tooltip = 'Sorts your hotbar the way you want it.'
 	})
 	Mode = AutoHotbar:CreateDropdown({
 		Name = 'Activation',
@@ -6612,7 +6731,7 @@ run(function()
 				oldshowprogress = nil
 			end
 		end,
-		Tooltip = 'Use/Consume items quicker.'
+		Tooltip = 'Eats and uses items faster.'
 	})
 	Value = FastConsume:CreateSlider({
 		Name = 'Multiplier',
@@ -6638,7 +6757,7 @@ run(function()
 				until not FastDrop.Enabled
 			end
 		end,
-		Tooltip = 'Drops items fast when you hold Q'
+		Tooltip = 'Dumps items quickly while you hold Q'
 	})
 end)
 	
@@ -6663,7 +6782,7 @@ run(function()
 	            end))
 	        end
 		end,
-		Tooltip = 'Custom bed break effects'
+		Tooltip = 'Your own effect when a bed goes down'
 	})
 	local BreakEffectName = {}
 	for i, v in bedwars.BedBreakEffectMeta do
@@ -6689,7 +6808,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Removes zephyr status indicator'
+		Tooltip = 'Gets rid of the zephyr status indicator'
 	})
 end)
 	
@@ -6715,7 +6834,7 @@ run(function()
 				bedwars.ViewmodelController:showCrosshair()
 			end
 		end,
-		Tooltip = 'Custom first person crosshair depending on the image choosen.'
+		Tooltip = 'Your own first person crosshair, whatever image you pick.'
 	})
 	Image = Crosshair:CreateTextBox({
 		Name = 'Image',
@@ -6765,7 +6884,7 @@ run(function()
 				debug.setconstant(bedwars.DamageIndicator, 119, 'Thickness')
 			end
 		end,
-		Tooltip = 'Customize the damage indicator'
+		Tooltip = 'Change how the damage indicator looks'
 	})
 	local fontitems = {'GothamBlack'}
 	for _, v in Enum.Font:GetEnumItems() do
@@ -6849,7 +6968,7 @@ run(function()
 			
 			bedwars.FovController:setFOV(bedwars.Store:getState().Settings.fov)
 		end,
-		Tooltip = 'Adjusts camera vision'
+		Tooltip = 'Tweaks how far and wide the camera sees'
 	})
 	Value = FOV:CreateSlider({
 		Name = 'FOV',
@@ -6954,7 +7073,7 @@ run(function()
 				restoreGameNametags()
 			end
 		end,
-		Tooltip = 'Improves the framerate by turning off certain effects'
+		Tooltip = 'Turns off some effects to get you more frames'
 	})
 	Kill = FPSBoost:CreateToggle({
 		Name = 'Kill Effects',
@@ -6996,7 +7115,7 @@ run(function()
 				restoreGameNametags()
 			end
 		end,
-		Tooltip = 'Removes the game nametag above every character, your teammates included.\nTurning this off puts them back without a rejoin.'
+		Tooltip = 'Hides the game nametag over everyone, teammates too.\nTurn it back off and they come back, no rejoin needed.'
 	})
 end)
 	
@@ -7034,7 +7153,7 @@ run(function()
 				table.clear(done)
 			end
 		end,
-		Tooltip = 'Customize the hit highlight options'
+		Tooltip = 'Change how the hit highlight looks'
 	})
 	Color = HitColor:CreateColorSlider({
 		Name = 'Color',
@@ -7049,7 +7168,7 @@ run(function()
 			debug.setconstant(bedwars.SwordController.swingSwordAtMouse, 23, callback and 'raycast' or 'Raycast')
 			debug.setupvalue(bedwars.SwordController.swingSwordAtMouse, 4, callback and bedwars.QueryUtil or workspace)
 		end,
-		Tooltip = 'Changes the raycast function to the correct one'
+		Tooltip = 'Points raycasts at the right function'
 	})
 end)
 	
@@ -7100,7 +7219,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Customize bedwars UI'
+		Tooltip = 'Change how the bedwars UI looks'
 	})
 	local fontitems = {'LuckiestGuy'}
 	for _, v in Enum.Font:GetEnumItems() do
@@ -7276,7 +7395,7 @@ run(function()
 				lplr:SetAttribute('KillEffectType', 'default')
 			end
 		end,
-		Tooltip = 'Custom final kill effects'
+		Tooltip = 'Your own effect on a final kill'
 	})
 	local modes = {'Bedwars'}
 	for i in killeffects do
@@ -7434,7 +7553,7 @@ run(function()
 				table.clear(alreadypicked)
 			end
 		end,
-		Tooltip = 'Built in mp3 player'
+		Tooltip = 'A little mp3 player built right in'
 	})
 	List = SongBeats:CreateTextList({
 		Name = 'Songs',
@@ -7590,7 +7709,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Change ingame sounds to custom ones and adjust their volume.'
+		Tooltip = 'Swap ingame sounds for your own and set how loud they are.'
 	})
 	
 	List = SoundChanger:CreateTextList({
@@ -7714,7 +7833,7 @@ run(function()
 				end
 			end
 		end,
-		Tooltip = 'Cleans up the UI for kits & main'
+		Tooltip = 'Tidies up the kit and main menu UI'
 	})
 	UICleanup:CreateToggle({
 		Name = 'Resize Health',
@@ -7828,7 +7947,7 @@ run(function()
 				old = nil
 			end
 		end,
-		Tooltip = 'Changes the viewmodel animations'
+		Tooltip = 'Swaps out the viewmodel animations'
 	})
 	Depth = Viewmodel:CreateSlider({
 		Name = 'Depth',
@@ -7911,7 +8030,7 @@ run(function()
 				end))
 			end
 		end,
-		Tooltip = 'Allows you to select any clientside win effect'
+		Tooltip = 'Pick any win effect you want. Clientside only'
 	})
 	local WinEffectName = {}
 	for i, v in bedwars.WinEffectMeta do
@@ -7970,7 +8089,7 @@ run(function()
 			end
 			return Device.Value
 		end,
-		Tooltip = 'Spoofs the device you show up as to the server'
+		Tooltip = 'Changes what device the server thinks youre on'
 	})
 
 	Device = DeviceSpoofer:CreateDropdown({
@@ -8039,7 +8158,7 @@ run(function()
 				setNametagEnabled(true)
 			end
 		end,
-		Tooltip = 'Hides the nametag above your own character'
+		Tooltip = 'Hides the nametag over your own head'
 	})
 end)
 end)
