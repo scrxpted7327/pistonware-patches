@@ -87,6 +87,33 @@ local hasContentText = (function()
 	return readable
 end)()
 
+--[[
+	The one that only fires once a profile is loaded.
+
+	Sliders set their Value directly when they are built and never call SetValue, so on a fresh
+	install with no profile this code is unreachable. SetValue runs when a saved value is applied
+	-- or when you drag the slider yourself. That is why enabling every module by hand is fine
+	and applying a profile is not: toggling a module calls Toggle, loading one calls SetValue on
+	every slider it saved.
+
+	Two ways it went wrong there, and the guard used to be `if not math.isfinite(value)`:
+
+	math.isfinite is a recent Luau builtin. The Luau VM in a repackaged mobile client predates
+	it, so the guard itself is nil and calling it throws -- on the first slider in the profile,
+	and there are dozens. The old GUI never used the function.
+
+	And even on a current client, a profile that predates a slider (or was written by the old
+	GUI, which stored these differently) hands over nil. math.isfinite(nil) does not return
+	false, it throws 'number expected, got nil'.
+
+	Plain arithmetic answers both, on every Luau version, for every input type.
+]]
+local function isFiniteNumber(value)
+	if type(value) ~= 'number' then return false end
+	if value ~= value then return false end
+	return value > -math.huge and value < math.huge
+end
+
 local function removeTags(str)
 	str = str:gsub('<br%s*/>', '\n')
 	return (str:gsub('<[^<>]->', ''))
@@ -2943,11 +2970,22 @@ components = {
 			end
 		end
 		
+		--[[
+			Every module's Load calls this with data.Bind, and nothing guarantees that field
+			exists: a profile written before the module did, or a legacy one where the migration
+			produced {Keys = nil}, both arrive here as nil or as a table with no Keys. Indexing
+			the nil threw, and #nil in SetBind threw, on a module list that is walked in full --
+			so one stale entry took the entire profile load with it.
+		]]
 		function component:Load(data)
-			self.Hold = data.Hold
-			self:SetBind(data.Keys)
+			if type(data) ~= 'table' then
+				return
+			end
 		
-			if data.Mobile then
+			self.Hold = data.Hold
+			self:SetBind(type(data.Keys) == 'table' and data.Keys or {})
+		
+			if type(data.Mobile) == 'table' and tonumber(data.Mobile.X) and tonumber(data.Mobile.Y) then
 				self:CreateMobileButton(Vector2.new(data.Mobile.X, data.Mobile.Y))
 			end
 		end
@@ -2964,8 +3002,12 @@ components = {
 		end
 		
 		function component:SetBind(keys, mouse)
+			-- Callers outside this file reach SetBind too, and a saved profile is not a trusted
+			-- shape. Everything below counts and concatenates it, so make it a table first.
+			keys = type(keys) == 'table' and keys or {}
+		
 			if props and props.NoRemove and #keys <= 0 then
-				keys = props.Default
+				keys = type(props.Default) == 'table' and props.Default or keys
 			end
 		
 			self.Binding = nil
@@ -7086,7 +7128,7 @@ components = {
 		end
 		
 		function component:SetValue(value, position, wasReleased)
-			if not math.isfinite(value) then
+			if not isFiniteNumber(value) then
 				return
 			end
 		
@@ -8191,7 +8233,7 @@ components = {
 		end
 		
 		function component:SetValue(isMax, value)
-			if not math.isfinite(value) then
+			if not isFiniteNumber(value) then
 				return
 			end
 		
