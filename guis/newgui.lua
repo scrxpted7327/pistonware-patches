@@ -2714,8 +2714,43 @@ function vape:Save(newProfile)
 		module:Save(mainData.Legit)
 	end
 
+	--[[
+		Merge with what is already on disk instead of replacing it.
+
+		Save serialises the modules that exist RIGHT NOW. In BedWars they do not all exist at the
+		same time: the payload is a LuaArmor VM that registers modules for ~30s (much longer on a
+		phone), so a save taken before it finishes wrote a profile with every unregistered module
+		simply absent -- deleting those settings permanently.
+
+		The old defence was to refuse to save at all until the module list was known complete,
+		which traded one failure for another: if the payload never signals completion -- and it
+		only signals it if the copy uploaded to LuaArmor is current -- nothing gets saved for the
+		entire session, and every change made in that match is lost. That is a config that never
+		saves rather than a config that gets truncated.
+
+		Merging removes the need to choose. A module gets written from memory when this session
+		actually owns its state, which means either the profile was applied to it (Applied) or the
+		user has toggled it since (Touched). Anything else keeps whatever the file already held,
+		so a module that registered too late to be loaded cannot be written out on defaults.
+	]]
+	local profilePath = 'pistonware/profiles/'..self.Profile..self.Place..'.txt'
+	local previous = isfile(profilePath) and loadJson(profilePath) or nil
+	if previous then
+		for _, pair in {{previous.Modules, mainData.Modules, self.Modules}, {previous.Legit, mainData.Legit, self.Legit.Modules}} do
+			local savedData, newData, container = pair[1], pair[2], pair[3]
+			if type(savedData) == 'table' then
+				for name, data in savedData do
+					local module = container[name]
+					if module == nil or not (module.Applied or module.Touched) then
+						newData[name] = data
+					end
+				end
+			end
+		end
+	end
+
 	writefile('pistonware/profiles/'..game.GameId..'.gui.txt', httpService:JSONEncode(guiData))
-	writefile('pistonware/profiles/'..self.Profile..self.Place..'.txt', httpService:JSONEncode(mainData))
+	writefile(profilePath, httpService:JSONEncode(mainData))
 end
 
 function vape:SaveOptions(obj)
@@ -5793,6 +5828,7 @@ components = {
 		end
 		
 		function component:Load(data)
+			self.Applied = true
 			vape:LoadOptions(self, data.Options)
 		
 			if self.Enabled ~= data.Enabled then
@@ -5816,6 +5852,7 @@ components = {
 		end
 		
 		function component:Toggle()
+			self.Touched = true
 			self.Enabled = not self.Enabled
 			if self.Children then
 				self.Children.Visible = self.Enabled
@@ -6241,6 +6278,9 @@ components = {
 		end
 		
 		function component:Load(data)
+			-- This session owns this module's state from here on: it was present when the
+			-- profile was applied, so what is in memory is what the file said. See vape:Save.
+			self.Applied = true
 			vape:LoadOptions(self, data.Options)
 			self.Bind:Load(data.Bind)
 		
@@ -6278,6 +6318,9 @@ components = {
 				setthreadidentity(8)
 			end
 		
+			-- Toggled by hand counts as owning it too, even for a module that registered too
+			-- late to have the profile applied to it. See vape:Save.
+			self.Touched = true
 			self.Enabled = not self.Enabled
 			divider.Visible = self.Enabled
 			gradient.Enabled = self.Enabled
