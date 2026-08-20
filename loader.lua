@@ -1821,11 +1821,14 @@ if not firstRunProfiles and not declinedDownload and not isReload then
 			-- below makes the equipped config survive the sync whether the merge held or not.
 			local lastProfile
 			pcall(function()
-				-- The live object first. SetProfile stamps a switch into gui.txt immediately,
-				-- so the file is normally current -- but this is read before the Uninject
-				-- below flushes in-memory state, and vape.Profile cannot be stale under any
-				-- ordering. On a fresh execution there is no object and the file is the only
-				-- source, which is the common case here.
+				-- The live object first. vape.Profile updates the moment a profile is switched, so it
+				-- cannot be stale under any ordering, and this is read before the Uninject below
+				-- flushes in-memory state to disk. On a fresh execution there is no object and the
+				-- file is the only source, which is the common case here.
+				--
+				-- (The rewritten GUI dropped SetProfile, which the old one used to stamp the switch
+				-- straight into gui.txt. Nothing ever called it -- only this comment named it -- so
+				-- the behaviour here is unchanged.)
 				local live = shared.vape and shared.vape.Profile
 				if type(live) == 'string' and live ~= '' then
 					lastProfile = live
