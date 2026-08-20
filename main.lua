@@ -237,11 +237,20 @@ local function finishLoading()
 		-- more unsaved work in a crash for a GUI that stays smooth while you are using it.
 		local saveInterval = isTouchDevice and 30 or 10
 		task.spawn(function()
-			-- Off the profile-apply frame. Applying a profile toggles modules, rebuilds the Text
-			-- GUI and lets the game script react to all of it; adding a full serialise and two
-			-- disk writes to that same frame is what makes a phone hitch hardest, and it is the
-			-- moment the teleport repro dies on.
-			task.wait(3)
+			--[[
+				One frame off the apply frame, not three seconds.
+
+				What made the teleport path fall over was TWO full serialisations in the frame the
+				profile finished applying -- while modules were still toggling, the Text GUI was
+				rebuilding and the game script was reacting to all of it. Stepping off that frame
+				is the whole fix; waiting three seconds on top of it was not, and it cost the
+				promptness the removed immediate save used to provide.
+
+				Persisting the newly applied profile is not optional: gui.txt only records which
+				profile is active when something saves, so a long gap here is a window in which a
+				reinject comes back on the previous profile.
+			]]
+			task.wait()
 			while vape.Loaded and not shared.PistonwareSessionRejected do
 				debugWarn('[pistonware] autosave tick')
 				pcall(function() vape:Save() end)
