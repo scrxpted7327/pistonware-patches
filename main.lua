@@ -202,54 +202,41 @@ local function finishLoading()
 			because nothing overwrote them.
 		]]
 		--[[
-			A timed-out load no longer forbids saving for the rest of the session.
+			Saving cannot begin until the module set has STOPPED CHANGING, and that is not the
+			same as it being complete.
 
-			It used to return here, and that is why nothing you changed in a BedWars match ever
-			persisted. The wait only reports complete when the payload SIGNALS completion, and it
-			signals it from the last line of bedwars.lua -- so a copy on LuaArmor that predates
-			that line can never report complete, the 120s backstop is hit every single time, and
-			this return fired every single time. The lobby was unaffected because an ordinary game
-			script returns normally, which is exactly the asymmetry: settings held in the lobby and
-			vanished in the match.
+			vape:Save walks vape.Modules with `next`. While the payload is still loading, the
+			LuaArmor VM is inserting into that same table from another thread, and growing a table
+			mid-iteration is undefined in Lua -- the rehash takes the VM down natively rather than
+			raising something catchable. That is the crash, and it is why the old build refused to
+			save here at all.
 
-			The reason for the ban was real -- Save serialised only the modules that existed, so
-			saving early deleted the ones still registering. vape:Save merges with the file on disk
-			now and will not write a module this session never owned, so an incomplete list costs
-			nothing. The warning stays, because a payload that never signals is still worth fixing.
+			What the old build then got wrong was giving up permanently: it returned, and nothing
+			was ever saved for the rest of the session. A payload that never signals completion --
+			which is any copy on LuaArmor predating the flag at the end of bedwars.lua -- therefore
+			meant a BedWars match where nothing you changed was ever written, while the lobby saved
+			fine because an ordinary game script returns normally.
+
+			So: still never save while modules are arriving, but keep watching instead of giving
+			up. A signal ends the wait immediately; failing that, a module count that has not moved
+			for a while means nothing is inserting any more, which is the only property the walk
+			below actually needs.
 		]]
-		if not moduleSetComplete then
-			warn('[pistonware] the payload never signalled completion -- re-upload games/bedwars.lua to LuaArmor. Saving anyway; settings for modules that never registered are preserved from disk.')
-		end
-
-		debugWarn('[pistonware] profile applied -- starting autosave')
-		profileApplied = true
-
+		local function startAutosave()
+			profileApplied = true
+			-- Opens the gate on vape:RequestSave, which is what makes a module toggle write the
+			-- profile straight away instead of waiting for the tick below. Nothing may walk
+			-- vape.Modules before this point; that is the crash.
+			vape.SaveReady = true
+			debugWarn('[pistonware] module set settled -- saving on change enabled')
 		--[[
-			The immediate Save that used to sit here is gone, because the autosave loop below
-			opens with one.
+			A backstop now, not the main mechanism.
 
-			Two full serialisations back to back: every module walked, two files JSON-encoded and
-			written, twice, in the same frame the profile finished applying. That is the single
-			heaviest moment in the whole boot, and it landed differently depending on how you got
-			here -- which is exactly the asymmetry in the teleport repro.
-
-			Arriving by queue_on_teleport ALWAYS set customProfile (the teleport script writes
-			shared.VapeCustomProfile unconditionally), so the double save always happened. Running
-			the loader by hand only sets it when configs were synced or a config button was
-			clicked, so most manual runs never paid it.
-
-			The loop's first iteration writes the same file with the same contents a moment later,
-			so nothing is lost -- there is just one save now instead of two.
+			Module toggles write immediately through vape:RequestSave. This loop is what still
+			catches everything else -- a slider nudged, a colour changed, a window dragged -- none
+			of which announce themselves. Left at the same cadence because it is no longer what
+			your on/off states depend on.
 		]]
-		-- Only now is autosaving safe, and only now is there a profile worth saving.
-		-- The rejection check repeats inside the wait as well as at the top: a key can be
-		-- revoked mid-session, and when that happens bedwars.lua switches every module off.
-		-- Catching the flag only once per cycle would leave up to ten seconds in which this
-		-- loop could persist that switched-off state over a good config.
-		-- Save() serialises every module and writes a file. On desktop that is imperceptible
-		-- every ten seconds; on a phone it is a visible hitch on the same cadence, and it is one
-		-- of the things people mean by 'it freezes a lot'. Thirty seconds there trades a little
-		-- more unsaved work in a crash for a GUI that stays smooth while you are using it.
 		local saveInterval = isTouchDevice and 30 or 10
 		task.spawn(function()
 			--[[
@@ -275,6 +262,35 @@ local function finishLoading()
 				end
 			end
 		end)
+		end
+
+		if moduleSetComplete then
+			startAutosave()
+		else
+			warn('[pistonware] the payload never signalled completion -- re-upload games/bedwars.lua to LuaArmor. Waiting for the module list to settle before saving anything.')
+			task.spawn(function()
+				local lastCount, stableSince = -1, os.clock()
+				while vape.Loaded and not shared.PistonwareSessionRejected do
+					if gameScriptFinished or shared.PistonwareBedwarsLoaded then break end
+
+					-- vape.ModuleCount, never a walk of vape.Modules: the whole reason this
+					-- loop exists is that the payload is still inserting into that table.
+					local count = vape.ModuleCount or 0
+					if count ~= lastCount then
+						lastCount = count
+						stableSince = os.clock()
+					elseif os.clock() - stableSince > 30 then
+						break
+					end
+
+					task.wait(2)
+				end
+
+				if vape.Loaded and not shared.PistonwareSessionRejected then
+					startAutosave()
+				end
+			end)
+		end
 	end
 
 	-- Waits until the game script has finished registering its modules, because the profile can
@@ -306,8 +322,9 @@ local function finishLoading()
 			or shared.PistonwareBedwarsLoaded
 			or os.clock() - started > 120
 		local complete = (gameScriptFinished or shared.PistonwareBedwarsLoaded) and true or false
-		local count = 0
-		for _ in vape.Modules do count += 1 end
+		-- Same reason as the settle-watcher below: on the timeout path the payload is still
+		-- inserting, so this must not walk vape.Modules to count them.
+		local count = vape.ModuleCount or 0
 		local how = shared.PistonwareBedwarsLoaded and 'payload signalled'
 			or gameScriptFinished and 'game script returned'
 			or 'TIMED OUT after 120s -- re-upload bedwars.lua to LuaArmor so it can signal when it is done'
