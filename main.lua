@@ -180,7 +180,10 @@ local function finishLoading()
 			warn('[pistonware] session was not authorised -- leaving profiles untouched')
 			return
 		end
+		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
+			tostring(customProfile or '<saved>'), tostring(shared.vapereload and true or false)))
 		vape:Load(nil, customProfile)
+		debugWarn('[pistonware] profile load returned')
 
 		--[[
 			Loading an incomplete module set is fine: every module that exists gets its saved
@@ -203,12 +206,26 @@ local function finishLoading()
 			return
 		end
 
+		debugWarn('[pistonware] profile applied -- starting autosave')
 		profileApplied = true
-		-- Persist the applied profile so a reinject before the first autosave tick still comes
-		-- back to the same config.
-		if customProfile then
-			pcall(function() vape:Save() end)
-		end
+
+		--[[
+			The immediate Save that used to sit here is gone, because the autosave loop below
+			opens with one.
+
+			Two full serialisations back to back: every module walked, two files JSON-encoded and
+			written, twice, in the same frame the profile finished applying. That is the single
+			heaviest moment in the whole boot, and it landed differently depending on how you got
+			here -- which is exactly the asymmetry in the teleport repro.
+
+			Arriving by queue_on_teleport ALWAYS set customProfile (the teleport script writes
+			shared.VapeCustomProfile unconditionally), so the double save always happened. Running
+			the loader by hand only sets it when configs were synced or a config button was
+			clicked, so most manual runs never paid it.
+
+			The loop's first iteration writes the same file with the same contents a moment later,
+			so nothing is lost -- there is just one save now instead of two.
+		]]
 		-- Only now is autosaving safe, and only now is there a profile worth saving.
 		-- The rejection check repeats inside the wait as well as at the top: a key can be
 		-- revoked mid-session, and when that happens bedwars.lua switches every module off.
@@ -220,7 +237,13 @@ local function finishLoading()
 		-- more unsaved work in a crash for a GUI that stays smooth while you are using it.
 		local saveInterval = isTouchDevice and 30 or 10
 		task.spawn(function()
+			-- Off the profile-apply frame. Applying a profile toggles modules, rebuilds the Text
+			-- GUI and lets the game script react to all of it; adding a full serialise and two
+			-- disk writes to that same frame is what makes a phone hitch hardest, and it is the
+			-- moment the teleport repro dies on.
+			task.wait(3)
 			while vape.Loaded and not shared.PistonwareSessionRejected do
+				debugWarn('[pistonware] autosave tick')
 				pcall(function() vape:Save() end)
 				for _ = 1, saveInterval do
 					task.wait(1)
