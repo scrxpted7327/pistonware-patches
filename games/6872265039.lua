@@ -79,7 +79,7 @@ end
 --
 -- Collect first, remove after: the walk finishes before anything is mutated.
 local toRemove = {}
-for name, module in vape.Modules do
+for name, module in (vape.EachModule and vape:EachModule() or vape.Modules) do
 	if module.Category == 'Combat' or module.Category == 'Minigames' then
 		table.insert(toRemove, name)
 	end
