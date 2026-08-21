@@ -36,11 +36,8 @@ local cloneref = cloneref or function(obj)
 end
 local playersService = cloneref(game:GetService('Players'))
 
--- Phones and tablets. Used to pace the autosave loop, which is the expensive recurring job on a
--- device with slow storage.
---
--- It used to gate the asset prefetch too, because only the desktop GUI read icons off disk. Both
--- platforms take icons from uploaded ids now, so there is no prefetch left to gate.
+-- Phones and tablets. Kept because the teleport path and a couple of notifications still ask, but
+-- it no longer paces anything: the autosave loop it used to slow down on slow storage is gone.
 local isTouchDevice = false
 pcall(function()
 	isTouchDevice = cloneref(game:GetService('UserInputService')).TouchEnabled and true or false
@@ -130,12 +127,12 @@ end
 -- False while a game script is still registering its modules on its own thread. A fast game
 -- script sets this back to true before runGameScript even returns, so the common path never
 -- observes it as false. finishLoading needs it because two of the things it starts are unsafe
--- until every module exists: the autosave loop, and the profile it applies.
+-- until every module exists: saving, and the profile it applies.
 local gameScriptFinished = true
 
--- Set once the profile has been applied against the full module set. Every Save() is gated on
--- this rather than on gameScriptFinished: a protected payload never sets that flag, so gating
--- saves on it would mean BedWars never autosaved or persisted a config change at all.
+-- Set once the profile has been applied. Only the teleport handler reads it now, to decide
+-- whether a final save on the way out would be writing something real or writing defaults over
+-- a config that was never loaded.
 local profileApplied = false
 
 local function finishLoading()
@@ -163,12 +160,12 @@ local function finishLoading()
 
 		Save() has the same constraint from the other side: it serialises the module list as it
 		stands, so any save taken before the payload finishes writes a profile missing every
-		module yet to appear -- destroying those settings on disk. Both the initial save and the
-		autosave loop therefore sit behind the same wait.
+		module yet to appear -- destroying those settings on disk. vape.Loaded stays false for the
+		whole of vape:Load, which is what holds saving off until the apply is complete.
 
-		A normal game script has already finished by the time we get here (task.spawn runs it
-		inline until it yields, and only bedwars.lua yields), so this whole block runs
-		synchronously and behaves exactly as it always did.
+		The one exception is a payload that runs past the backstop. Those modules are not lost:
+		vape:LoadLate applies their saved settings when they finally register, and it touches only
+		the ones that arrived after the load, so it cannot revert anything changed by hand.
 	]]
 	local function applyProfile(moduleSetComplete)
 		-- A session LuaArmor refused registered no game modules at all (see the session
@@ -182,117 +179,50 @@ local function finishLoading()
 		end
 		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
 			tostring(customProfile or '<saved>'), tostring(shared.vapereload and true or false)))
+		if vape.Trace then vape:Trace('applyProfile start (complete='..tostring(moduleSetComplete)..')') end
 		vape:Load(nil, customProfile)
+		if vape.Trace then vape:Trace('applyProfile returned') end
 		debugWarn('[pistonware] profile load returned')
 
 		--[[
-			Loading an incomplete module set is fine: every module that exists gets its saved
-			settings, and the ones still registering simply arrive later. PERSISTING one is not
-			fine, and this is where mobile configs were being reset.
+			No autosave loop, and nothing timed anywhere in the save path.
 
-			waitForModules only reports incomplete when it hit its 120s backstop. On desktop that
-			effectively never happens -- the payload signals long before. On a phone it happens
-			for real, because the LuaArmor VM is slow enough there to run past the deadline. What
-			followed was the destructive half: profileApplied went true, the autosave loop started
-			ten seconds later, and Save() serialised a module list that was still missing most of
-			BedWars -- writing every one of those settings out of the profile permanently.
+			There used to be one because the only way to write safely was to wait until the module set
+			had stopped changing, and with a payload that never announces it had finished the only
+			available answer was a guess: watch the count, call it settled after thirty seconds of
+			quiet, then poll every ten. Every part of that was a workaround for vape:Save walking a hash
+			table the payload was still inserting into.
 
-			So a timed-out load now applies and stops. Nothing is written, the file on disk stays
-			exactly as the user left it, and the modules that arrive late keep their saved values
-			because nothing overwrote them.
+			Save walks vape.ModuleOrder now -- an array, by index -- which nothing about a registration
+			can invalidate. That removes the reason to wait, and with it the timer, the poll, and the
+			gate they existed to open. A module toggle writes through vape:RequestSave; vape.Loaded is
+			the only thing gating it, and vape:Load owns that flag.
 		]]
-		--[[
-			Saving cannot begin until the module set has STOPPED CHANGING, and that is not the
-			same as it being complete.
+		profileApplied = true
 
-			vape:Save walks vape.Modules with `next`. While the payload is still loading, the
-			LuaArmor VM is inserting into that same table from another thread, and growing a table
-			mid-iteration is undefined in Lua -- the rehash takes the VM down natively rather than
-			raising something catchable. That is the crash, and it is why the old build refused to
-			save here at all.
-
-			What the old build then got wrong was giving up permanently: it returned, and nothing
-			was ever saved for the rest of the session. A payload that never signals completion --
-			which is any copy on LuaArmor predating the flag at the end of bedwars.lua -- therefore
-			meant a BedWars match where nothing you changed was ever written, while the lobby saved
-			fine because an ordinary game script returns normally.
-
-			So: still never save while modules are arriving, but keep watching instead of giving
-			up. A signal ends the wait immediately; failing that, a module count that has not moved
-			for a while means nothing is inserting any more, which is the only property the walk
-			below actually needs.
-		]]
-		local function startAutosave()
-			profileApplied = true
-			-- Opens the gate on vape:RequestSave, which is what makes a module toggle write the
-			-- profile straight away instead of waiting for the tick below. Nothing may walk
-			-- vape.Modules before this point; that is the crash.
-			vape.SaveReady = true
-			debugWarn('[pistonware] module set settled -- saving on change enabled')
-			-- Anything toggled while the gate was shut recorded itself instead of being dropped.
-			-- Write it now rather than leaving it for a backstop tick up to 30s away.
-			if vape.FlushSave then
-				pcall(function() vape:FlushSave() end)
-			end
-		--[[
-			A backstop now, not the main mechanism.
-
-			Module toggles write immediately through vape:RequestSave. This loop is what still
-			catches everything else -- a slider nudged, a colour changed, a window dragged -- none
-			of which announce themselves. Left at the same cadence because it is no longer what
-			your on/off states depend on.
-		]]
-		local saveInterval = isTouchDevice and 30 or 10
-		task.spawn(function()
+		if not moduleSetComplete then
+			warn('[pistonware] the payload never signalled completion -- re-upload games/bedwars.lua to LuaArmor.')
 			--[[
-				One frame off the apply frame, not three seconds.
+				The modules that were not registered in time still have their settings on disk, and
+				vape:LoadLate is what puts them on. It only touches modules that appeared AFTER the
+				profile was applied, so anything toggled by hand in the meantime is left alone.
 
-				What made the teleport path fall over was TWO full serialisations in the frame the
-				profile finished applying -- while modules were still toggling, the Text GUI was
-				rebuilding and the game script was reacting to all of it. Stepping off that frame
-				is the whole fix; waiting three seconds on top of it was not, and it cost the
-				promptness the removed immediate save used to provide.
-
-				Persisting the newly applied profile is not optional: gui.txt only records which
-				profile is active when something saves, so a long gap here is a window in which a
-				reinject comes back on the previous profile.
+				No deadline on this watcher: it is waiting for the game script to finish, and if it
+				never does there is nothing to apply and nothing lost by still waiting.
 			]]
-			task.wait()
-			while vape.Loaded and not shared.PistonwareSessionRejected do
-				debugWarn('[pistonware] autosave tick')
-				pcall(function() vape:Save() end)
-				for _ = 1, saveInterval do
-					task.wait(1)
-					if not vape.Loaded or shared.PistonwareSessionRejected then break end
-				end
-			end
-		end)
-		end
-
-		if moduleSetComplete then
-			startAutosave()
-		else
-			warn('[pistonware] the payload never signalled completion -- re-upload games/bedwars.lua to LuaArmor. Waiting for the module list to settle before saving anything.')
 			task.spawn(function()
-				local lastCount, stableSince = -1, os.clock()
-				while vape.Loaded and not shared.PistonwareSessionRejected do
-					if gameScriptFinished or shared.PistonwareBedwarsLoaded then break end
-
-					-- vape.ModuleCount, never a walk of vape.Modules: the whole reason this
-					-- loop exists is that the payload is still inserting into that table.
-					local count = vape.ModuleCount or 0
-					if count ~= lastCount then
-						lastCount = count
-						stableSince = os.clock()
-					elseif os.clock() - stableSince > 30 then
-						break
-					end
-
-					task.wait(2)
-				end
+				repeat task.wait(1) until gameScriptFinished
+					or shared.PistonwareBedwarsLoaded
+					or not vape.Loaded
+					or shared.PistonwareSessionRejected
 
 				if vape.Loaded and not shared.PistonwareSessionRejected then
-					startAutosave()
+					local applied = 0
+					pcall(function() applied = vape:LoadLate() or 0 end)
+					debugWarn(('[pistonware] payload finished late -- applied saved settings to %d further modules'):format(applied))
+					if applied > 0 then
+						pcall(function() vape:RequestSave() end)
+					end
 				end
 			end)
 		end
@@ -327,8 +257,7 @@ local function finishLoading()
 			or shared.PistonwareBedwarsLoaded
 			or os.clock() - started > 120
 		local complete = (gameScriptFinished or shared.PistonwareBedwarsLoaded) and true or false
-		-- Same reason as the settle-watcher below: on the timeout path the payload is still
-		-- inserting, so this must not walk vape.Modules to count them.
+		-- vape.ModuleCount, not a walk: on the timeout path the payload is still registering.
 		local count = vape.ModuleCount or 0
 		local how = shared.PistonwareBedwarsLoaded and 'payload signalled'
 			or gameScriptFinished and 'game script returned'
