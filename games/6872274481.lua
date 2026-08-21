@@ -3,13 +3,6 @@ if not shared.PistonwareAuthenticated then
 	return
 end
 
--- Every module in this file and in bedwars.lua is registered inside one of these -- 60 blocks
--- here, 59 there, all at top level, and bedwars.lua takes this same function through bw.run.
--- Unprotected, an error anywhere in any of them aborted the rest of the file: every module
--- below the failure never registered, and in bedwars.lua the completion signal on the last
--- line never ran either, so main.lua sat in waitForModules for the full 120s before loading a
--- profile against a half-built module set. One game update touching one API took the whole
--- script down that way. Contained here, a bad block costs its own modules and nothing else.
 local run = function(func)
 	if shared.VapeSmoothBoot then task.wait() end
 	local ok, err = pcall(func)
@@ -226,7 +219,11 @@ local function getBow()
 		local meta = bedwars.ItemMeta[item.itemType]
 		if meta then
 			local source = meta.projectileSource
-			if source and table.find(source.ammoItemTypes, "arrow") then
+			-- ammoItemTypes is absent on self-fuelled launchers (the frost staffs and most kit
+			-- casters -- bedwars.lua's isSelfFuelled is about the same field), and
+			-- table.find(nil, ...) throws rather than returning nil. Carrying one of those made
+			-- every getBow() call error out, which takes the caller with it.
+			if source and source.ammoItemTypes and table.find(source.ammoItemTypes, "arrow") then
 				local damage = (bedwars.ProjectileMeta[source.projectileType("arrow")] or {}).combat and bedwars.ProjectileMeta[source.projectileType("arrow")].combat.damage or 0
 				if damage > highestDamage then
 					bestBow, bestSlot, highestDamage = item, slot, damage
@@ -512,7 +509,9 @@ local function modifyVelocity(v)
 end
 
 local function updateVelocity(force)
-	local newState = getTableSize(frictionTable) > 0
+	-- next(), not a full count: the only question is whether anything is in there, and
+	-- getTableSize walks every entry to answer it.
+	local newState = next(frictionTable) ~= nil
 	if frictionState ~= newState or force then
 		if frictionConnection then
 			frictionConnection:Disconnect()
@@ -922,7 +921,24 @@ end
 local getnamecallmethod = getnamecallmethod
 local mt = getrawmetatable(game)
 setreadonly(mt, false)
-local oldNamecall = mt.__namecall
+--[[
+	Chain to the FIRST original, never to whatever is installed right now.
+
+	This file is re-executed on every injection, and a reinject in the same server is an
+	ordinary thing to do -- the Reinject button, Reset current profile, and the config sync all
+	go back through the loader. Reading mt.__namecall straight into oldNamecall meant the new
+	hook wrapped the previous hook, which wrapped the one before it: three reinjects and every
+	namecall in the game -- the tens of thousands Roact issues per item-shop render included --
+	walked three nested Lua closures, with only the newest one's watch table doing anything.
+	The stack never came back down, because nothing here restores the metamethod.
+
+	shared is per-session (it does not survive a teleport, and a teleport gives us a fresh
+	metatable anyway), so it holds exactly the right thing: the untouched original from the
+	first injection of this session. Later injections replace the live hook instead of stacking
+	on it, and the chain stays one deep however many times the script is reloaded.
+]]
+local oldNamecall = shared.PistonwareOldNamecall or mt.__namecall
+shared.PistonwareOldNamecall = oldNamecall
 mt.__namecall = function(self, ...)
     local method = getnamecallmethod()
     if method == "GetPrimaryPartCFrame" and self and self:IsA("Model") then
@@ -1279,7 +1295,11 @@ run(function()
 					return call:SendToServer(attackTable, ...)
 				end
 			}
-		elseif remoteName == 'StepOnSnapTrap' and TrapDisabler.Enabled then
+		-- TrapDisabler is nil until its own run() block registers it, hundreds of lines below
+		-- this one, and stays nil for the session if that block fails (which is exactly what
+		-- run() is there to survive). Indexing it then threw on every Client:Get for the trap
+		-- remote -- inside the hot path every remote in the game goes through.
+		elseif remoteName == 'StepOnSnapTrap' and TrapDisabler and TrapDisabler.Enabled then
 			return {SendToServer = function() end}
 		end
 
@@ -1881,8 +1901,19 @@ run(function()
 		end))
 	end
 
-	store.blocks = collection('block', gui)
-	store.shop = collection({'BedwarsItemShop', 'TeamUpgradeShopkeeper'}, gui, function(tab, obj)
+	--[[
+		Second argument is whatever owns the cleanup, and `gui` is not a name that exists in
+		this file -- so all three of these passed nil and registered no cleanup at all.
+
+		Each call opens two CollectionService signals per tag. Nothing disconnected them, so an
+		uninject left them live and mutating tables the rest of the script had let go of, and a
+		reinject in the same server (the Reinject button, a profile reset, a config sync) simply
+		added another set on top. Every other collection() call site in this file and in
+		bedwars.lua passes the module that owns it; these are file-level, so they belong to vape
+		itself, which is what its Clean list is for.
+	]]
+	store.blocks = collection('block', vape)
+	store.shop = collection({'BedwarsItemShop', 'TeamUpgradeShopkeeper'}, vape, function(tab, obj)
 		table.insert(tab, {
 			Id = obj.Name,
 			RootPart = obj,
@@ -1890,7 +1921,7 @@ run(function()
 			Upgrades = obj:HasTag('TeamUpgradeShopkeeper')
 		})
 	end)
-	store.enchant = collection({'enchant-table', 'broken-enchant-table'}, gui, nil, function(tab, obj, tag)
+	store.enchant = collection({'enchant-table', 'broken-enchant-table'}, vape, nil, function(tab, obj, tag)
 		if obj:HasTag('enchant-table') and tag == 'broken-enchant-table' then return end
 		obj = table.find(tab, obj)
 		if obj then
@@ -2141,7 +2172,8 @@ run(function()
 		Min = 1,
 		Max = 30,
 		Default = 30,
-		Suffx = function(val)
+		-- 'Suffx' was a typo, so the slider drew a bare number with no unit.
+		Suffix = function(val)
 			return val == 1 and 'stud' or 'studs'
 		end
 	})
@@ -2924,6 +2956,10 @@ run(function()
 	
 						root.CFrame += destination
 						root.AssemblyLinearVelocity = (moveDirection * velo) + Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
+						-- `Attacking` is a bare global on purpose: bedwars.lua's Killaura sets it
+						-- every Heartbeat and the two chunks share one environment. Do not turn it
+						-- into a local here or in bedwars.lua without moving it onto genv first --
+						-- this is the only thing that tells AutoJump a swing is in progress.
 						if AutoJump.Enabled and (state == Enum.HumanoidStateType.Running or state == Enum.HumanoidStateType.Landed) and moveDirection ~= Vector3.zero and (Attacking or AlwaysJump.Enabled) then
 							hum:ChangeState(Enum.HumanoidStateType.Jumping)
 						end
@@ -4272,7 +4308,11 @@ run(function()
 				local res = {old(...)}
 				local self, block = ...
 	
-				if (workspace:GetServerTimeNow() - self.lastLaunch) < 0.4 then
+				-- AutoGumdrop owns the pad while it is on, toggles and all. This break is
+				-- unconditional, so with both running its 'Break gumdrop' toggle did nothing
+				-- visible -- the pad went either way -- and the two modules raced to break the
+				-- same block.
+				if not genv.AutoGumdropActive and (workspace:GetServerTimeNow() - self.lastLaunch) < 0.4 then
 					if block:GetAttribute('PlacedByUserId') == lplr.UserId and (block.Position - entitylib.character.RootPart.Position).Magnitude < 30 then
 						task.spawn(bedwars.breakBlock, block, false, nil, true)
 					end
