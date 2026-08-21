@@ -357,6 +357,12 @@ local function finishLoading()
 			if shared.VapeSmoothBoot then
 				teleportScript = 'shared.VapeSmoothBoot = true\n'..teleportScript
 			end
+			-- Carried across for the same reason as the developer flag, and it matters more:
+			-- getgenv() and shared are both wiped by a teleport, so a trace switched on in the
+			-- lobby was off again in the match -- which is the only place worth tracing.
+			if (getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace then
+				teleportScript = 'shared.PistonwareTrace = true\n'..teleportScript
+			end
 			-- %q, matching the key above: profile names are user-supplied (the Profiles tab lets
 			-- you name one anything), and a name containing a quote or backslash used to produce
 			-- a chunk that would not compile -- which silently costs the whole re-injection, not
