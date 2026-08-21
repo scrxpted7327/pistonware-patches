@@ -699,13 +699,13 @@ run(function()
 		toggle = function(args)
 			if #args < 1 then return end
 			if args[1]:lower() == 'all' then
-				for i, v in vape.Modules do
+				for i, v in (vape.EachModule and vape:EachModule() or vape.Modules) do
 					if i ~= 'Panic' and i ~= 'ServerHop' and i ~= 'Rejoin' then
 						v:Toggle()
 					end
 				end
 			else
-				for i, v in vape.Modules do
+				for i, v in (vape.EachModule and vape:EachModule() or vape.Modules) do
 					if i:lower() == args[1]:lower() then
 						v:Toggle()
 						break
@@ -6261,7 +6261,7 @@ run(function()
 		Name = 'Panic',
 		Function = function(callback)
 			if callback then
-				for _, v in vape.Modules do
+				for _, v in (vape.EachModule and vape:EachModule() or vape.Modules) do
 					if v.Enabled then
 						v:Toggle()
 					end
@@ -6382,7 +6382,7 @@ run(function()
 				end
 			elseif Mode.Value == 'AutoConfig' then
 				vape.Save = function() end
-				for _, v in vape.Modules do
+				for _, v in (vape.EachModule and vape:EachModule() or vape.Modules) do
 					if v.Enabled then
 						v:Toggle()
 					end
