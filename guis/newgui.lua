@@ -32,9 +32,15 @@ local vape = {
 	Place = game.PlaceId,
 	Profile = 'default',
 	RainbowSliders = {},
-	-- Flipped on by main.lua once the module list has stopped changing. Until then nothing may
-	-- walk vape.Modules -- see the note on vape:Save.
-	SaveReady = false,
+	-- Bumped by every vape:Load. Load yields now, so a second one starting while the first is
+	-- still walking (switching profile, or the late pass for a payload that registered after the
+	-- first load) has to be able to tell the older one to stop rather than have the two of them
+	-- interleave writes into the same modules.
+	LoadGeneration = 0,
+	-- How many modules had been registered the last time a profile was applied. Anything past
+	-- this index in ModuleOrder arrived afterwards and has never had its saved settings put on
+	-- it -- see vape:LoadLate.
+	LoadedCount = 0,
 	Settings = {},
 	SettingToggleNotifications = {},
 	ThreadFix = setthreadidentity and true or false,
@@ -192,6 +198,14 @@ local isfile = isfile or function(file)
 	end)
 
 	return success and data ~= nil and data ~= ''
+end
+
+local buildclock = os.clock()
+local function yieldBuild(budget)
+	if os.clock() - buildclock > (budget or 0.004) then
+		task.wait()
+		buildclock = os.clock()
+	end
 end
 
 local function loadJson(path)
@@ -1055,6 +1069,20 @@ function vape:CreateOverlay(props)
 end
 
 function vape:Load(skipgui, profile)
+	--[[
+		Applying a profile yields now (see yieldBuild), so this can be interrupted -- by a profile
+		switch, or by the late pass that runs when a slow payload finally finishes registering.
+		Both call Load, and two overlapping walks writing into the same modules would leave a
+		mixture of the two profiles applied.
+
+		So each load claims a generation, and checks after every yield that it is still the
+		current one. The older walk stops where it stands and the newer one owns the result.
+	]]
+	self.LoadGeneration += 1
+	local generation = self.LoadGeneration
+	-- Nothing may write to disk while a load is in progress: it would serialise a config that is
+	-- half the old profile and half the new one. Restored at the end.
+	self.Loaded = false
 	local guiData = {Categories = {}}
 	local oldProfile = self.Profile
 	local canSave = true
@@ -1111,6 +1139,8 @@ function vape:Load(skipgui, profile)
 			local category = self.Categories[name]
 			if category then
 				category:Load(data)
+				yieldBuild(0.0015)
+				if self.LoadGeneration ~= generation then return end
 			end
 		end
 
@@ -1122,6 +1152,8 @@ function vape:Load(skipgui, profile)
 				trace('load '..name)
 				module:Load(data)
 				toggleCount += module.Enabled and 1 or 0
+				yieldBuild(0.0015)
+				if self.LoadGeneration ~= generation then return end
 			end
 		end
 
@@ -1129,6 +1161,8 @@ function vape:Load(skipgui, profile)
 			local module = self.Legit.Modules[name]
 			if module then
 				module:Load(data)
+				yieldBuild(0.0015)
+				if self.LoadGeneration ~= generation then return end
 			end
 		end
 
@@ -1159,6 +1193,12 @@ function vape:Load(skipgui, profile)
 	end
 
 	self.Loaded = canSave
+	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
+	-- profile to whatever appears past this index.
+	self.LoadedCount = #self.ModuleOrder
+	-- A toggle made while the load was running recorded itself instead of writing a half-applied
+	-- config. Saving is open again, so put it on disk.
+	self:FlushSave()
 
 	if inputService.TouchEnabled and not skipgui then
 		local button = Instance.new('TextButton')
@@ -1193,6 +1233,50 @@ function vape:Load(skipgui, profile)
 	end
 
 	return toggleData
+end
+
+--[[
+	Apply the current profile to modules that registered after it was loaded.
+
+	The payload is the reason this exists. A protected bedwars.lua can still be registering when
+	the profile is applied -- either because it never signals that it is done, or because it took
+	longer than the backstop -- and every module that arrives afterwards would otherwise sit on
+	its defaults with its real settings still on disk, untouched.
+
+	Only the tail of ModuleOrder is touched: index LoadedCount + 1 onwards is exactly the set that
+	has never been loaded. Modules the user changed by hand are earlier in the array and are not
+	revisited, which is what makes running this at an arbitrary later moment safe -- the blanket
+	re-apply that used to be rejected here reverted those changes because it walked all of them.
+]]
+function vape:LoadLate()
+	if not self.Profile then return 0 end
+
+	local path = 'pistonware/profiles/'..self.Profile..self.Place..'.txt'
+	if not isfile(path) then return 0 end
+
+	local mainData = loadJson(path)
+	if type(mainData) ~= 'table' or type(mainData.Modules) ~= 'table' then return 0 end
+
+	self.LoadGeneration += 1
+	local generation = self.LoadGeneration
+	local order = self.ModuleOrder
+	local first = (self.LoadedCount or 0) + 1
+	local applied = 0
+
+	for index = first, #order do
+		local module = order[index]
+		local data = module and mainData.Modules[module.Name]
+		if data then
+			trace('late '..module.Name)
+			pcall(module.Load, module, data)
+			applied += 1
+			yieldBuild(0.0015)
+			if self.LoadGeneration ~= generation then return applied end
+		end
+	end
+
+	self.LoadedCount = #order
+	return applied
 end
 
 function vape:LoadOptions(obj, data)
@@ -2910,7 +2994,7 @@ function vape:Save(newProfile)
 end
 
 function vape:RequestSave()
-	if not (self.SaveReady and self.Loaded) then
+	if not self.Loaded then
 		self.SaveNeeded = true
 		return
 	end
@@ -2937,7 +3021,7 @@ function vape:RequestSave()
 		self.SaveQueued = nil
 		self.SaveNeeded = nil
 
-		if self.SaveReady and self.Loaded then
+		if self.Loaded then
 			self:Save()
 		end
 	end
