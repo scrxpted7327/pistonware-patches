@@ -60,6 +60,52 @@ local function debugWarn(...)
 	end
 end
 
+--[[
+	A breadcrumb file that survives a native crash, written before the GUI exists.
+
+	The GUI keeps its own (vape:Trace) but it cannot record anything that happens before it is
+	downloaded and run, and "the client died and there is no log" is exactly the case where that
+	window matters. Same file, same rule: the last line is where it got to.
+
+	Written to the root rather than under pistonware/, because reinstall.lua deletes that folder
+	and would take the evidence with it.
+]]
+-- Shared with the GUI's own trace, so the two write ONE ordered log instead of each
+-- overwriting the other's file. Reset here because main.lua is the start of every session,
+-- including a reinject.
+shared.PistonwareTraceLines = {}
+local traceLines = shared.PistonwareTraceLines
+local function stage(text)
+	table.insert(traceLines, text)
+	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
+end
+stage('main.lua running, touch='..tostring(isTouchDevice))
+
+--[[
+	A heartbeat, so the log says WHEN it died and not only where.
+
+	Without it a crash during a long silent stretch is indistinguishable from a crash at the last
+	thing that logged. This rewrites a single line rather than appending, so it costs one small
+	file write every two seconds and the log stays readable.
+]]
+do
+	local started = os.clock()
+	local index
+	task.spawn(function()
+		while true do
+			task.wait(2)
+			local text = ('alive %.0fs'):format(os.clock() - started)
+			if index then
+				traceLines[index] = text
+				pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
+			else
+				stage(text)
+				index = #traceLines
+			end
+		end
+	end)
+end
+
 -- isfile is not the question. A zero-byte file reads back as PRESENT through every executor's
 -- real isfile, and only the fallback above treats empty as absent -- so on executors that ship
 -- one (most of them), an interrupted write leaves a truncated file that nothing ever repairs.
@@ -179,9 +225,9 @@ local function finishLoading()
 		end
 		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
 			tostring(customProfile or '<saved>'), tostring(shared.vapereload and true or false)))
-		if vape.Trace then vape:Trace('applyProfile start (complete='..tostring(moduleSetComplete)..')') end
+		stage('applyProfile start (complete='..tostring(moduleSetComplete)..')')
 		vape:Load(nil, customProfile)
-		if vape.Trace then vape:Trace('applyProfile returned') end
+		stage('applyProfile returned')
 		debugWarn('[pistonware] profile load returned')
 
 		--[[
@@ -416,7 +462,9 @@ end
 	if not isfolder('pistonware/assets/'..ASSET_FOLDER) then
 		makefolder('pistonware/assets/'..ASSET_FOLDER)
 	end
+	stage('downloading gui')
 	vape = loadstring(downloadFile('pistonware/guis/'..GUI_FILE..'.lua'), 'gui')()
+	stage('gui chunk returned')
 	shared.vape = vape
 
 if not shared.VapeIndependent then
@@ -435,9 +483,11 @@ if not shared.VapeIndependent then
 	end
 	-- pcall'd: an error thrown while universal.lua *executes* would otherwise propagate out of
 	-- main.lua entirely, skipping the game script below and finishLoading() with it.
+	stage('universal.lua start')
 	pcall(function()
 		loadstring(downloadFile('pistonware/games/universal.lua'), 'universal')()
 	end)
+	stage('universal.lua done')
 
 	-- Started, never waited on. There is no deadline here by design: a deadline would only be a
 	-- guess at how long the payload needs, and whatever number it held would become the time
@@ -490,9 +540,11 @@ if not shared.VapeIndependent then
 		end
 
 		local started = os.clock()
+		stage('game script start: '..tostring(chunkname))
 		task.spawn(function()
 			local ok, err = pcall(fn, table.unpack(gameArgs, 1, gameArgs.n))
 			gameScriptFinished = true
+			stage('game script returned: '..tostring(chunkname))
 			-- Only for a payload slow enough that the split-load path actually engaged; a normal
 			-- game script never trips it. Keeps the real cost of protecting bedwars.lua visible
 			-- instead of guessed at.
