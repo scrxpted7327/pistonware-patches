@@ -200,10 +200,35 @@ local isfile = isfile or function(file)
 	return success and data ~= nil and data ~= ''
 end
 
+--[[
+	Applying a profile yields so the client stays responsive, but a yield costs a WHOLE FRAME no
+	matter how little work came before it. Wall time is therefore roughly
+
+		work * (1 + frame / budget)
+
+	and the budget is the only term this controls. At the 0.0015 the call sites used to pass, a
+	mobile client rendering at 30fps did 1.5ms of work and then waited 33ms, over and over: a
+	multiplier of twenty-three. An apply whose real cost is a third of a second took eight,
+	which is exactly the profile switch that feels broken.
+
+	Ten milliseconds brings the multiplier to about four while keeping any single uninterrupted
+	block to under a third of a mobile frame, so the responsiveness this was added for is intact.
+	Overridable, because the right number depends on the device and this is worth measuring:
+	the yield count and elapsed time now land in the trace next to it.
+]]
 local buildclock = os.clock()
+local buildyields = 0
+local yieldBudget = 0.01
+pcall(function()
+	local override = tonumber(((getgenv and getgenv().PistonwareYieldBudget) or shared.PistonwareYieldBudget))
+	if override and override > 0 then
+		yieldBudget = override
+	end
+end)
 local function yieldBuild(budget)
-	if os.clock() - buildclock > (budget or 0.004) then
+	if os.clock() - buildclock > (budget or yieldBudget) then
 		task.wait()
+		buildyields += 1
 		buildclock = os.clock()
 	end
 end
@@ -1164,6 +1189,12 @@ function vape:Load(skipgui, profile)
 	]]
 	self.LoadGeneration += 1
 	local generation = self.LoadGeneration
+	-- Timing, unconditionally: a dragging profile switch is the thing the user actually feels, and
+	-- gating this behind the trace flag would leave the one measurement that matters out of every
+	-- ordinary report. Two clock reads and a longer closing line.
+	local loadClock = os.clock()
+	local loadYields = buildyields
+	local moduleClock = loadClock
 	-- Nothing may write to disk while a load is in progress: it would serialise a config that is
 	-- half the old profile and half the new one. Restored at the end.
 	self.Loaded = false
@@ -1233,7 +1264,7 @@ function vape:Load(skipgui, profile)
 			if category then
 				trace('Load category '..tostring(name), true)
 				category:Load(data)
-				yieldBuild(0.0015)
+				yieldBuild()
 				if self.LoadGeneration ~= generation then return end
 			end
 		end
@@ -1253,6 +1284,7 @@ function vape:Load(skipgui, profile)
 		]]
 		local costs = traceDetail and {} or nil
 		local applied = 0
+		moduleClock = os.clock()
 		trace('Load categories done, applying modules, heap='..heapKB()..'KB'
 			..(loadLimit < math.huge and ' limit='..loadLimit or '')
 			..(next(skipModules) and ' skipping='..(function()
@@ -1282,7 +1314,7 @@ function vape:Load(skipgui, profile)
 					end
 				end
 				toggleCount += module.Enabled and 1 or 0
-				yieldBuild(0.0015)
+				yieldBuild()
 				if self.LoadGeneration ~= generation then return end
 			end
 		end
@@ -1300,7 +1332,7 @@ function vape:Load(skipgui, profile)
 			local module = self.Legit.Modules[name]
 			if module then
 				module:Load(data)
-				yieldBuild(0.0015)
+				yieldBuild()
 				if self.LoadGeneration ~= generation then return end
 			end
 		end
@@ -1331,7 +1363,23 @@ function vape:Load(skipgui, profile)
 		self.Downloader = nil
 	end
 
-	trace('Load done, saving enabled='..tostring(canSave)..' heap='..heapKB()..'KB')
+	--[[
+		Where the seconds went, in one line.
+
+		total is wall time; modules is the part of it spent applying saved module state, which
+		is where a switch is expected to spend nearly everything. yields is how many frames were
+		given up along the way, and total minus (yields * frametime) is the real CPU cost -- if
+		those two are far apart the apply is waiting, not working, and the yield budget is the
+		dial. See yieldBuild.
+	]]
+	trace(('Load done in %.2fs (modules %.2fs, %d yields, budget %.0fms) saving enabled=%s heap=%dKB'):format(
+		os.clock() - loadClock,
+		os.clock() - moduleClock,
+		buildyields - loadYields,
+		yieldBudget * 1000,
+		tostring(canSave),
+		heapKB()
+	))
 	self.Loaded = canSave
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
@@ -1424,7 +1472,7 @@ function vape:LoadLate()
 			trace('late '..module.Name, true)
 			pcall(module.Load, module, data)
 			applied += 1
-			yieldBuild(0.0015)
+			yieldBuild()
 			if self.LoadGeneration ~= generation then return applied end
 		end
 	end
