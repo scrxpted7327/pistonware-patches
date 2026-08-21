@@ -279,14 +279,47 @@ end
 	Off unless pistonware/trace.txt exists, because it is a file write per module and nobody who
 	is not chasing a crash should pay for that.
 ]]
-local traceEnabled = false
-local traceLog = {}
+local traceDetail = false
 pcall(function()
-	traceEnabled = isfile and isfile('pistonware/trace.txt') or false
+	--[[
+		Three ways to switch the detailed trace on, and the obvious one is last for a reason.
+
+		reinstall.lua deletes the whole pistonware folder, so a flag file inside it is gone before
+		the GUI ever looks for it -- and so is any log written there, erased by the very next run
+		before anyone can read it. That is why the first version of this produced nothing at all.
+		The globals survive a reinstall; the file only works if you are not doing one.
+
+			getgenv().PistonwareTrace = true
+			shared.PistonwareTrace = true
+			pistonware/trace.txt
+	]]
+	if (getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace then
+		traceDetail = true
+	elseif isfile and isfile('pistonware/trace.txt') then
+		traceDetail = true
+	end
 end)
 
-local function trace(text)
-	if not traceEnabled then
+-- The same buffer main.lua's stage() appends to, so the stages before this file existed and
+-- everything after it end up in one ordered log rather than overwriting each other.
+local traceLog = shared.PistonwareTraceLines or {}
+shared.PistonwareTraceLines = traceLog
+--[[
+	Breadcrumbs that survive a native crash.
+
+	A crash that takes the client's process down leaves nothing behind -- no error, no console, no
+	traceback -- and everything in memory goes with it. The only record that outlives it is one
+	already on disk, so this writes what is about to happen BEFORE it happens. After a crash the
+	last line in the file is the thing that did it.
+
+	Written to the filesystem ROOT rather than under pistonware/, so a reinstall cannot delete the
+	evidence of the crash that prompted it.
+
+	Stage crumbs are unconditional -- a dozen a session, and they are what says how far the load
+	got. Per-module crumbs cost a file write each, so those are detail-only.
+]]
+local function trace(text, detail)
+	if detail and not traceDetail then
 		return
 	end
 
@@ -297,8 +330,10 @@ local function trace(text)
 	if #traceLog > 400 then
 		table.remove(traceLog, 1)
 	end
-	pcall(writefile, 'pistonware/trace.log.txt', table.concat(traceLog, '\n'))
+	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLog, '\n'))
 end
+
+trace('gui chunk running')
 
 local color = {}
 local uipallet = {}
@@ -1083,6 +1118,7 @@ function vape:Load(skipgui, profile)
 	-- Nothing may write to disk while a load is in progress: it would serialise a config that is
 	-- half the old profile and half the new one. Restored at the end.
 	self.Loaded = false
+	trace('Load start profile='..tostring(profile or self.Profile)..' modules='..tostring(#self.ModuleOrder))
 	local guiData = {Categories = {}}
 	local oldProfile = self.Profile
 	local canSave = true
@@ -1149,7 +1185,7 @@ function vape:Load(skipgui, profile)
 			if module then
 				-- Named before it runs, not after: if applying this module's saved state is what
 				-- kills the client, this is the last line that reaches disk.
-				trace('load '..name)
+				trace('load '..name, true)
 				module:Load(data)
 				toggleCount += module.Enabled and 1 or 0
 				yieldBuild(0.0015)
@@ -1192,6 +1228,7 @@ function vape:Load(skipgui, profile)
 		self.Downloader = nil
 	end
 
+	trace('Load done, saving enabled='..tostring(canSave))
 	self.Loaded = canSave
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
@@ -1267,7 +1304,7 @@ function vape:LoadLate()
 		local module = order[index]
 		local data = module and mainData.Modules[module.Name]
 		if data then
-			trace('late '..module.Name)
+			trace('late '..module.Name, true)
 			pcall(module.Load, module, data)
 			applied += 1
 			yieldBuild(0.0015)
@@ -1290,6 +1327,7 @@ function vape:LoadOptions(obj, data)
 end
 
 function vape:LoadGUI()
+	trace('LoadGUI start')
 	addMaid(vape)
 	gui = Instance.new('ScreenGui')
 	gui.Name = randomString()
@@ -2881,6 +2919,7 @@ function vape:LoadGUI()
 			table.remove(vape.HeldKeybinds, index)
 		end
 	end))
+	trace('LoadGUI done')
 end
 
 function vape:Remove(obj)
@@ -2981,7 +3020,7 @@ function vape:Save(newProfile)
 		return
 	end
 
-	trace('save '..tostring(self.Profile))
+	trace('save '..tostring(self.Profile), true)
 	local guiSuccess, guiError = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
 	local mainSuccess, mainError = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
 
@@ -3086,7 +3125,7 @@ function vape:Trace(text)
 end
 
 function vape:TraceEnabled()
-	return traceEnabled
+	return traceDetail
 end
 
 function vape:SortCategories()
@@ -6211,13 +6250,13 @@ components = {
 
 				Only when tracing is on. Otherwise this stays the same single spawn it was.
 			]]
-			if traceEnabled then
+			if traceDetail then
 				local enabled = self.Enabled
-				trace((enabled and 'enable ' or 'disable ')..props.Name)
+				trace((enabled and 'enable ' or 'disable ')..props.Name, true)
 				task.spawn(function()
-					trace('run '..props.Name)
+					trace('run '..props.Name, true)
 					props.Function(enabled)
-					trace('done '..props.Name)
+					trace('done '..props.Name, true)
 				end)
 			else
 				task.spawn(props.Function, self.Enabled)
@@ -6707,13 +6746,13 @@ components = {
 
 				Only when tracing is on. Otherwise this stays the same single spawn it was.
 			]]
-			if traceEnabled then
+			if traceDetail then
 				local enabled = self.Enabled
-				trace((enabled and 'enable ' or 'disable ')..props.Name)
+				trace((enabled and 'enable ' or 'disable ')..props.Name, true)
 				task.spawn(function()
-					trace('run '..props.Name)
+					trace('run '..props.Name, true)
 					props.Function(enabled)
-					trace('done '..props.Name)
+					trace('done '..props.Name, true)
 				end)
 			else
 				task.spawn(props.Function, self.Enabled)
