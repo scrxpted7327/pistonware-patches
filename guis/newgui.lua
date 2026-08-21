@@ -1074,6 +1074,17 @@ function vape:Load(skipgui, profile)
 		image.Parent = button
 		addCorner(button, UDim.new(1, 0))
 
+		self.VapeButton = button
+		self.VapeButtonImage = image
+		self.VapeButtonTransparency = button.BackgroundTransparency
+		-- Options are already loaded by this point, so honour the saved setting on the
+		-- button we just built -- the toggle's own Function ran before it existed.
+		-- Transparency rather than Visible: see HideVapeButton.
+		if self.HideVapeButton and self.HideVapeButton.Enabled then
+			button.BackgroundTransparency = 1
+			image.ImageTransparency = 1
+		end
+
 		button.MouseButton1Click:Connect(function()
 			self.GUIBind.Triggered:Fire(true)
 		end)
@@ -1444,6 +1455,14 @@ function vape:LoadGUI()
 		Tooltip = 'Reloads vape for debugging purposes'
 	})
 	
+	general:CreateButton({
+		Name = 'Reinstall',
+		Function = function()
+			loadstring(game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/refs/heads/main/reinstall.lua', true))()
+		end,
+		Tooltip = 'Uninjects, deletes the pistonware folder and downloads everything again'
+	})
+	
 	--[[
 		Module Settings
 	]]
@@ -1571,6 +1590,25 @@ function vape:LoadGUI()
 		Default = 1,
 		Darker = true,
 		Visible = false
+	})
+	
+	vape.HideVapeButton = guipane:CreateToggle({
+		Name = 'Hide Pistonware Mobile Button',
+		Function = function(callback)
+			-- Drops the transparencies rather than flipping Visible. An invisible
+			-- GuiObject stops hit-testing in Roblox, so hiding the button used to take
+			-- its tap target with it and the only way back into the GUI was the keybind
+			-- -- which mobile doesn't have. Fully transparent still receives input, so
+			-- the button keeps opening the menu from exactly where it always sat.
+			if vape.VapeButton then
+				vape.VapeButton.BackgroundTransparency = callback and 1 or (vape.VapeButtonTransparency or 0)
+				if vape.VapeButtonImage then
+					vape.VapeButtonImage.ImageTransparency = callback and 1 or 0
+				end
+			end
+		end,
+		Tooltip = 'Makes the Pistonware button invisible on mobile
+It still opens the GUI when tapped'
 	})
 	
 	vape.RainbowSpeed = guipane:CreateSlider({
