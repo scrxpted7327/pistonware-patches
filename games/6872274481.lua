@@ -4832,7 +4832,7 @@ run(function()
 		elseif Mode.Value == 'AutoConfig' then
 			local safe = {'AutoClicker', 'Reach', 'Sprint', 'HitFix', 'StaffDetector'}
 			vape.Save = function() end
-			for i, v in vape.Modules do
+			for i, v in (vape.EachModule and vape:EachModule() or vape.Modules) do
 				if not (table.find(safe, i) or v.Category == 'Render') then
 					if v.Enabled then
 						v:Toggle()
