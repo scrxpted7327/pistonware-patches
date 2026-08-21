@@ -96,7 +96,7 @@ local function downloadFile(path, func)
 			-- For .lua files, a compile check too: an outage can hand back the 503/error page
 			-- as the body, and caching that would poison the install silently (cache-first
 			-- means it would never be refetched).
-			if suc and res and res ~= '' and res ~= '404: Not Found' and (not path:find('.lua') or loadstring(res) ~= nil) then
+			if suc and res and res ~= '' and res ~= '404: Not Found' and (not path:find('%.lua$') or loadstring(res) ~= nil) then
 				content = res
 				break
 			end
@@ -107,7 +107,7 @@ local function downloadFile(path, func)
 		if not content then
 			error('failed to download '..path..' after 4 attempts')
 		end
-		if path:find('.lua') then
+		if path:find('%.lua$') then
 			content = '--This watermark is used to delete the file if its cached, remove it to make the file persist after vape updates.\n'..content
 		end
 		writefile(path, content)
