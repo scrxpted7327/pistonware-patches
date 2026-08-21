@@ -1294,35 +1294,51 @@ function vape:LoadGUI()
 	scaledgui.Size = UDim2.fromScale(1 / scale.Scale, 1 / scale.Scale)
 	components.GUI({})
 	
+	--[[
+		Square frames, and every icon that draws into one is ScaleType.Fit.
+
+		These used to be sized to the exact pixel dimensions of the source PNG -- 13x14 for
+		combat, 15x14 for render, and so on -- which was right while the icons were read off disk
+		with getcustomasset, because the file is exactly what it says it is.
+
+		They come from uploaded rbxassetids now, and an upload is not guaranteed to come back at
+		the dimensions it went in at. Drawing a texture whose aspect no longer matches into a
+		frame that assumes the old one is what squashed them: ScaleType defaults to Stretch, which
+		fills the frame regardless of shape.
+
+		Fit never distorts -- it scales to the larger axis and leaves the other letterboxed -- and
+		a square frame gives it room to do that in either direction. If the upload did keep its
+		proportions this renders it exactly as before, one pixel wider.
+	]]
 	vape:CreateCategory({
 		Name = 'Combat',
 		Icon = getvapeasset('pistonware/assets/new/combat.png'),
-		Size = UDim2.fromOffset(13, 14)
+		Size = UDim2.fromOffset(15, 15)
 	})
 	vape:CreateCategory({
 		Name = 'Blatant',
 		Icon = getvapeasset('pistonware/assets/new/blatant.png'),
-		Size = UDim2.fromOffset(14, 14)
+		Size = UDim2.fromOffset(15, 15)
 	})
 	vape:CreateCategory({
 		Name = 'Render',
 		Icon = getvapeasset('pistonware/assets/new/render.png'),
-		Size = UDim2.fromOffset(15, 14)
+		Size = UDim2.fromOffset(15, 15)
 	})
 	vape:CreateCategory({
 		Name = 'Utility',
 		Icon = getvapeasset('pistonware/assets/new/utility.png'),
-		Size = UDim2.fromOffset(15, 14)
+		Size = UDim2.fromOffset(15, 15)
 	})
 	vape:CreateCategory({
 		Name = 'World',
 		Icon = getvapeasset('pistonware/assets/new/world.png'),
-		Size = UDim2.fromOffset(14, 14)
+		Size = UDim2.fromOffset(15, 15)
 	})
 	vape:CreateCategory({
 		Name = 'Inventory',
 		Icon = getvapeasset('pistonware/assets/new/inventory.png'),
-		Size = UDim2.fromOffset(15, 14)
+		Size = UDim2.fromOffset(15, 15)
 	})
 	-- Minigames is not in the upstream rewrite, but it is not optional here: bedwars.lua alone
 	-- puts five modules in it (AutoHonor, Breaker, AutoFish, AutoHannah, AutoKaliyah) and four
@@ -1335,7 +1351,7 @@ function vape:LoadGUI()
 	vape:CreateCategory({
 		Name = 'Minigames',
 		Icon = getvapeasset('pistonware/assets/new/utility.png'),
-		Size = UDim2.fromOffset(15, 14)
+		Size = UDim2.fromOffset(15, 15)
 	})
 
 	-- games/6872274481.lua sizes two scrolling frames against the GUI's UIScale and reads it as
@@ -3536,8 +3552,9 @@ components = {
 		icon.BackgroundTransparency = 1
 		icon.Image = props.Icon
 		icon.ImageColor3 = uipallet.Text
-		icon.Position = UDim2.fromOffset(12, (icon.Size.X.Offset > 20 and 14 or 13))
+		icon.ScaleType = Enum.ScaleType.Fit
 		icon.Size = props.Size
+		icon.Position = UDim2.fromOffset(12, math.floor((41 - props.Size.Y.Offset) / 2))
 		icon.Parent = window
 		local title = Instance.new('TextLabel')
 		title.BackgroundTransparency = 1
@@ -3798,6 +3815,7 @@ components = {
 		icon.Image = props.Icon
 		icon.ImageColor3 = uipallet.Text
 		icon.Name = 'Icon'
+		icon.ScaleType = Enum.ScaleType.Fit
 		icon.Size = props.Size
 		icon.Position = props.Position or UDim2.fromOffset(12, (props.Size.X.Offset > 20 and 13 or 12))
 		icon.Parent = window
@@ -5256,8 +5274,9 @@ components = {
 			icon.BackgroundTransparency = 1
 			icon.Image = props.Icon
 			icon.ImageColor3 = color.Dark(uipallet.Text, 0.16)
-			icon.Position = UDim2.fromOffset(16, 13)
+			icon.ScaleType = Enum.ScaleType.Fit
 			icon.Size = props.Size
+			icon.Position = UDim2.fromOffset(16, math.floor((40 - props.Size.Y.Offset) / 2))
 			icon.Parent = button
 			component.Icon = icon
 		end
@@ -5841,6 +5860,7 @@ components = {
 		icon.ImageColor3 = uipallet.Text
 		icon.Name = 'Icon'
 		icon.Position = props.Position
+		icon.ScaleType = Enum.ScaleType.Fit
 		icon.Size = props.Size
 		icon.Parent = toggle
 		local holder = Instance.new('Frame')
@@ -6819,8 +6839,9 @@ components = {
 		icon.BackgroundTransparency = 1
 		icon.Image = props.Icon
 		icon.ImageColor3 = uipallet.Text
-		icon.Position = UDim2.fromOffset(12, (icon.Size.X.Offset > 14 and 14 or 13))
+		icon.ScaleType = Enum.ScaleType.Fit
 		icon.Size = props.Size
+		icon.Position = UDim2.fromOffset(12, math.floor((41 - props.Size.Y.Offset) / 2))
 		icon.Parent = window
 		local title = Instance.new('TextLabel')
 		title.BackgroundTransparency = 1
@@ -7902,6 +7923,7 @@ components = {
 		icon.Image = props.Icon
 		icon.ImageColor3 = color.Light(uipallet.Main, 0.37)
 		icon.Position = UDim2.fromScale(0.5, 0.5)
+		icon.ScaleType = Enum.ScaleType.Fit
 		icon.Size = props.IconSize
 		icon.Parent = holder
 		props.Function = props.Function or function() end
