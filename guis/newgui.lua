@@ -1294,51 +1294,35 @@ function vape:LoadGUI()
 	scaledgui.Size = UDim2.fromScale(1 / scale.Scale, 1 / scale.Scale)
 	components.GUI({})
 	
-	--[[
-		Square frames, and every icon that draws into one is ScaleType.Fit.
-
-		These used to be sized to the exact pixel dimensions of the source PNG -- 13x14 for
-		combat, 15x14 for render, and so on -- which was right while the icons were read off disk
-		with getcustomasset, because the file is exactly what it says it is.
-
-		They come from uploaded rbxassetids now, and an upload is not guaranteed to come back at
-		the dimensions it went in at. Drawing a texture whose aspect no longer matches into a
-		frame that assumes the old one is what squashed them: ScaleType defaults to Stretch, which
-		fills the frame regardless of shape.
-
-		Fit never distorts -- it scales to the larger axis and leaves the other letterboxed -- and
-		a square frame gives it room to do that in either direction. If the upload did keep its
-		proportions this renders it exactly as before, one pixel wider.
-	]]
 	vape:CreateCategory({
 		Name = 'Combat',
 		Icon = getvapeasset('pistonware/assets/new/combat.png'),
-		Size = UDim2.fromOffset(15, 15)
+		Size = UDim2.fromOffset(13, 14)
 	})
 	vape:CreateCategory({
 		Name = 'Blatant',
 		Icon = getvapeasset('pistonware/assets/new/blatant.png'),
-		Size = UDim2.fromOffset(15, 15)
+		Size = UDim2.fromOffset(14, 14)
 	})
 	vape:CreateCategory({
 		Name = 'Render',
 		Icon = getvapeasset('pistonware/assets/new/render.png'),
-		Size = UDim2.fromOffset(15, 15)
+		Size = UDim2.fromOffset(15, 14)
 	})
 	vape:CreateCategory({
 		Name = 'Utility',
 		Icon = getvapeasset('pistonware/assets/new/utility.png'),
-		Size = UDim2.fromOffset(15, 15)
+		Size = UDim2.fromOffset(15, 14)
 	})
 	vape:CreateCategory({
 		Name = 'World',
 		Icon = getvapeasset('pistonware/assets/new/world.png'),
-		Size = UDim2.fromOffset(15, 15)
+		Size = UDim2.fromOffset(14, 14)
 	})
 	vape:CreateCategory({
 		Name = 'Inventory',
 		Icon = getvapeasset('pistonware/assets/new/inventory.png'),
-		Size = UDim2.fromOffset(15, 15)
+		Size = UDim2.fromOffset(15, 14)
 	})
 	-- Minigames is not in the upstream rewrite, but it is not optional here: bedwars.lua alone
 	-- puts five modules in it (AutoHonor, Breaker, AutoFish, AutoHannah, AutoKaliyah) and four
@@ -1351,7 +1335,7 @@ function vape:LoadGUI()
 	vape:CreateCategory({
 		Name = 'Minigames',
 		Icon = getvapeasset('pistonware/assets/new/utility.png'),
-		Size = UDim2.fromOffset(15, 15)
+		Size = UDim2.fromOffset(15, 14)
 	})
 
 	-- games/6872274481.lua sizes two scrolling frames against the GUI's UIScale and reads it as
@@ -3552,9 +3536,8 @@ components = {
 		icon.BackgroundTransparency = 1
 		icon.Image = props.Icon
 		icon.ImageColor3 = uipallet.Text
-		icon.ScaleType = Enum.ScaleType.Fit
+		icon.Position = UDim2.fromOffset(12, (icon.Size.X.Offset > 20 and 14 or 13))
 		icon.Size = props.Size
-		icon.Position = UDim2.fromOffset(12, math.floor((41 - props.Size.Y.Offset) / 2))
 		icon.Parent = window
 		local title = Instance.new('TextLabel')
 		title.BackgroundTransparency = 1
@@ -3815,7 +3798,6 @@ components = {
 		icon.Image = props.Icon
 		icon.ImageColor3 = uipallet.Text
 		icon.Name = 'Icon'
-		icon.ScaleType = Enum.ScaleType.Fit
 		icon.Size = props.Size
 		icon.Position = props.Position or UDim2.fromOffset(12, (props.Size.X.Offset > 20 and 13 or 12))
 		icon.Parent = window
@@ -5236,9 +5218,22 @@ components = {
 			end
 		
 			window.Size = UDim2.fromOffset(220, 42 + windowlist.AbsoluteContentSize.Y / scale.Scale)
+			--[[
+				A fixed number of hair spaces, NOT one scaled by scale.Scale.
+
+				This is how far the label sits from the icon beside it: the row's text is indented by
+				repeating U+200A, so the count IS the gap. Multiplying it by the UIScale looked like it
+				was compensating for something and did the opposite -- the whole GUI already lives under
+				that UIScale, so the spaces shrink along with the icon and the row on their own. Scaling
+				the count as well applied it twice.
+
+				It also truncates. string.rep takes an integer, so 39 * 0.4 is 15 spaces and not 15.6 --
+				on a phone the label jumped left into the icon it was meant to clear, and moved again
+				every time the viewport changed. On desktop scale is 1 and none of this showed.
+			]]
 			for _, button in component.Buttons do
 				if button.Icon then
-					button.Object.Text = string.rep(' ', 39 * scale.Scale)..button.Name
+					button.Object.Text = string.rep(' ', 39)..button.Name
 				end
 			end
 		end)
@@ -5274,9 +5269,8 @@ components = {
 			icon.BackgroundTransparency = 1
 			icon.Image = props.Icon
 			icon.ImageColor3 = color.Dark(uipallet.Text, 0.16)
-			icon.ScaleType = Enum.ScaleType.Fit
+			icon.Position = UDim2.fromOffset(16, 13)
 			icon.Size = props.Size
-			icon.Position = UDim2.fromOffset(16, math.floor((40 - props.Size.Y.Offset) / 2))
 			icon.Parent = button
 			component.Icon = icon
 		end
@@ -5847,7 +5841,7 @@ components = {
 		toggle.BorderSizePixel = 0
 		toggle.FontFace = uipallet.Font
 		toggle.Size = UDim2.new(1, 0, 0, 40)
-		toggle.Text = string.rep(' ', 33 * scale.Scale)..props.Name
+		toggle.Text = string.rep(' ', 33)..props.Name
 		toggle.TextColor3 = color.Dark(uipallet.Text, 0.16)
 		toggle.TextSize = 14
 		toggle.TextXAlignment = Enum.TextXAlignment.Left
@@ -5860,7 +5854,6 @@ components = {
 		icon.ImageColor3 = uipallet.Text
 		icon.Name = 'Icon'
 		icon.Position = props.Position
-		icon.ScaleType = Enum.ScaleType.Fit
 		icon.Size = props.Size
 		icon.Parent = toggle
 		local holder = Instance.new('Frame')
@@ -5901,7 +5894,7 @@ components = {
 		end
 		
 		scale:GetPropertyChangedSignal('Scale'):Connect(function()
-			toggle.Text = string.rep(' ', 33 * scale.Scale)..props.Name
+			toggle.Text = string.rep(' ', 33)..props.Name
 		end)
 		
 		toggle.MouseEnter:Connect(function()
@@ -6839,9 +6832,8 @@ components = {
 		icon.BackgroundTransparency = 1
 		icon.Image = props.Icon
 		icon.ImageColor3 = uipallet.Text
-		icon.ScaleType = Enum.ScaleType.Fit
+		icon.Position = UDim2.fromOffset(12, (icon.Size.X.Offset > 14 and 14 or 13))
 		icon.Size = props.Size
-		icon.Position = UDim2.fromOffset(12, math.floor((41 - props.Size.Y.Offset) / 2))
 		icon.Parent = window
 		local title = Instance.new('TextLabel')
 		title.BackgroundTransparency = 1
@@ -7923,7 +7915,6 @@ components = {
 		icon.Image = props.Icon
 		icon.ImageColor3 = color.Light(uipallet.Main, 0.37)
 		icon.Position = UDim2.fromScale(0.5, 0.5)
-		icon.ScaleType = Enum.ScaleType.Fit
 		icon.Size = props.IconSize
 		icon.Parent = holder
 		props.Function = props.Function or function() end
