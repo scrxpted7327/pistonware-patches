@@ -156,6 +156,13 @@ end
 
 local gameCamera = workspace.CurrentCamera
 
+-- Declared here rather than further down with the rest of the forward declarations, because
+-- viewportWidth below reads it. A local is only in scope for code that comes AFTER it, so
+-- from down there this reference compiled against the (never-assigned) global instead: the
+-- AbsoluteSize fallback could not fire, and on a client that reports no ViewportSize the
+-- scale silently stayed at the floor value.
+local gui
+
 -- Viewport in GUI units. The camera answers immediately; a ScreenGui's AbsoluteSize is (0, 0)
 -- until it has rendered at least one frame, which on a phone is after the GUI has already been
 -- built and scaled -- so reading the GUI gave the floor value on the first pass every time.
@@ -190,7 +197,7 @@ local toolblur
 local tooltip
 local TextGUI
 local scale = {Scale = 1}
-local gui
+-- `gui` is declared above viewportWidth, which reads it.
 
 local isfile = isfile or function(file)
 	local success, data = pcall(function()
@@ -549,30 +556,49 @@ do
 	end
 end
 
+--[[
+	The registry of in-flight tweens, keyed by the object being animated.
+
+	The lazy __index has to STORE what it builds. Returning a fresh table without keeping
+	it meant every call got its own throwaway registry, so `registry[obj]` was always empty:
+	nothing was ever found, nothing was ever cancelled, and tween:Cancel was a no-op at all
+	~100 call sites. Two tweens on the same property then ran at once and fought -- the hurt
+	flash (which cancels the previous flash before starting the next), and every hover that
+	re-enters before its 0.16s colour tween has finished. Each orphaned tween also kept its
+	Completed connection alive for its full duration.
+]]
 local tween = setmetatable({}, {
-	__index = function()
-		return {}
+	__index = function(self, key)
+		local registry = {}
+		rawset(self, key, registry)
+		return registry
 	end
 })
 
 do
 	function tween:Tween(obj, info, goal, index)
-		index = self[index or 'tweens']
-		if index[obj] then
-			index[obj]:Cancel()
-			index[obj] = nil
+		local registry = self[index or 'tweens']
+		local existing = registry[obj]
+		if existing then
+			-- Cleared BEFORE cancelling: Cancel() fires Completed, and a handler that
+			-- runs later would otherwise wipe the entry belonging to the tween created
+			-- below it.
+			registry[obj] = nil
+			existing:Cancel()
 		end
 
 		if obj.Parent and (obj:IsA('UIStroke') or obj.Visible) then
-			index[obj] = tweenService:Create(obj, info, goal)
-			index[obj].Completed:Once(function()
-				if index then
-					index[obj] = nil
-					index = nil
+			local playing = tweenService:Create(obj, info, goal)
+			registry[obj] = playing
+			playing.Completed:Once(function()
+				-- Only retire the entry if it is still ours; a newer tween may already
+				-- own the slot.
+				if registry[obj] == playing then
+					registry[obj] = nil
 				end
 			end)
 
-			index[obj]:Play()
+			playing:Play()
 		else
 			for prop, value in goal do
 				obj[prop] = value
@@ -581,11 +607,12 @@ do
 	end
 
 	function tween:Cancel(obj, index)
-		index = self[index or 'tweens']
+		local registry = self[index or 'tweens']
+		local existing = registry[obj]
 
-		if index[obj] then
-			index[obj]:Cancel()
-			index[obj] = nil
+		if existing then
+			registry[obj] = nil
+			existing:Cancel()
 		end
 	end
 end
@@ -919,10 +946,10 @@ local function randomString()
 	return table.concat(array)
 end
 
-local function removeTags(text)
-	text = text:gsub('<br%s*/>', '\n')
-	return text:gsub('<[^<>]->', '')
-end
+-- The second copy of removeTags that stood here is gone. It shadowed the identical one
+-- defined near the top of the file for everything below it, and -- lacking that one's
+-- wrapping parentheses -- returned gsub's replacement COUNT as a second value, so any
+-- caller passing it straight into another function would have handed over a stray number.
 
 --[[
 	The only native call this GUI makes, and it fires exactly when the menu opens.
@@ -1234,7 +1261,10 @@ function vape:Load(skipgui, profile)
 		end)
 	end
 
-	return toggleData
+	-- `toggleData` was an undeclared global here, so every caller was handed nil. The count
+	-- of modules the profile switched on is the only thing this function has to report, and
+	-- it is what the profile-swap notification above already uses.
+	return toggleCount
 end
 
 --[[
@@ -1494,7 +1524,7 @@ function vape:LoadGUI()
 	--[[
 		Profiles
 	]]
-	vape:CreateCategoryList({
+	local profilescategory = vape:CreateCategoryList({
 		Name = 'Profiles',
 		Icon = getvapeasset('pistonware/assets/new/profiles.png'),
 		Size = UDim2.fromOffset(17, 10),
@@ -1502,6 +1532,439 @@ function vape:LoadGUI()
 		Placeholder = 'Type name',
 		Profiles = true
 	})
+
+	--[[
+		Profile sync -- 'Sync to current profiles', plus the Blatant/Legit default picker.
+
+		Redownloads pistonware/profiles the way loader.lua does on a first install: every file
+		the repo keeps in that folder, pulled from the raw host through the same 4-attempt retry
+		(raw hosts 504 intermittently, and an empty body would otherwise land as a corrupt file).
+
+		Two things differ from loader.lua's downloadFile, both required for a sync rather than an
+		install: it writes over files that already exist (downloadFile skips those, which for a
+		sync would download nothing at all), and nothing is filtered out. <GameId>.gui.txt carries
+		the config's GUI theme colour and window layout, so holding it back was what made a synced
+		config come back looking exactly like the one it replaced.
+	]]
+
+	-- Same reinject route the buttons in Settings > General use: the developer build lives on
+	-- disk under its own name and must never be fetched from GitHub, and every other path goes
+	-- back through the loader so the key gate re-runs.
+	local function reinjectThroughLoader()
+		if shared.PistonwareDeveloper and isfile('pistonware/loaderdev.lua') then
+			loadstring(readfile('pistonware/loaderdev.lua'), 'loader')()
+		else
+			loadstring(game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/loader.lua', true), 'loader')()
+		end
+	end
+
+	-- pistonware/profiles is stamped with the commit it was pulled from, so a sync that would
+	-- change nothing can be turned away before it spends any requests finding that out.
+	--
+	-- loader.lua stamps the SAME file with its own 'p1-' fingerprint (a hash of the profile blob
+	-- shas, so its update check costs no extra API call). The two schemes can never compare
+	-- equal, which only means the short-circuit below misses after a loader-driven sync and this
+	-- button downloads once more than it strictly had to. That is the safe direction to fail:
+	-- syncing when nothing changed costs a few requests, skipping a sync that was needed does
+	-- not do what the button says. loader.lua already migrates a 40-char sha it finds here, so
+	-- writing one back does not make it prompt.
+	local function localProfileCommit()
+		local suc, res = pcall(readfile, 'pistonware/profiles/profilecommit.txt')
+		if not (suc and type(res) == 'string') then return nil end
+		res = res:gsub('%s', '')
+		return res ~= '' and res or nil
+	end
+
+	local function latestProfileCommit()
+		local suc, res = pcall(function()
+			return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/commits?path=profiles&sha=main&per_page=1', true)
+		end)
+		if not (suc and res and res ~= '' and res ~= '404: Not Found') then return nil end
+		local ok, body = pcall(function()
+			return httpService:JSONDecode(res)
+		end)
+		if not (ok and typeof(body) == 'table' and body[1] and type(body[1].sha) == 'string') then return nil end
+		return body[1].sha
+	end
+
+	-- Being on the latest commit is not enough on its own: the sync exists to put both shipped
+	-- configs for this place on disk, so a missing one has to let it through regardless.
+	local function hasBothConfigs()
+		return isfile('pistonware/profiles/blatant'..vape.Place..'.txt') and isfile('pistonware/profiles/legit'..vape.Place..'.txt')
+	end
+
+	--[[
+		<GameId>.gui.txt is the GUI's state file, not a config: besides the theme and window
+		layout it holds the equipped config and the profile LIST shown in the Profiles tab,
+		custom ones included. Writing the repo's copy over it wipes every custom profile from
+		that list and forces the equipped config back to whatever shipped.
+
+		Where the list lives differs between the two GUIs, and this GUI is the one on disk now:
+		the old file kept it at the top level as `Profiles`, this one keeps it at
+		Categories.Profiles.List / .ListEnabled (see vape:Save). Both are carried across, so a
+		repo copy written by either version merges correctly -- the theme still syncs, the
+		user's own profiles stay local, and only shipped configs get replaced.
+	]]
+	local function mergeGuiState(path, content)
+		local ok, merged = pcall(function()
+			local new = httpService:JSONDecode(content)
+			if type(new) ~= 'table' then return content end
+
+			if isfile(path) then
+				local old = httpService:JSONDecode(readfile(path))
+				if type(old) == 'table' then
+					if old.Profiles ~= nil then new.Profiles = old.Profiles end
+					if old.Profile ~= nil then new.Profile = old.Profile end
+
+					local oldprofiles = type(old.Categories) == 'table' and old.Categories.Profiles or nil
+					if type(oldprofiles) == 'table' then
+						new.Categories = type(new.Categories) == 'table' and new.Categories or {}
+						local newprofiles = type(new.Categories.Profiles) == 'table' and new.Categories.Profiles or {}
+						new.Categories.Profiles = newprofiles
+						if oldprofiles.List ~= nil then newprofiles.List = oldprofiles.List end
+						if oldprofiles.ListEnabled ~= nil then newprofiles.ListEnabled = oldprofiles.ListEnabled end
+					end
+				end
+			end
+
+			return httpService:JSONEncode(new)
+		end)
+
+		return (ok and type(merged) == 'string') and merged or content
+	end
+
+	-- Pinned to the commit the check reported rather than to the branch path: raw.githubusercontent
+	-- serves CDN-cached content for a few minutes after a push, so a branch-head fetch can quietly
+	-- reinstall the old profiles and then get stamped with the new commit, blocking every later sync.
+	local function downloadProfileFile(path, commit)
+		local relPath = select(1, path:gsub('pistonware/', ''))
+		local content
+		for attempt = 1, 4 do
+			local suc, res = pcall(function()
+				return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/'..(commit or 'main')..'/'..relPath, true)
+			end)
+			if suc and res and res ~= '' and res ~= '404: Not Found' then
+				content = res
+				break
+			end
+			if attempt < 4 then
+				task.wait(attempt)
+			end
+		end
+		if not content then return false end
+
+		if path:find('%.gui%.txt$') then
+			content = mergeGuiState(path, content)
+		end
+
+		return (pcall(writefile, path, content))
+	end
+
+	local function downloadProfiles(commit)
+		local reqSuc, res = pcall(function()
+			-- listing pinned too, so it can never describe a different commit than the files below
+			return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/contents/profiles'..(commit and ('?ref='..commit) or ''), true)
+		end)
+		if not (reqSuc and res and res ~= '' and res ~= '404: Not Found') then
+			return nil, 'Profile sync failed (could not reach GitHub).'
+		end
+
+		local bodySuc, body = pcall(function()
+			return httpService:JSONDecode(res)
+		end)
+		if not (bodySuc and typeof(body) == 'table') then
+			return nil, 'Profile sync failed (unreadable response).'
+		end
+
+		local files = {}
+		for _, v in body do
+			if type(v) == 'table' and v.type == 'file' and type(v.path) == 'string' then
+				table.insert(files, v)
+			end
+		end
+		if #files <= 0 then
+			return nil, 'Profile sync failed (the repo has no profiles).'
+		end
+
+		-- Downloaded in parallel like the loader does, rather than one blocking request per file.
+		local synced, failed = 0, 0
+		local total = #files
+		for _, v in files do
+			task.spawn(function()
+				-- pcall'd so a worker that throws is still counted. It used to decrement the
+				-- counter only on the success path and join on a BindableEvent with no timeout, so
+				-- one file that errored left the sync button spinning for the rest of the session.
+				local ok, got = pcall(downloadProfileFile, 'pistonware/'..({v.path:gsub(' ', '%%20')})[1], commit)
+				if ok and got then
+					synced += 1
+				else
+					failed += 1
+				end
+			end)
+		end
+		local deadline = os.clock() + 90
+		while synced + failed < total and os.clock() < deadline do
+			task.wait(0.05)
+		end
+
+		if synced <= 0 then
+			return nil, 'Profile sync failed (nothing downloaded).'
+		end
+		return synced, 'Synced '..synced..' file'..(synced == 1 and '' or 's')..' from GitHub'..(failed > 0 and ' ('..failed..' failed).' or '.')
+	end
+
+	do
+		local syncing = false
+		-- Set once a download lands. From then until a config is picked the buttons below own the
+		-- reinject, so syncing and choosing stay one flow rather than two reloads.
+		local pending, syncmessage = false, nil
+		local refreshConfigButtons
+		-- Tracked because the recolour below runs on every rainbow tick and would otherwise
+		-- overwrite whatever MouseEnter/MouseLeave just set.
+		local synchovered = false
+		local children = profilescategory.Object:FindFirstChild('Children')
+		local syncbutton = Instance.new('TextButton')
+		syncbutton.AutoButtonColor = false
+		syncbutton.Name = 'SyncProfiles'
+		-- ChangeValue rebuilds the profile entries from scratch on every add/remove, so this sits
+		-- outside that list with a LayoutOrder that keeps it pinned underneath them.
+		syncbutton.LayoutOrder = 999
+		syncbutton.Size = UDim2.fromOffset(200, 33)
+		syncbutton.BackgroundColor3 = color.Light(uipallet.Main, 0.02)
+		syncbutton.Text = 'Sync to current profiles'
+		-- Static black, and never touched again: the background under it is the GUI colour now,
+		-- so anything that varied with the colour or with hover read as the label flickering.
+		syncbutton.TextColor3 = Color3.new(0, 0, 0)
+		syncbutton.TextSize = 15
+		syncbutton.FontFace = uipallet.Font
+		syncbutton.Parent = children
+		addCorner(syncbutton)
+		addTooltip(syncbutton, 'Redownloads the profiles from GitHub, then pick a config below to load one')
+
+		-- Flag only. The tween these used to run fought recolorProfileCards, which rewrites this
+		-- background every rainbow tick: leaving the button started a tween back to the flat
+		-- grey while the tick kept writing the colour, and the two took turns each frame.
+		-- The hover shade is applied by the tick instead, off this flag.
+		syncbutton.MouseEnter:Connect(function()
+			synchovered = true
+		end)
+		syncbutton.MouseLeave:Connect(function()
+			synchovered = false
+		end)
+		syncbutton.MouseButton1Click:Connect(function()
+			if syncing then return end
+			syncing = true
+			syncbutton.Text = 'Checking...'
+
+			-- One request to compare commits, rather than a dozen to redownload files that have not
+			-- moved. GitHub allows 60 unauthenticated API calls an hour and a few reinjects can spend
+			-- that, so a folder that is already current is turned away before the listing request.
+			local latest = latestProfileCommit()
+			if latest and latest == localProfileCommit() and hasBothConfigs() then
+				syncing = false
+				syncbutton.Text = 'Profiles already up to date'
+				vape:CreateNotification('Pistonware', 'Profiles are already on the latest commit, nothing to sync.', 10)
+				return
+			end
+
+			syncbutton.Text = 'Syncing...'
+			-- Flush what is in memory first so a download that only half lands cannot strand the
+			-- GUI between two states -- whatever does arrive replaces this a moment later.
+			pcall(function() vape:Save() end)
+
+			local synced, message = downloadProfiles(latest)
+			syncing = false
+			if not synced then
+				syncbutton.Text = 'Sync to current profiles'
+				vape:CreateNotification('Pistonware', message, 10, 'alert')
+				return
+			end
+			-- Stamped only once the files are down, and only when the commit was readable in the first
+			-- place, so a half-finished or unverified sync still re-checks next time.
+			if latest then
+				pcall(writefile, 'pistonware/profiles/profilecommit.txt', latest)
+			end
+
+			-- Saving stops here rather than at the reload. A module toggled from now on would go
+			-- through RequestSave and write the pre-sync state back over the files that were just
+			-- downloaded -- which is exactly how a synced config came back wearing the old GUI
+			-- colour. Cleared for good; the reload builds a fresh vape.
+			vape.Save = function() end
+			vape.SaveNeeded = nil
+
+			-- Downloaded, but nothing is loaded yet: the files are settings on disk until something
+			-- reads them. Picking a config below is what reloads onto them.
+			pending, syncmessage = true, message
+			syncbutton.Text = 'Synced, choose a config'
+			refreshConfigButtons()
+			vape:CreateNotification('Pistonware', message..' Choose Blatant or Legit below to load one.', 10)
+		end)
+
+		-- Which shipped config loads by default. There is nothing extra to persist: the default is
+		-- simply the active profile, which Save already records in gui.txt, so it is what a plain
+		-- reinject (and the sync above) comes back to.
+		local defaultrow = Instance.new('Frame')
+		defaultrow.Name = 'DefaultConfig'
+		defaultrow.LayoutOrder = 1000
+		defaultrow.Size = UDim2.fromOffset(200, 33)
+		defaultrow.BackgroundTransparency = 1
+		defaultrow.Parent = children
+
+		local configbuttons = {}
+		-- Which of the two the pointer is over. Same purpose as `synchovered` above: this
+		-- function runs on every rainbow tick, and an unselected card that is mid-hover owns
+		-- its own colours until the pointer leaves. Writing the flat shade over it here is the
+		-- fight the sync button's flag already avoids -- the hover tween and the tick took
+		-- turns each frame. (The old GUI only guarded the sync button and left these two to
+		-- flicker.) Nothing about the appearance changes; the hover tween simply stops being
+		-- overwritten while it is the one in charge.
+		local confighovered = {}
+		-- Colour only, and deliberately split from refreshConfigButtons: that one stats the
+		-- profile files to decide what is offered, and this runs on every rainbow tick --
+		-- at the default 60hz the combined version would be 120 isfile calls a second.
+		--
+		-- Registered on vape so UpdateGUI can reach it: UpdateGUI is defined at file scope,
+		-- well outside this block, and is the only thing that runs per rainbow tick.
+		local function recolorProfileCards()
+			for name, button in configbuttons do
+				local selected = vape.Profile == name and not pending
+				if selected then
+					button.BackgroundColor3 = Color3.fromHSV(vape.GUIColor.Hue, vape.GUIColor.Sat, vape.GUIColor.Value)
+					-- Fixed black rather than vape:TextColor: that picks dark or white from the
+					-- colour's brightness, and a rainbow sweeps across its threshold several
+					-- times a cycle, so the label flipped between the two every few frames.
+					button.TextColor3 = Color3.new(0, 0, 0)
+				elseif not confighovered[name] then
+					button.BackgroundColor3 = color.Light(uipallet.Main, 0.02)
+					-- while a sync is waiting on a choice both read as live options, not one active one
+					button.TextColor3 = pending and uipallet.Text or color.Dark(uipallet.Text, 0.4)
+				end
+			end
+			-- The button takes the GUI colour, its label stays black. Hover is a shade of the same
+			-- colour applied here rather than a tween, so there is only ever one writer.
+			local synccolor = Color3.fromHSV(vape.GUIColor.Hue, vape.GUIColor.Sat, vape.GUIColor.Value)
+			syncbutton.BackgroundColor3 = synchovered and color.Light(synccolor, 0.12) or synccolor
+		end
+		vape.RecolorProfileCards = recolorProfileCards
+
+		function refreshConfigButtons()
+			local anyvisible = false
+			for name, button in configbuttons do
+				-- A config can only be offered once its file is on disk: before the first sync there
+				-- may be none at all, so the row hides itself rather than showing a button whose only
+				-- possible answer is an error.
+				button.Visible = pending or isfile('pistonware/profiles/'..name..vape.Place..'.txt')
+				anyvisible = anyvisible or button.Visible
+			end
+			-- an invisible row is skipped by the list layout, so the gap closes with it
+			defaultrow.Visible = anyvisible
+			recolorProfileCards()
+		end
+
+		local function selectConfig(name)
+			if not isfile('pistonware/profiles/'..name..vape.Place..'.txt') then
+				vape:CreateNotification('Pistonware', 'There is no '..name..' config for this game yet, press Sync to current profiles first.', 10, 'alert')
+				return
+			end
+			-- Always a full reload, never an in-place profile switch. The GUI theme colour, window
+			-- layout and keybind live in <GameId>.gui.txt, and Load(true) -- what the profile entries
+			-- use -- deliberately skips that file, so switching in place brings the config's modules
+			-- across but leaves the GUI dressed as whatever it replaced.
+			pending = false
+			syncbutton.Text = 'Reloading...'
+			-- On a plain switch this flushes anything newer than the last write into the profile
+			-- being left behind. After a sync it is deliberately a no-op: Save was already neutered
+			-- when the download landed, which is what keeps those files intact until they are read.
+			pcall(function() vape:Save() end)
+			vape.Save = function() end
+			vape.SaveNeeded = nil
+			-- Save is off now and the reload reads the profile list back out of gui.txt, so the chosen
+			-- config has to be written in there directly. Going through Save instead would rewrite the
+			-- profile file a download just refreshed.
+			pcall(function()
+				local guipath = 'pistonware/profiles/'..game.GameId..'.gui.txt'
+				local guidata = isfile(guipath) and loadJson(guipath)
+				if type(guidata) ~= 'table' then return end
+				-- Categories.Profiles.List is where this GUI keeps the profile list; see the note
+				-- on mergeGuiState above.
+				guidata.Categories = type(guidata.Categories) == 'table' and guidata.Categories or {}
+				local profiles = type(guidata.Categories.Profiles) == 'table' and guidata.Categories.Profiles or {}
+				guidata.Categories.Profiles = profiles
+				profiles.List = type(profiles.List) == 'table' and profiles.List or {}
+				local listed = false
+				for _, v in profiles.List do
+					if type(v) == 'table' and v.Name == name then
+						listed = true
+						break
+					end
+				end
+				if not listed then
+					table.insert(profiles.List, {Name = name, Bind = {}})
+				end
+				guidata.Profile = name
+				writefile(guipath, httpService:JSONEncode(guidata))
+			end)
+			-- nil unless a sync is being finished off, which is the only time main.lua should report one
+			shared.PistonwareSyncResult = syncmessage
+			shared.VapeCustomProfile = name
+			shared.vapereload = true
+			reinjectThroughLoader()
+		end
+
+		for index, config in {{Key = 'blatant', Text = 'Blatant'}, {Key = 'legit', Text = 'Legit'}} do
+			local name = config.Key
+			local button = Instance.new('TextButton')
+			button.Name = name
+			-- Half of the sync button each, with a 4px gutter, so the pair lines up with it exactly.
+			button.Size = UDim2.fromOffset(98, 33)
+			button.Position = UDim2.fromOffset((index - 1) * 102, 0)
+			button.BackgroundColor3 = color.Light(uipallet.Main, 0.02)
+			button.AutoButtonColor = false
+			button.Text = config.Text
+			button.TextColor3 = color.Dark(uipallet.Text, 0.4)
+			button.TextSize = 15
+			button.FontFace = uipallet.Font
+			button.Parent = defaultrow
+			addCorner(button)
+			addTooltip(button, 'Load the '..config.Text..' config by default')
+			configbuttons[name] = button
+
+			button.MouseEnter:Connect(function()
+				-- Recorded before the early return, so the flag still tracks the pointer while
+				-- this card happens to be the selected one.
+				confighovered[name] = true
+				if vape.Profile == name and not pending then return end
+				button.TextColor3 = uipallet.Text
+				tween:Tween(button, uipallet.Tween, {
+					BackgroundColor3 = color.Light(uipallet.Main, 0.14)
+				})
+			end)
+			button.MouseLeave:Connect(function()
+				confighovered[name] = nil
+				if vape.Profile == name and not pending then return end
+				button.TextColor3 = color.Dark(uipallet.Text, 0.4)
+				tween:Tween(button, uipallet.Tween, {
+					BackgroundColor3 = color.Light(uipallet.Main, 0.02)
+				})
+			end)
+			button.MouseButton1Click:Connect(function()
+				selectConfig(name)
+			end)
+		end
+
+		-- Load is the one place that settles which profile is active -- first inject, reinject, or a
+		-- click on a profile entry -- so the highlight follows it instead of being poked from each
+		-- of those callers.
+		local loadprofile = vape.Load
+		function vape:Load(...)
+			local result = loadprofile(self, ...)
+			refreshConfigButtons()
+			return result
+		end
+		-- picks up a GUI colour change made while the tab was closed
+		defaultrow.MouseEnter:Connect(refreshConfigButtons)
+		refreshConfigButtons()
+	end
 	
 	--[[
 		Targets
@@ -2454,9 +2917,11 @@ function vape:LoadGUI()
 			Target Info
 		]]
 		
+		-- Object is filled in once Holder exists (a few dozen lines down). Setting it here
+		-- read an undeclared global, so vape.Libraries.targetinfo.Object was permanently nil.
 		local targetinfo = {
 			Targets = {},
-			Object = Holder,
+			Object = nil,
 			Health = 0,
 			MaxHealth = 0
 		}
@@ -2490,6 +2955,7 @@ function vape:LoadGUI()
 		Holder.BackgroundColor3 = color.Dark(uipallet.Main, 0.1)
 		Holder.BackgroundTransparency = 0.5
 		Holder.Parent = TargetInfoOverlay.Children
+		targetinfo.Object = Holder
 		local BlurHolder = addBlur(Holder, nil, true)
 		BlurHolder.Visible = false
 		addCorner(Holder)
@@ -2643,25 +3109,32 @@ function vape:LoadGUI()
 		})
 		
 		function targetinfo:Update()
-			local entitylib = vape.Libraries
-			if not entitylib then return end
-		
-			local cloned = table.clone(self.Targets)
-			for index, expire in cloned do
-				if expire < tick() then
-					self.Targets[index] = nil
+			if not vape.Libraries then return end
+
+			--[[
+				One pass, no copy.
+
+				This runs on RenderStepped, and it used to table.clone(self.Targets) on every
+				frame purely so it could clear expired entries while iterating -- a whole
+				table allocated and thrown away 60-240 times a second, for a set that is
+				almost always empty or holds one entity.
+
+				Clearing a field that already exists is explicitly allowed during Luau's
+				generalised iteration, so expiry and the highest-priority search fold into the
+				same walk. tick() is read once instead of once per entry as well.
+			]]
+			local now = tick()
+			local entity, highest = nil, now
+			for target, expire in self.Targets do
+				if expire < now then
+					self.Targets[target] = nil
+				elseif expire > highest then
+					entity = target
+					highest = expire
 				end
 			end
-			table.clear(cloned)
-		
-			local entity, highest = nil, tick()
-			for index, level in self.Targets do
-				if level > highest then
-					entity = index
-					highest = level
-				end
-			end
-		
+
+
 			Holder.Visible = entity ~= nil or clickgui.Visible
 			if entity then
 				Name.Text = entity.Player and (DisplayName.Enabled and entity.Player.DisplayName or entity.Player.Name) or entity.Character and entity.Character.Name or Name.Text
@@ -2709,6 +3182,24 @@ function vape:LoadGUI()
 	vape:Clean(task.spawn(function()
 		local hue = 0
 		repeat
+			--[[
+				Idle at 4Hz while nothing is on rainbow.
+
+				This thread woke at the rainbow update rate -- up to 144 times a second by
+				default 60 -- whether or not a single slider had rainbow switched on, and for
+				most users none ever is. An empty loop body is cheap, but the wakeup itself is
+				not free on a phone, and a GUISlider on rainbow drives vape:UpdateGUI, so the
+				whole thing is only worth paying for when there is something to animate.
+
+				hue is not advanced while parked: nothing is reading it, and resuming from
+				where it left off is what makes switching rainbow on look continuous rather
+				than jumping to wherever a free-running counter happened to be.
+			]]
+			if #vape.RainbowSliders == 0 then
+				task.wait(0.25)
+				continue
+			end
+
 			for _, component in vape.RainbowSliders do
 				if component.Type == 'GUISlider' then
 					component:SetValue(vape:Color(hue))
@@ -2716,7 +3207,7 @@ function vape:LoadGUI()
 					component:SetValue(hue)
 				end
 			end
-	
+
 			local delta = task.wait(1 / vape.RainbowUpdateSpeed.Value)
 			hue = (hue + (delta * (0.2 * vape.RainbowSpeed.Value))) % 1
 		until false
@@ -3079,7 +3570,7 @@ function vape:EachLegitModule()
 	return orderedModules(self.Legit and self.Legit.Order)
 end
 
-function vape:SortCategories()
+local function sortCategoriesNow(self)
 	local sorting = {}
 	for _, module in orderedModules(self.ModuleOrder) do
 		sorting[module.Category] = sorting[module.Category] or {}
@@ -3089,11 +3580,45 @@ function vape:SortCategories()
 	for _, sort in sorting do
 		table.sort(sort)
 		for index, name in sort do
-			self.Modules[name].Index = index
-			self.Modules[name].Object.LayoutOrder = index
-			self.Modules[name].Children.LayoutOrder = index
+			local module = self.Modules[name]
+			-- The array can name a module the hash no longer holds if a removal lands
+			-- between the request and this pass.
+			if module then
+				module.Index = index
+				module.Object.LayoutOrder = index
+				module.Children.LayoutOrder = index
+			end
 		end
 	end
+end
+
+--[[
+	Coalesced, because the callers are a burst.
+
+	Every CreateModule ends with a SortCategories, and each one re-walks every module
+	registered so far, sorts each category and writes two LayoutOrder properties per module.
+	Over a payload that registers several hundred modules that is quadratic, and the expensive
+	half is the property writes -- hundreds of thousands of round trips into the Roblox
+	instance API during the single slowest part of the load.
+
+	The answer only has to be right by the time anything looks at it, and nothing does until a
+	frame is rendered. Deferring collapses a whole registration burst into ONE sort at the end
+	of the frame, which is the same result the last call of the burst would have produced.
+
+	task.defer rather than a flag checked elsewhere: it needs no cooperation from callers, and
+	a module removed between the request and the pass is handled above.
+]]
+function vape:SortCategories()
+	if self.SortQueued then return end
+	self.SortQueued = true
+
+	task.defer(function()
+		self.SortQueued = nil
+		-- Uninject's loopClean strips vape down to an empty table, so a pass still queued
+		-- when it runs finds no ModuleOrder at all. Guarded rather than cancelled: there is
+		-- nothing left to sort at that point and nothing to report.
+		pcall(sortCategoriesNow, self)
+	end)
 end
 
 function vape:Uninject()
@@ -3158,6 +3683,14 @@ function vape:UpdateGUI(hue, sat, val, default)
 
 	if not clickgui.Visible and not vape.Legit.Window.Visible then return end
 	local isRainbow = vape.GUIColor.Rainbow and vape.RainbowMode.Value ~= 'Retro'
+
+	-- The Profiles cards are built inside their own do-block and are only recoloured when
+	-- something pokes them (a load, or the mouse entering the row), so with the GUI colour on
+	-- rainbow the sync button and the equipped-config highlight would sit frozen at whatever
+	-- hue happened to be current at the time while everything around them cycled.
+	if vape.RecolorProfileCards then
+		vape.RecolorProfileCards()
+	end
 
 	for name, component in vape.Categories do
 		component:Color(hue, sat, val, isRainbow)
@@ -3610,7 +4143,10 @@ components = {
 		icon.BackgroundTransparency = 1
 		icon.Image = props.Icon
 		icon.ImageColor3 = uipallet.Text
-		icon.Position = UDim2.fromOffset(12, (icon.Size.X.Offset > 20 and 14 or 13))
+		-- props.Size, not icon.Size: Size is assigned on the NEXT line, so this read the
+		-- freshly-constructed default of (0, 0) every time and the branch could never be
+		-- taken. CategoryList a few components down already measures props.Size here.
+		icon.Position = UDim2.fromOffset(12, (props.Size.X.Offset > 20 and 14 or 13))
 		icon.Size = props.Size
 		icon.Parent = window
 		local title = Instance.new('TextLabel')
@@ -4874,7 +5410,11 @@ components = {
 			if enter then
 				local success, parsed = pcall(function()
 					local commas = custombox.Text:split(',')
-					return tonumber(commas[1]) and Color3.fromRGB(tonumber(commas[1]), tonumber(commas[2]), tonumber(commas[3])) or Color3.fromHex(valuebox.Text)
+					-- custombox, not `valuebox` -- that was an undeclared global, so the hex
+					-- branch threw on every entry, the pcall swallowed it, and typing a hex
+					-- colour into a colour slider silently did nothing. The GUISlider copy of
+					-- this handler already reads the right box.
+					return tonumber(commas[1]) and Color3.fromRGB(tonumber(commas[1]), tonumber(commas[2]), tonumber(commas[3])) or Color3.fromHex(custombox.Text)
 				end)
 		
 				if success then
@@ -5397,24 +5937,27 @@ components = {
 			end
 		end
 		
+		-- `icon`, not `buttonicon` -- that name does not exist here, so the guard was
+		-- always false and a category button's icon stayed dim while the label beside it
+		-- lit up on hover. Toggle() a few lines above already uses the right local.
 		button.MouseEnter:Connect(function()
 			if not component.Enabled then
 				button.TextColor3 = uipallet.Text
-				if buttonicon then
-					buttonicon.ImageColor3 = uipallet.Text
+				if icon then
+					icon.ImageColor3 = uipallet.Text
 				end
-		
+
 				button.BackgroundColor3 = color.Light(uipallet.Main, 0.02)
 			end
 		end)
-		
+
 		button.MouseLeave:Connect(function()
 			if not component.Enabled then
 				button.TextColor3 = color.Dark(uipallet.Text, 0.16)
-				if buttonicon then
-					buttonicon.ImageColor3 = color.Dark(uipallet.Text, 0.16)
+				if icon then
+					icon.ImageColor3 = color.Dark(uipallet.Text, 0.16)
 				end
-		
+
 				button.BackgroundColor3 = uipallet.Main
 			end
 		end)
@@ -5967,9 +6510,11 @@ components = {
 			props.Function(self.Enabled)
 		end
 		
-		scale:GetPropertyChangedSignal('Scale'):Connect(function()
-			toggle.Text = string.rep(' ', 33)..props.Name
-		end)
+		-- The Scale listener that stood here is gone. It rewrote toggle.Text to the exact
+		-- string it was already set to (the indent is a fixed count of hair spaces -- see the
+		-- GUI component AbsoluteContentSize handler for why scaling that count is wrong), so
+		-- it did no work. It was still one connection per overlay toggle, on a signal outside
+		-- the GUI tree that nothing ever disconnected.
 		
 		toggle.MouseEnter:Connect(function()
 			isHover = true
@@ -6470,7 +7015,11 @@ components = {
 			Category = api.Name,
 			Enabled = false,
 			ExtraText = props.ExtraText,
-			Index = getTableSize(vape.Modules),
+			-- ModuleCount, not a walk of vape.Modules. getTableSize is O(n) and this runs
+			-- once per registration, so a payload with several hundred modules paid a
+			-- quadratic count for a placeholder that SortCategories overwrites moments
+			-- later anyway. The count is maintained on insert and remove for exactly this.
+			Index = vape.ModuleCount,
 			Name = props.Name,
 			Options = {},
 			-- Every other component in this table declares its Type; this one never did, so
@@ -6866,7 +7415,10 @@ components = {
 		icon.BackgroundTransparency = 1
 		icon.Image = props.Icon
 		icon.ImageColor3 = uipallet.Text
-		icon.Position = UDim2.fromOffset(12, (icon.Size.X.Offset > 14 and 14 or 13))
+		-- props.Size, not icon.Size: Size is assigned on the NEXT line, so this read the
+		-- freshly-constructed default of (0, 0) every time and the branch could never be
+		-- taken. CategoryList already measures props.Size in the same expression.
+		icon.Position = UDim2.fromOffset(12, (props.Size.X.Offset > 14 and 14 or 13))
 		icon.Size = props.Size
 		icon.Parent = window
 		local title = Instance.new('TextLabel')
@@ -7290,15 +7842,29 @@ components = {
 		windowlist.SortOrder = Enum.SortOrder.LayoutOrder
 		windowlist.Parent = children
 		
-		box:GetPropertyChangedSignal('Text'):Connect(function()
+		--[[
+			Coalesced to one rebuild per frame.
+
+			A rebuild destroys every result row and then CLONES the module button -- with its
+			whole subtree -- for each remaining match, plus six property listeners apiece. On
+			a single letter that is most of the module list, and the Text signal fires once
+			per keystroke, so holding a key down or pasting a word queued a full rebuild for
+			every character in it.
+
+			The result only depends on the box's final text, so a burst of keystrokes inside
+			one frame needs exactly one pass. task.defer runs at the end of the current
+			resumption cycle and re-reads box.Text there, which is the newest value.
+		]]
+		local searchQueued = false
+		local function rebuildSearch()
 			for _, obj in children:GetChildren() do
 				if obj:IsA('TextButton') then
 					obj:Destroy()
 				end
 			end
-		
+
 			if box.Text == '' then return end
-		
+
 			for name, module in orderedModules(vape.ModuleOrder) do
 				if name:lower():find(box.Text:lower()) then
 					local button = module.Object:Clone()
@@ -7336,8 +7902,18 @@ components = {
 					button.Parent = children
 				end
 			end
+		end
+
+		box:GetPropertyChangedSignal('Text'):Connect(function()
+			if searchQueued then return end
+			searchQueued = true
+
+			task.defer(function()
+				searchQueued = false
+				rebuildSearch()
+			end)
 		end)
-		
+
 		children:GetPropertyChangedSignal('CanvasPosition'):Connect(function()
 			divider.Visible = children.CanvasPosition.Y > 10 and children.Visible
 		end)
@@ -8688,6 +9264,12 @@ components = {
 				Position = UDim2.fromScale(size, 0),
 				Size = UDim2.fromScale(math.clamp(math.clamp(self.ValueMax / props.Max, 0.04, 0.96) - size, 0, 1), 1)
 			})
+
+			-- props.Function is defaulted to a no-op just above and was then never called, so
+			-- a TwoSlider given a Function silently ignored it -- unlike every other component
+			-- here. No shipped call site passes one today, which is why nothing broke; this
+			-- makes the contract real rather than waiting for the first one that does.
+			props.Function(self.ValueMin, self.ValueMax, isMax)
 		end
 		
 		knob.MouseEnter:Connect(function()
