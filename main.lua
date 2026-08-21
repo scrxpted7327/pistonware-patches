@@ -229,6 +229,11 @@ local function finishLoading()
 			-- vape.Modules before this point; that is the crash.
 			vape.SaveReady = true
 			debugWarn('[pistonware] module set settled -- saving on change enabled')
+			-- Anything toggled while the gate was shut recorded itself instead of being dropped.
+			-- Write it now rather than leaving it for a backstop tick up to 30s away.
+			if vape.FlushSave then
+				pcall(function() vape:FlushSave() end)
+			end
 		--[[
 			A backstop now, not the main mechanism.
 
