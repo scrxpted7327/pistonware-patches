@@ -99,6 +99,10 @@ do
 	local started = os.clock()
 	local index
 	local memTrend = {}
+	-- Half-minute buckets, each keeping its lowest reading. See the comment at the sample site.
+	local memFloor = {}
+	local bucketFloor
+	local bucketEnd = os.clock() + 30
 	-- Half a second while tracing, because two seconds could not resolve the failure it was meant
 	-- to time: the whole profile load and the save that followed it fitted inside a single tick,
 	-- so the log said "alive 28s" for an event that happened somewhere in the next two seconds.
@@ -117,11 +121,41 @@ do
 			]]
 			local mem = heapKB()
 			-- The trend matters more than the current value, and rewriting one line in place
-			-- would throw it away every tick. Last twenty samples, in one line, so the log stays
+			-- would throw it away every tick. Last ten samples, in one line, so the log stays
 			-- short and still shows the shape of the curve leading up to the death.
 			table.insert(memTrend, ('%d'):format(mem))
-			if #memTrend > 20 then table.remove(memTrend, 1) end
-			local text = ('alive %.1fs mem=%dKB trend=%s'):format(os.clock() - started, mem, table.concat(memTrend, ','))
+			if #memTrend > 10 then table.remove(memTrend, 1) end
+
+			--[[
+				The floor, which is the only series that answers "is this leaking".
+
+				A live heap sawtooths: it climbs until the collector runs, drops, climbs again.
+				Every sample of that curve is a mix of garbage not yet collected and data that is
+				genuinely held, so a raw trend rising over ten samples proves nothing -- it may
+				simply not have reached the next collection. That misreading has already cost one
+				wrong diagnosis in this file's history.
+
+				What a leak does is raise the BOTTOM of the sawtooth: memory the collector visits
+				and cannot free, because something still references it. So the lowest reading in
+				each half-minute is kept, and those minima are reported as their own series.
+
+				Flat floors mean no leak, however alarming the peaks look. Floors climbing steadily
+				across several buckets mean something is being retained, and the slope is the rate.
+			]]
+			bucketFloor = math.min(bucketFloor or mem, mem)
+			if os.clock() >= bucketEnd then
+				table.insert(memFloor, ('%d'):format(bucketFloor))
+				if #memFloor > 10 then table.remove(memFloor, 1) end
+				bucketFloor = nil
+				bucketEnd = os.clock() + 30
+			end
+
+			local text = ('alive %.1fs mem=%dKB trend=%s floor=%s'):format(
+				os.clock() - started,
+				mem,
+				table.concat(memTrend, ','),
+				#memFloor > 0 and table.concat(memFloor, ',') or '-'
+			)
 			if index then
 				traceLines[index] = text
 				pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
@@ -417,6 +451,13 @@ local function finishLoading()
 						table.insert(quoted, string.format('%q', tostring(name)))
 					end
 					teleportScript = 'shared.PistonwareSkipModules = {'..table.concat(quoted, ',')..'}\n'..teleportScript
+				end
+
+				-- The yield budget, for the same reason again: a profile switch in a match is
+				-- exactly what this tunes, and the lobby is not where you measure it.
+				local budget = tonumber(env.PistonwareYieldBudget or shared.PistonwareYieldBudget)
+				if budget and budget > 0 then
+					teleportScript = 'shared.PistonwareYieldBudget = '..budget..'\n'..teleportScript
 				end
 			end
 			-- %q, matching the key above: profile names are user-supplied (the Profiles tab lets
