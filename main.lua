@@ -401,6 +401,24 @@ local function finishLoading()
 			if (getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace then
 				teleportScript = 'shared.PistonwareTrace = true\n'..teleportScript
 			end
+			-- Same reason: bisecting a crash that only happens in a match is useless if the
+			-- setting that does the bisecting is wiped by the teleport into it.
+			do
+				local env = (getgenv and getgenv()) or {}
+				local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
+				if limit then
+					teleportScript = 'shared.PistonwareLoadLimit = '..limit..'\n'..teleportScript
+				end
+
+				local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
+				if type(skip) == 'table' and #skip > 0 then
+					local quoted = {}
+					for _, name in skip do
+						table.insert(quoted, string.format('%q', tostring(name)))
+					end
+					teleportScript = 'shared.PistonwareSkipModules = {'..table.concat(quoted, ',')..'}\n'..teleportScript
+				end
+			end
 			-- %q, matching the key above: profile names are user-supplied (the Profiles tab lets
 			-- you name one anything), and a name containing a quote or backslash used to produce
 			-- a chunk that would not compile -- which silently costs the whole re-injection, not
