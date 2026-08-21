@@ -303,6 +303,36 @@ pcall(function()
 	end
 end)
 
+--[[
+	Bisection controls, for isolating a module that kills the client.
+
+	Reading a log has taken this as far as it goes: the heaviest module in a config costs 3MB and
+	the heap sawtooths normally, so neither points at a culprit. What does isolate one is halving
+	the config until the crash stops, and these make that a one-line change instead of an edit to
+	the profile on disk.
+
+		getgenv().PistonwareLoadLimit = 30              -- apply only the first 30 modules
+		getgenv().PistonwareSkipModules = {'KitESP'}    -- apply everything except these
+
+	Both are read once here and reported in the log, so a run always says what it actually did.
+]]
+local loadLimit = math.huge
+local skipModules = {}
+pcall(function()
+	local env = (getgenv and getgenv()) or {}
+	local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
+	if limit then
+		loadLimit = limit
+	end
+
+	local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
+	if type(skip) == 'table' then
+		for _, name in skip do
+			skipModules[tostring(name)] = true
+		end
+	end
+end)
+
 -- The same buffer main.lua's stage() appends to, so the stages before this file existed and
 -- everything after it end up in one ordered log rather than overwriting each other.
 local traceLog = shared.PistonwareTraceLines or {}
@@ -1222,10 +1252,24 @@ function vape:Load(skipgui, profile)
 			loop, is not -- this measures the cost of turning it on, not the cost of running it.
 		]]
 		local costs = traceDetail and {} or nil
-		trace('Load categories done, applying modules, heap='..heapKB()..'KB')
+		local applied = 0
+		trace('Load categories done, applying modules, heap='..heapKB()..'KB'
+			..(loadLimit < math.huge and ' limit='..loadLimit or '')
+			..(next(skipModules) and ' skipping='..(function()
+				local names = {}
+				for skipped in skipModules do table.insert(names, skipped) end
+				return table.concat(names, ',')
+			end)() or ''))
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
+			if module and skipModules[name] then
+				trace('SKIPPED '..name, true)
+				module = nil
+			elseif module and applied >= loadLimit then
+				module = nil
+			end
 			if module then
+				applied += 1
 				-- Named before it runs, not after: if applying this module's saved state is what
 				-- kills the client, this is the last line that reaches disk.
 				trace('load '..name, true)
