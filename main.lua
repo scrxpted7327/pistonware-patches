@@ -91,10 +91,15 @@ stage('main.lua running, touch='..tostring(isTouchDevice))
 do
 	local started = os.clock()
 	local index
+	-- Half a second while tracing, because two seconds could not resolve the failure it was meant
+	-- to time: the whole profile load and the save that followed it fitted inside a single tick,
+	-- so the log said "alive 28s" for an event that happened somewhere in the next two seconds.
+	local traceOn = (getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace
+	local interval = traceOn and 0.5 or 2
 	task.spawn(function()
 		while true do
-			task.wait(2)
-			local text = ('alive %.0fs'):format(os.clock() - started)
+			task.wait(interval)
+			local text = ('alive %.1fs'):format(os.clock() - started)
 			if index then
 				traceLines[index] = text
 				pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
