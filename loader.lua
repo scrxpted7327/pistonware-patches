@@ -172,7 +172,7 @@ local function downloadFile(path, func)
 				end
 				return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..relPath, true)
 			end)
-			if suc and res and res ~= '' and res ~= '404: Not Found' and (not path:find('.lua') or loadstring(res) ~= nil) then
+			if suc and res and res ~= '' and res ~= '404: Not Found' and (not path:find('%.lua$') or loadstring(res) ~= nil) then
 				content = res
 				break
 			end
@@ -183,7 +183,7 @@ local function downloadFile(path, func)
 		if not content then
 			error('failed to download '..path..' after 4 attempts')
 		end
-		if path:find('.lua') then
+		if path:find('%.lua$') then
 			content = Watermark..'\n'..content
 		end
 		writefile(path, content)
@@ -276,8 +276,29 @@ local function mergeGuiState(path, incoming)
 		if isfile(path) then
 			local old = httpService:JSONDecode(readfile(path))
 			if type(old) == 'table' then
+				-- Top level: the shape the OLD gui wrote, kept for a repo copy still in it.
 				if old.Profiles ~= nil then new.Profiles = old.Profiles end
 				if old.Profile ~= nil then new.Profile = old.Profile end
+
+				--[[
+					And the shape guis/newgui.lua writes, which is what is on disk now.
+
+					The point of this merge is that a config sync replaces the theme and window
+					layout without costing the user the profiles they made themselves. The new
+					GUI keeps that list at Categories.Profiles.List (see its vape:Save), not at
+					the top level -- so preserving only the two fields above let the repo's copy
+					overwrite it, and a sync silently emptied the Profiles tab of everything
+					except the shipped configs. The GUI's own sync button carries both across
+					for the same reason.
+				]]
+				local oldprofiles = type(old.Categories) == 'table' and old.Categories.Profiles or nil
+				if type(oldprofiles) == 'table' then
+					new.Categories = type(new.Categories) == 'table' and new.Categories or {}
+					local newprofiles = type(new.Categories.Profiles) == 'table' and new.Categories.Profiles or {}
+					new.Categories.Profiles = newprofiles
+					if oldprofiles.List ~= nil then newprofiles.List = oldprofiles.List end
+					if oldprofiles.ListEnabled ~= nil then newprofiles.ListEnabled = oldprofiles.ListEnabled end
+				end
 			end
 		end
 		return httpService:JSONEncode(new)
@@ -539,6 +560,20 @@ local function deleteInstall()
 	-- every cancel/abort path comes through here, so a cancelled boot immediately frees the
 	-- duplicate-execution guard for the next manual run
 	shared.PistonwareLoaderBoot = nil
+	--[[
+		And the reload flag, for the same reason.
+
+		shared.vapereload is normally consumed at the very bottom of this file, AFTER main.lua
+		has had its look at it -- but a boot that ends here never gets there, so the flag was
+		left standing for the rest of the session. Everything from then on read as a reload:
+		the console went headless, and a headless console cannot ask for a key.
+
+		That is what made a lapsed key unrecoverable in-game. Pressing Reinject with an expired
+		key failed at the gate and printed 'run the loader manually to enter one' -- and running
+		it manually hit this same stale flag, went headless again, and printed the same line.
+		The only way out was restarting Roblox.
+	]]
+	shared.vapereload = nil
 	if not freshInstall then return end
 	pcall(function()
 		if delfolder then
@@ -1309,8 +1344,10 @@ do
 			-- next execution tears this console down before building its own.
 			console:Halt()
 			-- released so a later execution on a supported executor is not locked out by the
-			-- duplicate-boot guard at the top of this file
+			-- duplicate-boot guard at the top of this file, and the reload flag with it so
+			-- that later execution still gets a window (see deleteInstall)
 			shared.PistonwareLoaderBoot = nil
+			shared.vapereload = nil
 			return
 		end
 	end
@@ -1530,6 +1567,38 @@ do
 
 		if not shared.PistonwareAuthenticated then
 			if console:IsAborted() then deleteInstall() return end
+
+			--[[
+				A reload gets a real window from here on, even though it started headless.
+
+				Headless is the right default for a run something else began: the reinject
+				button, a profile reset, a config sync. None of those should throw a terminal
+				over the game when the key they are carrying still works.
+
+				It is exactly wrong once the key is the thing that failed. A headless AskKey
+				answers nil immediately, so the boot ended on a console warning nobody reads
+				mid-match -- and the line it printed, 'run the loader manually to enter one',
+				could not even be acted on, because the run had left shared.vapereload set and
+				every execution afterwards went down this same headless path. An expired key
+				meant restarting Roblox.
+
+				Every route that reaches here headless is a deliberate in-game click (a
+				teleport re-runs main.lua directly and never touches this file), so there is
+				someone at the keyboard. Give them something to type into.
+
+				pcall'd because building the console touches CoreGui/gethui and is the one
+				thing here that can throw on a hostile executor; if it does, the boot falls
+				back to the old behaviour rather than dying on the way to the prompt.
+			]]
+			local canPrompt = not isReload
+			if isReload then
+				local built, upgraded = pcall(createConsole)
+				if built and upgraded then
+					console = upgraded
+					canPrompt = true
+				end
+			end
+
 			console:SetStatus('KEY SYSTEM', nil, '<')
 			console:SetProgress(0.1)
 
@@ -1609,10 +1678,15 @@ do
 			-- saved and the session still counts as authenticated, so the next run skips the
 			-- gate -- cancelling costs the boot, not the key.
 			if not key or console:IsAborted() then
-				-- Window closed, or a headless reload that had no valid saved key to fall back
-				-- on. Nothing has been downloaded or injected at this point, so stopping here
-				-- leaves the session exactly as the loader found it.
-				local message = isReload and t('headless') or t('cancelled')
+				-- Window closed, or -- only if the console could not be built at all -- a
+				-- headless run with no valid saved key to fall back on. Nothing has been
+				-- downloaded or injected at this point, so stopping here leaves the session
+				-- exactly as the loader found it.
+				--
+				-- Keyed off canPrompt rather than isReload: a reload now gets a real prompt,
+				-- so telling someone who just closed that window to 'run the loader manually
+				-- to enter one' would be describing the thing they had in front of them.
+				local message = (not canPrompt) and t('headless') or t('cancelled')
 				if not console:IsAborted() then
 					console:Fail(message)
 				end
