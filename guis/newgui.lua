@@ -213,11 +213,10 @@ end
 
 	Ten milliseconds brings the multiplier to about four while keeping any single uninterrupted
 	block to under a third of a mobile frame, so the responsiveness this was added for is intact.
-	Overridable, because the right number depends on the device and this is worth measuring:
-	the yield count and elapsed time now land in the trace next to it.
+	Overridable via getgenv().PistonwareYieldBudget, because the right number depends on how fast
+	the device is and how many modules the profile carries.
 ]]
 local buildclock = os.clock()
-local buildyields = 0
 local yieldBudget = 0.01
 pcall(function()
 	local override = tonumber(((getgenv and getgenv().PistonwareYieldBudget) or shared.PistonwareYieldBudget))
@@ -228,7 +227,6 @@ end)
 local function yieldBuild(budget)
 	if os.clock() - buildclock > (budget or yieldBudget) then
 		task.wait()
-		buildyields += 1
 		buildclock = os.clock()
 	end
 end
@@ -260,9 +258,7 @@ local function writeJson(path, data)
 	end
 
 	local ok, err = pcall(writefile, path, encoded)
-	-- Third return is the byte count, purely so the trace can show how big the thing being
-	-- written actually is -- a profile that has grown to something absurd is worth seeing.
-	return ok, err, #encoded
+	return ok, err
 end
 
 --[[
@@ -295,119 +291,6 @@ local function orderedModules(order)
 		return nil
 	end
 end
-
---[[
-	Breadcrumbs that survive a native crash.
-
-	A crash that takes the client's process down leaves nothing behind -- no error, no console,
-	no traceback, and anything held in memory goes with it. The only record that outlives it is
-	one already on disk, so this writes the name of what is about to run BEFORE running it. After
-	a crash the last line in the file is the thing that did it.
-
-	Off unless pistonware/trace.txt exists, because it is a file write per module and nobody who
-	is not chasing a crash should pay for that.
-]]
-local traceDetail = false
-pcall(function()
-	--[[
-		Three ways to switch the detailed trace on, and the obvious one is last for a reason.
-
-		reinstall.lua deletes the whole pistonware folder, so a flag file inside it is gone before
-		the GUI ever looks for it -- and so is any log written there, erased by the very next run
-		before anyone can read it. That is why the first version of this produced nothing at all.
-		The globals survive a reinstall; the file only works if you are not doing one.
-
-			getgenv().PistonwareTrace = true
-			shared.PistonwareTrace = true
-			pistonware/trace.txt
-	]]
-	if (getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace then
-		traceDetail = true
-	elseif isfile and isfile('pistonware/trace.txt') then
-		traceDetail = true
-	end
-end)
-
---[[
-	Bisection controls, for isolating a module that kills the client.
-
-	Reading a log has taken this as far as it goes: the heaviest module in a config costs 3MB and
-	the heap sawtooths normally, so neither points at a culprit. What does isolate one is halving
-	the config until the crash stops, and these make that a one-line change instead of an edit to
-	the profile on disk.
-
-		getgenv().PistonwareLoadLimit = 30              -- apply only the first 30 modules
-		getgenv().PistonwareSkipModules = {'KitESP'}    -- apply everything except these
-
-	Both are read once here and reported in the log, so a run always says what it actually did.
-]]
-local loadLimit = math.huge
-local skipModules = {}
-pcall(function()
-	local env = (getgenv and getgenv()) or {}
-	local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
-	if limit then
-		loadLimit = limit
-	end
-
-	local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
-	if type(skip) == 'table' then
-		for _, name in skip do
-			skipModules[tostring(name)] = true
-		end
-	end
-end)
-
--- The same buffer main.lua's stage() appends to, so the stages before this file existed and
--- everything after it end up in one ordered log rather than overwriting each other.
-local traceLog = shared.PistonwareTraceLines or {}
-shared.PistonwareTraceLines = traceLog
---[[
-	Breadcrumbs that survive a native crash.
-
-	A crash that takes the client's process down leaves nothing behind -- no error, no console, no
-	traceback -- and everything in memory goes with it. The only record that outlives it is one
-	already on disk, so this writes what is about to happen BEFORE it happens. After a crash the
-	last line in the file is the thing that did it.
-
-	Written to the filesystem ROOT rather than under pistonware/, so a reinstall cannot delete the
-	evidence of the crash that prompted it.
-
-	Stage crumbs are unconditional -- a dozen a session, and they are what says how far the load
-	got. Per-module crumbs cost a file write each, so those are detail-only.
-]]
--- Lua heap in KB, for the crumbs that care how much applying a profile actually costs.
-local function heapKB()
-	local kb = 0
-	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
-	return kb
-end
-
-local function trace(text, detail)
-	if detail and not traceDetail then
-		return
-	end
-
-	table.insert(traceLog, text)
-	-- Rewritten whole rather than appended: appendfile is missing on several mobile executors,
-	-- and a breadcrumb that only works on desktop is no use for a crash that only happens on
-	-- mobile. Capped so a long session cannot grow this without bound.
-	--[[
-		A short window, deliberately.
-
-		Every crumb rewrites the WHOLE file, so the buffer length is the cost of each write. At
-		400 lines that is a ~10KB string built and thrown away several hundred times during a
-		profile apply -- megabytes of churn at exactly the moment the heap is tightest, i.e. the
-		measurement changing what it measures. 150 still covers the whole apply of a large config
-		and costs a third as much.
-	]]
-	if #traceLog > 150 then
-		table.remove(traceLog, 1)
-	end
-	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLog, '\n'))
-end
-
-trace('gui chunk running')
 
 local color = {}
 local uipallet = {}
@@ -1189,25 +1072,16 @@ function vape:Load(skipgui, profile)
 	]]
 	self.LoadGeneration += 1
 	local generation = self.LoadGeneration
-	-- Timing, unconditionally: a dragging profile switch is the thing the user actually feels, and
-	-- gating this behind the trace flag would leave the one measurement that matters out of every
-	-- ordinary report. Two clock reads and a longer closing line.
-	local loadClock = os.clock()
-	local loadYields = buildyields
-	local moduleClock = loadClock
 	-- Nothing may write to disk while a load is in progress: it would serialise a config that is
 	-- half the old profile and half the new one. Restored at the end.
 	self.Loaded = false
-	trace('Load start profile='..tostring(profile or self.Profile)..' modules='..tostring(#self.ModuleOrder)..' heap='..heapKB()..'KB')
 	local guiData = {Categories = {}}
 	local oldProfile = self.Profile
 	local canSave = true
 	local toggleCount = 0
 
 	if isfile('pistonware/profiles/'..game.GameId..'.gui.txt') then
-		trace('Load reading gui.txt')
 		guiData = loadJson('pistonware/profiles/'..game.GameId..'.gui.txt')
-		trace('Load gui.txt decoded')
 		if not guiData then
 			guiData = {Categories = {}}
 			self:CreateNotification('Vape', 'Failed to load GUI settings.', 10, 'alert')
@@ -1228,24 +1102,18 @@ function vape:Load(skipgui, profile)
 			for name, data in guiData.Categories do
 				local category = self.Categories[name]
 				if category then
-					trace('Load gui category '..tostring(name), true)
 					category:Load(data)
 				end
 			end
 		end
-		trace('Load gui categories done')
 	end
 
-	trace('Load checking default profile entry')
 	if not self.Categories.Profiles:GetValue('default') then
 		self.Categories.Profiles:ChangeValue('default', true)
 	end
-	trace('Load default profile entry ok')
 
 	if isfile('pistonware/profiles/'..self.Profile..self.Place..'.txt') then
-		trace('Load reading profile file')
 		local mainData = loadJson('pistonware/profiles/'..self.Profile..self.Place..'.txt')
-		trace('Load profile decoded')
 		if not mainData then
 			mainData = {Categories = {}, Modules = {}, Legit = {}}
 			self:CreateNotification('Vape', 'Failed to load '..self.Profile..' profile.', 10, 'alert')
@@ -1262,70 +1130,20 @@ function vape:Load(skipgui, profile)
 		for name, data in mainData.Categories do
 			local category = self.Categories[name]
 			if category then
-				trace('Load category '..tostring(name), true)
 				category:Load(data)
 				yieldBuild()
 				if self.LoadGeneration ~= generation then return end
 			end
 		end
 
-		--[[
-			Heap cost per module, when tracing.
-
-			The client is dying because the Lua heap runs out, not because a particular call is
-			wrong -- the crash lands on a different line every run, which is what running out
-			looks like. Knowing WHICH modules that heap is going into is the only thing that turns
-			that into a decision, so each one is weighed as it is applied and the expensive ones
-			are named at the end.
-
-			task.spawn runs a module's function inline until its first yield, so most of what a
-			module allocates up front is captured here. Anything it allocates later, in its own
-			loop, is not -- this measures the cost of turning it on, not the cost of running it.
-		]]
-		local costs = traceDetail and {} or nil
-		local applied = 0
-		moduleClock = os.clock()
-		trace('Load categories done, applying modules, heap='..heapKB()..'KB'
-			..(loadLimit < math.huge and ' limit='..loadLimit or '')
-			..(next(skipModules) and ' skipping='..(function()
-				local names = {}
-				for skipped in skipModules do table.insert(names, skipped) end
-				return table.concat(names, ',')
-			end)() or ''))
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
-			if module and skipModules[name] then
-				trace('SKIPPED '..name, true)
-				module = nil
-			elseif module and applied >= loadLimit then
-				module = nil
-			end
 			if module then
-				applied += 1
-				-- Named before it runs, not after: if applying this module's saved state is what
-				-- kills the client, this is the last line that reaches disk.
-				trace('load '..name, true)
-				local before = costs and heapKB() or 0
 				module:Load(data)
-				if costs then
-					local delta = heapKB() - before
-					if delta > 0 then
-						table.insert(costs, {Name = name, KB = delta})
-					end
-				end
 				toggleCount += module.Enabled and 1 or 0
 				yieldBuild()
 				if self.LoadGeneration ~= generation then return end
 			end
-		end
-
-		if costs and #costs > 0 then
-			table.sort(costs, function(a, b) return a.KB > b.KB end)
-			local worst = {}
-			for index = 1, math.min(12, #costs) do
-				table.insert(worst, costs[index].Name..'='..costs[index].KB..'KB')
-			end
-			trace('heaviest modules: '..table.concat(worst, ' '), true)
 		end
 
 		for name, data in mainData.Legit do
@@ -1363,23 +1181,6 @@ function vape:Load(skipgui, profile)
 		self.Downloader = nil
 	end
 
-	--[[
-		Where the seconds went, in one line.
-
-		total is wall time; modules is the part of it spent applying saved module state, which
-		is where a switch is expected to spend nearly everything. yields is how many frames were
-		given up along the way, and total minus (yields * frametime) is the real CPU cost -- if
-		those two are far apart the apply is waiting, not working, and the yield budget is the
-		dial. See yieldBuild.
-	]]
-	trace(('Load done in %.2fs (modules %.2fs, %d yields, budget %.0fms) saving enabled=%s heap=%dKB'):format(
-		os.clock() - loadClock,
-		os.clock() - moduleClock,
-		buildyields - loadYields,
-		yieldBudget * 1000,
-		tostring(canSave),
-		heapKB()
-	))
 	self.Loaded = canSave
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
@@ -1393,8 +1194,7 @@ function vape:Load(skipgui, profile)
 
 		Flushing them put a full serialise and two file writes into the single most loaded instant
 		of the session -- the moment Load returns, sixty module functions start their loops for
-		the first time, and the client has the least headroom it will ever have. The trace showed
-		the last thing to happen before a crash being exactly that save.
+		the first time, and the client has the least headroom it will ever have.
 
 		The cost is a toggle flipped BY HAND during the second or so a load takes, which is
 		dropped instead of written. The next change to anything saves it, and losing a toggle from
@@ -1469,7 +1269,6 @@ function vape:LoadLate()
 		local module = order[index]
 		local data = module and mainData.Modules[module.Name]
 		if data then
-			trace('late '..module.Name, true)
 			pcall(module.Load, module, data)
 			applied += 1
 			yieldBuild()
@@ -1492,7 +1291,6 @@ function vape:LoadOptions(obj, data)
 end
 
 function vape:LoadGUI()
-	trace('LoadGUI start')
 	addMaid(vape)
 	gui = Instance.new('ScreenGui')
 	gui.Name = randomString()
@@ -3084,7 +2882,6 @@ function vape:LoadGUI()
 			table.remove(vape.HeldKeybinds, index)
 		end
 	end))
-	trace('LoadGUI done')
 end
 
 function vape:Remove(obj)
@@ -3185,16 +2982,8 @@ function vape:Save(newProfile)
 		return
 	end
 
-	-- Crumbs on both sides of each write. "save X" with nothing after it means the client died
-	-- INSIDE a write; "save done" means it survived the save and something later killed it. Those
-	-- are different bugs and without the closing crumb the log cannot tell them apart.
-	trace('save '..tostring(self.Profile), true)
-	local guiSuccess, guiError, guiSize = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
-	trace('save gui written '..tostring(guiSize)..'b', true)
-	local mainSuccess, mainError, mainSize = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
-	trace('save profile written '..tostring(mainSize)..'b', true)
-
-	trace('save done', true)
+	local guiSuccess, guiError = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
+	local mainSuccess, mainError = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
 
 	if guiSuccess and mainSuccess then
 		self.SaveFailed = nil
@@ -3288,16 +3077,6 @@ end
 
 function vape:EachLegitModule()
 	return orderedModules(self.Legit and self.Legit.Order)
-end
-
--- The public form of the breadcrumb writer, so main.lua and the game scripts can mark their own
--- stages in the same log. Silent unless pistonware/trace.txt exists.
-function vape:Trace(text)
-	trace(tostring(text))
-end
-
-function vape:TraceEnabled()
-	return traceDetail
 end
 
 function vape:SortCategories()
@@ -6412,27 +6191,7 @@ components = {
 			end
 		
 			vape:RequestSave()
-			--[[
-				Traced around the module's own function, not just before it.
-
-				props.Function runs on its own thread, so a breadcrumb written here only says
-				which module was STARTED -- several more can start before one of them crashes.
-				Wrapping it means the log ends with a 'run' that has no matching 'done', and
-				that module is the one that took the client down.
-
-				Only when tracing is on. Otherwise this stays the same single spawn it was.
-			]]
-			if traceDetail then
-				local enabled = self.Enabled
-				trace((enabled and 'enable ' or 'disable ')..props.Name, true)
-				task.spawn(function()
-					trace('run '..props.Name, true)
-					props.Function(enabled)
-					trace('done '..props.Name, true)
-				end)
-			else
-				task.spawn(props.Function, self.Enabled)
-			end
+			task.spawn(props.Function, self.Enabled)
 		end
 		
 		bindComponents(component, settingschildren)
@@ -6908,27 +6667,7 @@ components = {
 			end
 		
 			vape:RequestSave()
-			--[[
-				Traced around the module's own function, not just before it.
-
-				props.Function runs on its own thread, so a breadcrumb written here only says
-				which module was STARTED -- several more can start before one of them crashes.
-				Wrapping it means the log ends with a 'run' that has no matching 'done', and
-				that module is the one that took the client down.
-
-				Only when tracing is on. Otherwise this stays the same single spawn it was.
-			]]
-			if traceDetail then
-				local enabled = self.Enabled
-				trace((enabled and 'enable ' or 'disable ')..props.Name, true)
-				task.spawn(function()
-					trace('run '..props.Name, true)
-					props.Function(enabled)
-					trace('done '..props.Name, true)
-				end)
-			else
-				task.spawn(props.Function, self.Enabled)
-			end
+			task.spawn(props.Function, self.Enabled)
 		end
 		
 		bindComponents(component, modulechildren)
