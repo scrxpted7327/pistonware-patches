@@ -321,6 +321,13 @@ shared.PistonwareTraceLines = traceLog
 	Stage crumbs are unconditional -- a dozen a session, and they are what says how far the load
 	got. Per-module crumbs cost a file write each, so those are detail-only.
 ]]
+-- Lua heap in KB, for the crumbs that care how much applying a profile actually costs.
+local function heapKB()
+	local kb = 0
+	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
+	return kb
+end
+
 local function trace(text, detail)
 	if detail and not traceDetail then
 		return
@@ -1121,7 +1128,7 @@ function vape:Load(skipgui, profile)
 	-- Nothing may write to disk while a load is in progress: it would serialise a config that is
 	-- half the old profile and half the new one. Restored at the end.
 	self.Loaded = false
-	trace('Load start profile='..tostring(profile or self.Profile)..' modules='..tostring(#self.ModuleOrder))
+	trace('Load start profile='..tostring(profile or self.Profile)..' modules='..tostring(#self.ModuleOrder)..' heap='..heapKB()..'KB')
 	local guiData = {Categories = {}}
 	local oldProfile = self.Profile
 	local canSave = true
@@ -1192,7 +1199,7 @@ function vape:Load(skipgui, profile)
 			end
 		end
 
-		trace('Load categories done, applying modules')
+		trace('Load categories done, applying modules, heap='..heapKB()..'KB')
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
 			if module then
@@ -1241,7 +1248,7 @@ function vape:Load(skipgui, profile)
 		self.Downloader = nil
 	end
 
-	trace('Load done, saving enabled='..tostring(canSave))
+	trace('Load done, saving enabled='..tostring(canSave)..' heap='..heapKB()..'KB')
 	self.Loaded = canSave
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
