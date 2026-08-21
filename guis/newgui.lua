@@ -337,7 +337,16 @@ local function trace(text, detail)
 	-- Rewritten whole rather than appended: appendfile is missing on several mobile executors,
 	-- and a breadcrumb that only works on desktop is no use for a crash that only happens on
 	-- mobile. Capped so a long session cannot grow this without bound.
-	if #traceLog > 400 then
+	--[[
+		A short window, deliberately.
+
+		Every crumb rewrites the WHOLE file, so the buffer length is the cost of each write. At
+		400 lines that is a ~10KB string built and thrown away several hundred times during a
+		profile apply -- megabytes of churn at exactly the moment the heap is tightest, i.e. the
+		measurement changing what it measures. 150 still covers the whole apply of a large config
+		and costs a third as much.
+	]]
+	if #traceLog > 150 then
 		table.remove(traceLog, 1)
 	end
 	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLog, '\n'))
@@ -1199,6 +1208,20 @@ function vape:Load(skipgui, profile)
 			end
 		end
 
+		--[[
+			Heap cost per module, when tracing.
+
+			The client is dying because the Lua heap runs out, not because a particular call is
+			wrong -- the crash lands on a different line every run, which is what running out
+			looks like. Knowing WHICH modules that heap is going into is the only thing that turns
+			that into a decision, so each one is weighed as it is applied and the expensive ones
+			are named at the end.
+
+			task.spawn runs a module's function inline until its first yield, so most of what a
+			module allocates up front is captured here. Anything it allocates later, in its own
+			loop, is not -- this measures the cost of turning it on, not the cost of running it.
+		]]
+		local costs = traceDetail and {} or nil
 		trace('Load categories done, applying modules, heap='..heapKB()..'KB')
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
@@ -1206,11 +1229,27 @@ function vape:Load(skipgui, profile)
 				-- Named before it runs, not after: if applying this module's saved state is what
 				-- kills the client, this is the last line that reaches disk.
 				trace('load '..name, true)
+				local before = costs and heapKB() or 0
 				module:Load(data)
+				if costs then
+					local delta = heapKB() - before
+					if delta > 0 then
+						table.insert(costs, {Name = name, KB = delta})
+					end
+				end
 				toggleCount += module.Enabled and 1 or 0
 				yieldBuild(0.0015)
 				if self.LoadGeneration ~= generation then return end
 			end
+		end
+
+		if costs and #costs > 0 then
+			table.sort(costs, function(a, b) return a.KB > b.KB end)
+			local worst = {}
+			for index = 1, math.min(12, #costs) do
+				table.insert(worst, costs[index].Name..'='..costs[index].KB..'KB')
+			end
+			trace('heaviest modules: '..table.concat(worst, ' '), true)
 		end
 
 		for name, data in mainData.Legit do
