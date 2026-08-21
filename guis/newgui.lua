@@ -234,7 +234,10 @@ local function writeJson(path, data)
 		return false, encoded
 	end
 
-	return pcall(writefile, path, encoded)
+	local ok, err = pcall(writefile, path, encoded)
+	-- Third return is the byte count, purely so the trace can show how big the thing being
+	-- written actually is -- a profile that has grown to something absurd is worth seeing.
+	return ok, err, #encoded
 end
 
 --[[
@@ -1233,9 +1236,23 @@ function vape:Load(skipgui, profile)
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
 	self.LoadedCount = #self.ModuleOrder
-	-- A toggle made while the load was running recorded itself instead of writing a half-applied
-	-- config. Saving is open again, so put it on disk.
-	self:FlushSave()
+	--[[
+		Drop the pending save rather than flushing it, because there is nothing to write.
+
+		Applying a profile toggles every module in it, and every one of those toggles asked for a
+		save. All of them are redundant by construction: the state they would serialise is the
+		state that was just read off disk, so the write is the file being copied back onto itself.
+
+		Flushing them put a full serialise and two file writes into the single most loaded instant
+		of the session -- the moment Load returns, sixty module functions start their loops for
+		the first time, and the client has the least headroom it will ever have. The trace showed
+		the last thing to happen before a crash being exactly that save.
+
+		The cost is a toggle flipped BY HAND during the second or so a load takes, which is
+		dropped instead of written. The next change to anything saves it, and losing a toggle from
+		a one-second window is not worth what flushing it costs.
+	]]
+	self.SaveNeeded = nil
 
 	if inputService.TouchEnabled and not skipgui then
 		local button = Instance.new('TextButton')
@@ -3020,9 +3037,16 @@ function vape:Save(newProfile)
 		return
 	end
 
+	-- Crumbs on both sides of each write. "save X" with nothing after it means the client died
+	-- INSIDE a write; "save done" means it survived the save and something later killed it. Those
+	-- are different bugs and without the closing crumb the log cannot tell them apart.
 	trace('save '..tostring(self.Profile), true)
-	local guiSuccess, guiError = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
-	local mainSuccess, mainError = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
+	local guiSuccess, guiError, guiSize = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
+	trace('save gui written '..tostring(guiSize)..'b', true)
+	local mainSuccess, mainError, mainSize = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
+	trace('save profile written '..tostring(mainSize)..'b', true)
+
+	trace('save done', true)
 
 	if guiSuccess and mainSuccess then
 		self.SaveFailed = nil
