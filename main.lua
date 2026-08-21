@@ -91,6 +91,7 @@ stage('main.lua running, touch='..tostring(isTouchDevice))
 do
 	local started = os.clock()
 	local index
+	local memTrend = {}
 	-- Half a second while tracing, because two seconds could not resolve the failure it was meant
 	-- to time: the whole profile load and the save that followed it fitted inside a single tick,
 	-- so the log said "alive 28s" for an event that happened somewhere in the next two seconds.
@@ -99,7 +100,22 @@ do
 	task.spawn(function()
 		while true do
 			task.wait(interval)
-			local text = ('alive %.1fs'):format(os.clock() - started)
+			--[[
+				Lua heap size alongside the clock.
+
+				A crash whose position in the code keeps MOVING is usually not about the line it
+				lands on -- it is a resource running out, and whichever allocation happens to be
+				next is the one that dies. A number that climbs steadily and then stops says that
+				plainly, and distinguishes it from a specific call that is genuinely at fault.
+			]]
+			local mem = 0
+			pcall(function() mem = gcinfo and gcinfo() or collectgarbage('count') end)
+			-- The trend matters more than the current value, and rewriting one line in place
+			-- would throw it away every tick. Last twenty samples, in one line, so the log stays
+			-- short and still shows the shape of the curve leading up to the death.
+			table.insert(memTrend, ('%d'):format(mem))
+			if #memTrend > 20 then table.remove(memTrend, 1) end
+			local text = ('alive %.1fs mem=%dKB trend=%s'):format(os.clock() - started, mem, table.concat(memTrend, ','))
 			if index then
 				traceLines[index] = text
 				pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
