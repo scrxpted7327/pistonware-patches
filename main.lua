@@ -60,113 +60,6 @@ local function debugWarn(...)
 	end
 end
 
---[[
-	A breadcrumb file that survives a native crash, written before the GUI exists.
-
-	The GUI keeps its own (vape:Trace) but it cannot record anything that happens before it is
-	downloaded and run, and "the client died and there is no log" is exactly the case where that
-	window matters. Same file, same rule: the last line is where it got to.
-
-	Written to the root rather than under pistonware/, because reinstall.lua deletes that folder
-	and would take the evidence with it.
-]]
--- Shared with the GUI's own trace, so the two write ONE ordered log instead of each
--- overwriting the other's file. Reset here because main.lua is the start of every session,
--- including a reinject.
-shared.PistonwareTraceLines = {}
-local traceLines = shared.PistonwareTraceLines
-local function stage(text)
-	table.insert(traceLines, text)
-	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
-end
--- Lua heap in KB. gcinfo on Roblox, collectgarbage('count') as the portable fallback.
-local function heapKB()
-	local kb = 0
-	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
-	return kb
-end
-
-stage('main.lua running, touch='..tostring(isTouchDevice))
-
---[[
-	A heartbeat, so the log says WHEN it died and not only where.
-
-	Without it a crash during a long silent stretch is indistinguishable from a crash at the last
-	thing that logged. This rewrites a single line rather than appending, so it costs one small
-	file write every two seconds and the log stays readable.
-]]
-do
-	local started = os.clock()
-	local index
-	local memTrend = {}
-	-- Half-minute buckets, each keeping its lowest reading. See the comment at the sample site.
-	local memFloor = {}
-	local bucketFloor
-	local bucketEnd = os.clock() + 30
-	-- Half a second while tracing, because two seconds could not resolve the failure it was meant
-	-- to time: the whole profile load and the save that followed it fitted inside a single tick,
-	-- so the log said "alive 28s" for an event that happened somewhere in the next two seconds.
-	local traceOn = (getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace
-	local interval = traceOn and 0.5 or 2
-	task.spawn(function()
-		while true do
-			task.wait(interval)
-			--[[
-				Lua heap size alongside the clock.
-
-				A crash whose position in the code keeps MOVING is usually not about the line it
-				lands on -- it is a resource running out, and whichever allocation happens to be
-				next is the one that dies. A number that climbs steadily and then stops says that
-				plainly, and distinguishes it from a specific call that is genuinely at fault.
-			]]
-			local mem = heapKB()
-			-- The trend matters more than the current value, and rewriting one line in place
-			-- would throw it away every tick. Last ten samples, in one line, so the log stays
-			-- short and still shows the shape of the curve leading up to the death.
-			table.insert(memTrend, ('%d'):format(mem))
-			if #memTrend > 10 then table.remove(memTrend, 1) end
-
-			--[[
-				The floor, which is the only series that answers "is this leaking".
-
-				A live heap sawtooths: it climbs until the collector runs, drops, climbs again.
-				Every sample of that curve is a mix of garbage not yet collected and data that is
-				genuinely held, so a raw trend rising over ten samples proves nothing -- it may
-				simply not have reached the next collection. That misreading has already cost one
-				wrong diagnosis in this file's history.
-
-				What a leak does is raise the BOTTOM of the sawtooth: memory the collector visits
-				and cannot free, because something still references it. So the lowest reading in
-				each half-minute is kept, and those minima are reported as their own series.
-
-				Flat floors mean no leak, however alarming the peaks look. Floors climbing steadily
-				across several buckets mean something is being retained, and the slope is the rate.
-			]]
-			bucketFloor = math.min(bucketFloor or mem, mem)
-			if os.clock() >= bucketEnd then
-				table.insert(memFloor, ('%d'):format(bucketFloor))
-				if #memFloor > 10 then table.remove(memFloor, 1) end
-				bucketFloor = nil
-				bucketEnd = os.clock() + 30
-			end
-
-			local text = ('alive %.1fs mem=%dKB trend=%s floor=%s'):format(
-				os.clock() - started,
-				mem,
-				table.concat(memTrend, ','),
-				#memFloor > 0 and table.concat(memFloor, ',') or '-'
-			)
-			if index then
-				traceLines[index] = text
-				pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
-			else
-				stage(text)
-				index = #traceLines
-			end
-		end
-	end)
-end
-
 -- isfile is not the question. A zero-byte file reads back as PRESENT through every executor's
 -- real isfile, and only the fallback above treats empty as absent -- so on executors that ship
 -- one (most of them), an interrupted write leaves a truncated file that nothing ever repairs.
@@ -286,20 +179,7 @@ local function finishLoading()
 		end
 		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
 			tostring(customProfile or '<saved>'), tostring(shared.vapereload and true or false)))
-		--[[
-			There is no forcing a collection here, and the attempt that used to sit at this point was
-			a no-op dressed up as a fix.
-
-			Roblox's Luau only implements collectgarbage('count'). A bare collectgarbage() raises
-			"invalid option" -- which the pcall around it swallowed, so it reported freeing 0KB and
-			looked like proof the heap was all live data. It was proof of nothing; the call never ran.
-
-			The heap numbers below are still worth having, so the measurement stays and the pretence
-			of a fix does not.
-		]]
-		stage('applyProfile start (complete='..tostring(moduleSetComplete)..')')
 		vape:Load(nil, customProfile)
-		stage('applyProfile returned, heap='..heapKB()..'KB')
 		debugWarn('[pistonware] profile load returned')
 
 		--[[
@@ -429,32 +309,10 @@ local function finishLoading()
 			if shared.VapeSmoothBoot then
 				teleportScript = 'shared.VapeSmoothBoot = true\n'..teleportScript
 			end
-			-- Carried across for the same reason as the developer flag, and it matters more:
-			-- getgenv() and shared are both wiped by a teleport, so a trace switched on in the
-			-- lobby was off again in the match -- which is the only place worth tracing.
-			if (getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace then
-				teleportScript = 'shared.PistonwareTrace = true\n'..teleportScript
-			end
-			-- Same reason: bisecting a crash that only happens in a match is useless if the
-			-- setting that does the bisecting is wiped by the teleport into it.
+			-- getgenv() and shared are both wiped by a teleport, so a budget set in the lobby
+			-- would be gone in the match -- which is where profile switches actually happen.
 			do
 				local env = (getgenv and getgenv()) or {}
-				local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
-				if limit then
-					teleportScript = 'shared.PistonwareLoadLimit = '..limit..'\n'..teleportScript
-				end
-
-				local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
-				if type(skip) == 'table' and #skip > 0 then
-					local quoted = {}
-					for _, name in skip do
-						table.insert(quoted, string.format('%q', tostring(name)))
-					end
-					teleportScript = 'shared.PistonwareSkipModules = {'..table.concat(quoted, ',')..'}\n'..teleportScript
-				end
-
-				-- The yield budget, for the same reason again: a profile switch in a match is
-				-- exactly what this tunes, and the lobby is not where you measure it.
 				local budget = tonumber(env.PistonwareYieldBudget or shared.PistonwareYieldBudget)
 				if budget and budget > 0 then
 					teleportScript = 'shared.PistonwareYieldBudget = '..budget..'\n'..teleportScript
@@ -565,9 +423,7 @@ end
 	if not isfolder('pistonware/assets/'..ASSET_FOLDER) then
 		makefolder('pistonware/assets/'..ASSET_FOLDER)
 	end
-	stage('downloading gui')
 	vape = loadstring(downloadFile('pistonware/guis/'..GUI_FILE..'.lua'), 'gui')()
-	stage('gui chunk returned')
 	shared.vape = vape
 
 if not shared.VapeIndependent then
@@ -586,11 +442,9 @@ if not shared.VapeIndependent then
 	end
 	-- pcall'd: an error thrown while universal.lua *executes* would otherwise propagate out of
 	-- main.lua entirely, skipping the game script below and finishLoading() with it.
-	stage('universal.lua start')
 	pcall(function()
 		loadstring(downloadFile('pistonware/games/universal.lua'), 'universal')()
 	end)
-	stage('universal.lua done')
 
 	-- Started, never waited on. There is no deadline here by design: a deadline would only be a
 	-- guess at how long the payload needs, and whatever number it held would become the time
@@ -643,11 +497,9 @@ if not shared.VapeIndependent then
 		end
 
 		local started = os.clock()
-		stage('game script start: '..tostring(chunkname))
 		task.spawn(function()
 			local ok, err = pcall(fn, table.unpack(gameArgs, 1, gameArgs.n))
 			gameScriptFinished = true
-			stage('game script returned: '..tostring(chunkname))
 			-- Only for a payload slow enough that the split-load path actually engaged; a normal
 			-- game script never trips it. Keeps the real cost of protecting bedwars.lua visible
 			-- instead of guessed at.
