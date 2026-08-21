@@ -1128,7 +1128,9 @@ function vape:Load(skipgui, profile)
 	local toggleCount = 0
 
 	if isfile('pistonware/profiles/'..game.GameId..'.gui.txt') then
+		trace('Load reading gui.txt')
 		guiData = loadJson('pistonware/profiles/'..game.GameId..'.gui.txt')
+		trace('Load gui.txt decoded')
 		if not guiData then
 			guiData = {Categories = {}}
 			self:CreateNotification('Vape', 'Failed to load GUI settings.', 10, 'alert')
@@ -1149,18 +1151,24 @@ function vape:Load(skipgui, profile)
 			for name, data in guiData.Categories do
 				local category = self.Categories[name]
 				if category then
+					trace('Load gui category '..tostring(name), true)
 					category:Load(data)
 				end
 			end
 		end
+		trace('Load gui categories done')
 	end
 
+	trace('Load checking default profile entry')
 	if not self.Categories.Profiles:GetValue('default') then
 		self.Categories.Profiles:ChangeValue('default', true)
 	end
+	trace('Load default profile entry ok')
 
 	if isfile('pistonware/profiles/'..self.Profile..self.Place..'.txt') then
+		trace('Load reading profile file')
 		local mainData = loadJson('pistonware/profiles/'..self.Profile..self.Place..'.txt')
+		trace('Load profile decoded')
 		if not mainData then
 			mainData = {Categories = {}, Modules = {}, Legit = {}}
 			self:CreateNotification('Vape', 'Failed to load '..self.Profile..' profile.', 10, 'alert')
@@ -1177,12 +1185,14 @@ function vape:Load(skipgui, profile)
 		for name, data in mainData.Categories do
 			local category = self.Categories[name]
 			if category then
+				trace('Load category '..tostring(name), true)
 				category:Load(data)
 				yieldBuild(0.0015)
 				if self.LoadGeneration ~= generation then return end
 			end
 		end
 
+		trace('Load categories done, applying modules')
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
 			if module then
