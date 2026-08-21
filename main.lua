@@ -253,32 +253,19 @@ local function finishLoading()
 		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
 			tostring(customProfile or '<saved>'), tostring(shared.vapereload and true or false)))
 		--[[
-			Collect before applying, and again after.
+			There is no forcing a collection here, and the attempt that used to sit at this point was
+			a no-op dressed up as a fix.
 
-			Interpreting the protected payload allocates continuously -- the trace showed the Lua
-			heap climbing about 5MB a second while bedwars.lua ran, reaching 150MB by the time it
-			signalled completion, with the incremental collector only ever clawing back part of
-			it. Applying a profile then allocates hard in one burst on top of that peak, which is
-			why the client died at a different point in the apply on every run: it was not a bad
-			line, it was whichever allocation happened to be the one that could not be served.
+			Roblox's Luau only implements collectgarbage('count'). A bare collectgarbage() raises
+			"invalid option" -- which the pcall around it swallowed, so it reported freeing 0KB and
+			looked like proof the heap was all live data. It was proof of nothing; the call never ran.
 
-			The payload's load-time garbage is genuinely dead by this point, and a full collect
-			here hands that headroom to the burst that follows. It costs a pause measured in
-			milliseconds at a moment where nothing is on screen yet.
+			The heap numbers below are still worth having, so the measurement stays and the pretence
+			of a fix does not.
 		]]
-		local beforeGC = heapKB()
-		pcall(collectgarbage)
-		stage(('gc before apply: %dKB -> %dKB'):format(beforeGC, heapKB()))
-
 		stage('applyProfile start (complete='..tostring(moduleSetComplete)..')')
 		vape:Load(nil, customProfile)
 		stage('applyProfile returned, heap='..heapKB()..'KB')
-
-		-- And again once every module has been enabled: the apply itself churns through a lot of
-		-- short-lived tables, and leaving that sitting on the heap is what the next spike lands on.
-		local afterApply = heapKB()
-		pcall(collectgarbage)
-		stage(('gc after apply: %dKB -> %dKB'):format(afterApply, heapKB()))
 		debugWarn('[pistonware] profile load returned')
 
 		--[[
