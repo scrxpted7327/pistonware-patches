@@ -1607,8 +1607,7 @@ function vape:LoadGUI()
 				end
 			end
 		end,
-		Tooltip = 'Makes the Pistonware button invisible on mobile
-It still opens the GUI when tapped'
+		Tooltip = 'Makes the Pistonware button invisible on mobile\nIt still opens the GUI when tapped'
 	})
 	
 	vape.RainbowSpeed = guipane:CreateSlider({
