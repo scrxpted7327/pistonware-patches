@@ -14,6 +14,21 @@ local vape = {
 	-- main.lua polls this while the payload is still registering, and iterating a table another
 	-- thread is growing is the crash described on vape:Save. Reading a number is not.
 	ModuleCount = 0,
+	--[[
+		The same set of modules as vape.Modules, kept as a plain array, and the ONLY thing
+		vape:Save is allowed to walk.
+
+		pairs/next is a stateless protocol: it finds the current key's slot and returns the next
+		one. If the table rehashes between two resumptions of the walking coroutine -- which is
+		exactly what a module being registered does -- that slot no longer means what it meant,
+		and the walk either skips entries or takes the VM down with it. That is the crash.
+
+		A numeric `for i = 1, n` carries no such state. It reads t[1], t[2] ... t[n] and nothing
+		about an append invalidates an index that was already valid, so a save that overlaps
+		registration sees a prefix of the list instead of corrupting itself. Late arrivals are
+		picked up by the next save; the alternative was a crash.
+	]]
+	ModuleOrder = {},
 	Place = game.PlaceId,
 	Profile = 'default',
 	RainbowSliders = {},
@@ -185,6 +200,58 @@ local function loadJson(path)
 	end)
 
 	return success and type(data) == 'table' and data or nil
+end
+
+--[[
+	Encode and write, reporting rather than throwing.
+
+	writefile can fail for reasons that have nothing to do with the config -- a full disk, a
+	sandboxed executor, a filesystem that rejects the profile name -- and JSONEncode throws on
+	values it cannot represent (inf, NaN, a cycle) which a single misbehaving module Save can
+	introduce. Both used to propagate out of vape:Save; in the autosave loop that error was
+	swallowed and saving silently stopped working for the rest of the session.
+
+	Encoding first also means a failure to encode never truncates the file that is already on
+	disk: nothing is written unless there is something valid to write.
+]]
+local function writeJson(path, data)
+	local success, encoded = pcall(httpService.JSONEncode, httpService, data)
+	if not success then
+		return false, encoded
+	end
+
+	return pcall(writefile, path, encoded)
+end
+
+--[[
+	Walk the modules without pairs.
+
+	pairs/next is stateless: it locates the key it was handed and returns whatever sits after it.
+	If the table rehashes between two resumptions of the walking coroutine -- which is precisely
+	what registering a module does -- that lookup no longer means what it meant, and the walk
+	either skips entries or takes the VM down with it. Not a catchable error; a client crash.
+
+	This closure keeps its own integer cursor over the parallel array instead, so nothing that
+	happens to the hash table can invalidate it. A module appended mid-walk is either seen or
+	missed depending on where the cursor is, which is the correct trade: the next pass picks it
+	up, and neither outcome is a crash.
+
+	Every loop that can run while the payload is still registering uses this -- opening the GUI,
+	the colour pass, the text list's update loop, the search box, saving. Yields the name first
+	so `for name, module in` and `for _, module in` both read the same as they did over the hash.
+]]
+local function orderedModules(order)
+	local index = 0
+	order = order or {}
+
+	return function()
+		index += 1
+		local module = order[index]
+		if module then
+			return module.Name, module
+		end
+		return nil
+	end
 end
 
 local color = {}
@@ -1350,8 +1417,8 @@ function vape:LoadGUI()
 		Name = 'Allow setting keybinds',
 		Function = function(callback)
 			if callback then
-				for _, container in {vape.Modules, vape.Legit.Modules} do
-					for _, module in container do
+				for _, container in {vape.ModuleOrder, vape.Legit.Order} do
+					for _, module in orderedModules(container) do
 						for _, component in module.Options do
 							if component.Type == 'Toggle' then
 								local bind = components.Bind({
@@ -1389,8 +1456,8 @@ function vape:LoadGUI()
 					end
 				end
 			else
-				for _, container in {vape.Modules, vape.Legit.Modules} do
-					for _, module in container do
+				for _, container in {vape.ModuleOrder, vape.Legit.Order} do
+					for _, module in orderedModules(container) do
 						for _, component in module.Options do
 							if component.Bind then
 								component.Bind:Destroy()
@@ -2085,7 +2152,7 @@ function vape:LoadGUI()
 				end
 				table.clear(Labels)
 		
-				for name, module in vape.Modules do
+				for name, module in orderedModules(vape.ModuleOrder) do
 					if HideModules.Enabled and table.find(HideModulesList.ListEnabled, name) then
 						continue
 					end
@@ -2629,7 +2696,7 @@ function vape:LoadGUI()
 			window.Visible = false
 		end
 	
-		for _, module in self.Modules do
+		for _, module in orderedModules(self.ModuleOrder) do
 			if module.Bind.Mobile then
 				module.Bind.Mobile.Visible = clickgui.Visible
 			end
@@ -2722,6 +2789,17 @@ function vape:Remove(obj)
 		loopClean(component)
 		container[obj] = nil
 
+		-- Keep the save order in step with the table it mirrors. The lobby strips every Combat
+		-- and Minigames module on entry, and a stale entry left here would have vape:Save call
+		-- module:Save on a destroyed component on the next write.
+		local order = container == self.Legit.Modules and self.Legit.Order or self.ModuleOrder
+		if order then
+			local index = table.find(order, component)
+			if index then
+				table.remove(order, index)
+			end
+		end
+
 		if isModule then
 			self.ModuleCount = math.max((self.ModuleCount or 1) - 1, 0)
 			self:SortCategories()
@@ -2729,25 +2807,13 @@ function vape:Remove(obj)
 	end
 end
 
---[[
-	A plain write of the modules that exist, exactly as the old GUI did it.
-
-	A merge-with-disk version of this was tried so that saving during a partial load could not
-	delete the modules that had not registered yet. It fixed the truncation and reintroduced the
-	crash, because truncation was never the only reason not to save early:
-
-	the loops below walk self.Modules with `next`, and while the payload is still loading the
-	LuaArmor VM is INSERTING into that same table from another thread. Growing a table that is
-	being iterated is undefined in Lua -- a rehash part-way through the walk takes the VM with it,
-	which is a client crash rather than a catchable error. Snapshotting first does not help; the
-	snapshot has to walk the same live table to build itself.
-
-	There is no way to iterate a table another thread is growing. So the rule is the old one:
-	nothing here runs until the module set has stopped changing. main.lua owns that decision.
-]]
 function vape:Save(newProfile)
 	if not self.Loaded then
 		return
+	end
+
+	if self.ThreadFix then
+		setthreadidentity(8)
 	end
 
 	local guiData = {
@@ -2763,49 +2829,95 @@ function vape:Save(newProfile)
 		v = 1
 	}
 
-	for name, category in self.Categories do
-		category:Save((category.Type == 'Overlay' and mainData or guiData).Categories)
-	end
+	local success, err = pcall(function()
+		for _, category in self.Categories do
+			category:Save((category.Type == 'Overlay' and mainData or guiData).Categories)
+		end
 
-	for _, module in self.Modules do
-		module:Save(mainData.Modules)
-	end
+		-- Length captured up front: if the payload appends while this runs, the new module is
+		-- simply not in this write, and the save that follows its registration picks it up.
+		local order = self.ModuleOrder
+		for index = 1, #order do
+			local module = order[index]
+			if module then
+				module:Save(mainData.Modules)
+			end
+		end
 
-	for _, module in self.Legit.Modules do
-		module:Save(mainData.Legit)
-	end
-
-	writefile('pistonware/profiles/'..game.GameId..'.gui.txt', httpService:JSONEncode(guiData))
-	writefile('pistonware/profiles/'..self.Profile..self.Place..'.txt', httpService:JSONEncode(mainData))
-end
-
---[[
-	Write the profile now, because something actually changed.
-
-	Toggling a module used to sit in memory until the next autosave tick, so anything you changed
-	in the last few seconds before a crash, a teleport or an executor kill was simply gone.
-
-	Two guards, and both are load-bearing:
-
-	SaveReady is false until main.lua decides the module list has stopped changing. Saving before
-	that walks vape.Modules while the payload is still inserting into it, which is the crash.
-	Applying a profile also toggles modules, and that happens before SaveReady is set, so a load
-	cannot trigger a save of itself.
-
-	The delay coalesces. Switching profile toggles every module in the config, and a save per
-	toggle would be a hundred full serialisations back to back -- exactly the pile-up that made
-	the teleport path fall over. One pending write, however many changes arrive.
-]]
-function vape:RequestSave()
-	if not (self.SaveReady and self.Loaded) then return end
-	if self.SaveThread then return end
-
-	self.SaveThread = task.delay(0.4, function()
-		self.SaveThread = nil
-		if self.SaveReady and self.Loaded then
-			pcall(function() self:Save() end)
+		local legit = self.Legit.Order
+		for index = 1, (legit and #legit or 0) do
+			local module = legit[index]
+			if module then
+				module:Save(mainData.Legit)
+			end
 		end
 	end)
+
+	if not success then
+		if not self.SaveFailed then
+			self.SaveFailed = true
+			self:CreateNotification('Pistonware', 'Failed to save your config, '..tostring(err), 10, 'alert')
+		end
+
+		return
+	end
+
+	local guiSuccess, guiError = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
+	local mainSuccess, mainError = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
+
+	if guiSuccess and mainSuccess then
+		self.SaveFailed = nil
+	elseif not self.SaveFailed then
+		self.SaveFailed = true
+		self:CreateNotification('Pistonware', 'Failed to save your config, '..tostring(guiError or mainError), 10, 'alert')
+	end
+end
+
+function vape:RequestSave()
+	if not (self.SaveReady and self.Loaded) then
+		self.SaveNeeded = true
+		return
+	end
+
+	self.SaveTime = os.clock() + 0.4
+
+	if self.SaveQueued then
+		return
+	end
+
+	self.SaveQueued = true
+
+	local function flush()
+		if vape.ThreadFix then
+			setthreadidentity(8)
+		end
+
+		local remaining = self.SaveTime - os.clock()
+		if remaining > 0 then
+			task.delay(remaining, flush)
+			return
+		end
+
+		self.SaveQueued = nil
+		self.SaveNeeded = nil
+
+		if self.SaveReady and self.Loaded then
+			self:Save()
+		end
+	end
+
+	task.delay(0.4, flush)
+end
+
+-- Called by main.lua the instant saving becomes safe, so a toggle made while the payload was
+-- still loading is written then rather than waiting for a backstop tick.
+function vape:FlushSave()
+	if not self.SaveNeeded then
+		return
+	end
+
+	self.SaveNeeded = nil
+	self:RequestSave()
 end
 
 function vape:SaveOptions(obj)
@@ -2831,9 +2943,25 @@ end
 	Lifted out of module creation so removal can call it too. vape:Remove used to leave the
 	surviving modules holding the indexes they had when the removed one was still there.
 ]]
+--[[
+	The public form of orderedModules, for game scripts.
+
+	Anything outside this file that walks vape.Modules with pairs has the same hazard the GUI
+	just had -- Panic, the chat 'toggle all' command and AutoConfig all iterate every module, and
+	all three can be triggered while a payload is still registering. `for name, module in
+	vape:EachModule() do` is a drop-in replacement for `for name, module in vape.Modules do`.
+]]
+function vape:EachModule()
+	return orderedModules(self.ModuleOrder)
+end
+
+function vape:EachLegitModule()
+	return orderedModules(self.Legit and self.Legit.Order)
+end
+
 function vape:SortCategories()
 	local sorting = {}
-	for _, module in self.Modules do
+	for _, module in orderedModules(self.ModuleOrder) do
 		sorting[module.Category] = sorting[module.Category] or {}
 		table.insert(sorting[module.Category], module.Name)
 	end
@@ -2852,13 +2980,13 @@ function vape:Uninject()
 	self:Save()
 	self.Loaded = nil
 
-	for _, module in self.Modules do
+	for _, module in orderedModules(self.ModuleOrder) do
 		if module.Enabled then
 			module:Toggle()
 		end
 	end
 
-	for _, module in self.Legit.Modules do
+	for _, module in orderedModules(self.Legit.Order) do
 		if module.Enabled then
 			module:Toggle()
 		end
@@ -2915,7 +3043,7 @@ function vape:UpdateGUI(hue, sat, val, default)
 		component:Color(hue, sat, val, isRainbow)
 	end
 
-	for _, component in vape.Modules do
+	for _, component in orderedModules(vape.ModuleOrder) do
 		component:Color(hue, sat, val, isRainbow)
 	end
 
@@ -2934,7 +3062,7 @@ function vape:UpdateGUI(hue, sat, val, default)
 	end
 
 	if vape.Legit.Window.Visible then
-		for _, component in vape.Legit.Modules do
+		for _, component in orderedModules(vape.Legit.Order) do
 			component:Color(hue, sat, val, isRainbow)
 		end
 	end
@@ -3507,7 +3635,7 @@ components = {
 				end
 			end
 		
-			for _, module in vape.Modules do
+			for _, module in orderedModules(vape.ModuleOrder) do
 				module.Object.Visible = module.Visible
 				module.Object.Text = string.rep(' ', 12)..module.Name
 				module.Edit.Visible = false
@@ -3532,7 +3660,7 @@ components = {
 				end
 			end
 		
-			for _, module in vape.Modules do
+			for _, module in orderedModules(vape.ModuleOrder) do
 				module.Object.Visible = true
 				module.Object.Text = string.rep(' ', 50)..module.Name
 				module.Edit.Visible = true
@@ -6033,9 +6161,12 @@ components = {
 		end)
 		
 		api.Modules[props.Name] = component
-		
+		-- Same reasoning as vape.ModuleOrder: vape:Save walks the array, never the hash.
+		api.Order = api.Order or {}
+		table.insert(api.Order, component)
+
 		local sorting = {}
-		for _, mod in api.Modules do
+		for _, mod in orderedModules(api.Order) do
 			table.insert(sorting, mod.Name)
 		end
 		table.sort(sorting)
@@ -6048,7 +6179,11 @@ components = {
 	end,
 	LegitWindow = function(props, children, api)
 		local component = {
-			Modules = {}
+			Modules = {},
+			-- The array half of Modules, for the same reason as vape.ModuleOrder. Declared here
+			-- rather than on first insert so a walk that happens before any legit module exists
+			-- iterates an empty list instead of nil.
+			Order = {}
 		}
 		
 		local window = Instance.new('Frame')
@@ -6134,7 +6269,7 @@ components = {
 		end
 		
 		local function visibleCheck()
-			for _, module in component.Modules do
+			for _, module in orderedModules(component.Order) do
 				if module.Children then
 					local visible = clickgui.Visible
 					--[[for _, v2 in self.Windows do
@@ -6147,7 +6282,7 @@ components = {
 		end
 		
 		box:GetPropertyChangedSignal('Text'):Connect(function()
-			for name, module in component.Modules do
+			for name, module in orderedModules(component.Order) do
 				module.Object.Visible = (box.Text == '' or name:lower():find(box.Text:lower())) and true or false
 			end
 		end)
@@ -6510,7 +6645,7 @@ components = {
 					clickgui.Visible = false
 					tooltip.Visible = false
 					vape:BlurCheck()
-					for _, module in vape.Modules do
+					for _, module in orderedModules(vape.ModuleOrder) do
 						if module.Bind.Mobile then
 							module.Bind.Mobile.Visible = true
 						end
@@ -6527,7 +6662,7 @@ components = {
 							clickgui.Visible = true
 							vape:BlurCheck()
 		
-							for _, module in vape.Modules do
+							for _, module in orderedModules(vape.ModuleOrder) do
 								if module.Bind.Mobile then
 									module.Bind.Mobile.Visible = false
 								end
@@ -6546,6 +6681,7 @@ components = {
 		
 		vape.Modules[props.Name] = component
 		vape.ModuleCount += 1
+		table.insert(vape.ModuleOrder, component)
 		vape:SortCategories()
 		
 		return component
@@ -7030,7 +7166,7 @@ components = {
 		
 			if box.Text == '' then return end
 		
-			for name, module in vape.Modules do
+			for name, module in orderedModules(vape.ModuleOrder) do
 				if name:lower():find(box.Text:lower()) then
 					local button = module.Object:Clone()
 					button.Bind:Destroy()
