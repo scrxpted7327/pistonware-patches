@@ -254,6 +254,38 @@ local function orderedModules(order)
 	end
 end
 
+--[[
+	Breadcrumbs that survive a native crash.
+
+	A crash that takes the client's process down leaves nothing behind -- no error, no console,
+	no traceback, and anything held in memory goes with it. The only record that outlives it is
+	one already on disk, so this writes the name of what is about to run BEFORE running it. After
+	a crash the last line in the file is the thing that did it.
+
+	Off unless pistonware/trace.txt exists, because it is a file write per module and nobody who
+	is not chasing a crash should pay for that.
+]]
+local traceEnabled = false
+local traceLog = {}
+pcall(function()
+	traceEnabled = isfile and isfile('pistonware/trace.txt') or false
+end)
+
+local function trace(text)
+	if not traceEnabled then
+		return
+	end
+
+	table.insert(traceLog, text)
+	-- Rewritten whole rather than appended: appendfile is missing on several mobile executors,
+	-- and a breadcrumb that only works on desktop is no use for a crash that only happens on
+	-- mobile. Capped so a long session cannot grow this without bound.
+	if #traceLog > 400 then
+		table.remove(traceLog, 1)
+	end
+	pcall(writefile, 'pistonware/trace.log.txt', table.concat(traceLog, '\n'))
+end
+
 local color = {}
 local uipallet = {}
 do
@@ -1085,6 +1117,9 @@ function vape:Load(skipgui, profile)
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
 			if module then
+				-- Named before it runs, not after: if applying this module's saved state is what
+				-- kills the client, this is the last line that reaches disk.
+				trace('load '..name)
 				module:Load(data)
 				toggleCount += module.Enabled and 1 or 0
 			end
@@ -2862,6 +2897,7 @@ function vape:Save(newProfile)
 		return
 	end
 
+	trace('save '..tostring(self.Profile))
 	local guiSuccess, guiError = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
 	local mainSuccess, mainError = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
 
@@ -2957,6 +2993,16 @@ end
 
 function vape:EachLegitModule()
 	return orderedModules(self.Legit and self.Legit.Order)
+end
+
+-- The public form of the breadcrumb writer, so main.lua and the game scripts can mark their own
+-- stages in the same log. Silent unless pistonware/trace.txt exists.
+function vape:Trace(text)
+	trace(tostring(text))
+end
+
+function vape:TraceEnabled()
+	return traceEnabled
 end
 
 function vape:SortCategories()
@@ -6058,7 +6104,27 @@ components = {
 			end
 		
 			vape:RequestSave()
-			task.spawn(props.Function, self.Enabled)
+			--[[
+				Traced around the module's own function, not just before it.
+
+				props.Function runs on its own thread, so a breadcrumb written here only says
+				which module was STARTED -- several more can start before one of them crashes.
+				Wrapping it means the log ends with a 'run' that has no matching 'done', and
+				that module is the one that took the client down.
+
+				Only when tracing is on. Otherwise this stays the same single spawn it was.
+			]]
+			if traceEnabled then
+				local enabled = self.Enabled
+				trace((enabled and 'enable ' or 'disable ')..props.Name)
+				task.spawn(function()
+					trace('run '..props.Name)
+					props.Function(enabled)
+					trace('done '..props.Name)
+				end)
+			else
+				task.spawn(props.Function, self.Enabled)
+			end
 		end
 		
 		bindComponents(component, settingschildren)
@@ -6534,7 +6600,27 @@ components = {
 			end
 		
 			vape:RequestSave()
-			task.spawn(props.Function, self.Enabled)
+			--[[
+				Traced around the module's own function, not just before it.
+
+				props.Function runs on its own thread, so a breadcrumb written here only says
+				which module was STARTED -- several more can start before one of them crashes.
+				Wrapping it means the log ends with a 'run' that has no matching 'done', and
+				that module is the one that took the client down.
+
+				Only when tracing is on. Otherwise this stays the same single spawn it was.
+			]]
+			if traceEnabled then
+				local enabled = self.Enabled
+				trace((enabled and 'enable ' or 'disable ')..props.Name)
+				task.spawn(function()
+					trace('run '..props.Name)
+					props.Function(enabled)
+					trace('done '..props.Name)
+				end)
+			else
+				task.spawn(props.Function, self.Enabled)
+			end
 		end
 		
 		bindComponents(component, modulechildren)
