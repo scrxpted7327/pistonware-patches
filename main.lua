@@ -72,13 +72,29 @@ local traceLines = shared.PistonwareTraceLines
 local function stage(text)
 	if not traceOn then return end
 	table.insert(traceLines, text)
-	if #traceLines > 200 then table.remove(traceLines, 1) end
+	if #traceLines > 400 then table.remove(traceLines, 1) end
 	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
 end
 local function heapKB()
 	local kb = 0
 	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
 	return kb
+end
+
+--[[
+	Whole-client memory, which is what the OS kills on -- gcinfo above sees only the Lua heap.
+
+	Measured at each stage of the load rather than once, because the question the crash log
+	could not answer was how much of the client's total is the GAME and how much is this script.
+	A run reports its own share by subtraction: whatever the first line says is the client with
+	pistonware not yet loaded.
+]]
+local statsService
+pcall(function() statsService = cloneref(game:GetService('Stats')) end)
+local function clientMB()
+	local mb = 0
+	pcall(function() mb = statsService and statsService:GetTotalMemoryUsageMb() or 0 end)
+	return math.floor(mb)
 end
 
 --[[
@@ -98,8 +114,8 @@ if traceOn then
 			local mem = heapKB()
 			table.insert(trend, ('%d'):format(mem))
 			if #trend > 15 then table.remove(trend, 1) end
-			local text = ('alive %.1fs mem=%dKB trend=%s'):format(
-				os.clock() - started, mem, table.concat(trend, ','))
+			local text = ('alive %.1fs client=%dMB lua=%dKB trend=%s'):format(
+				os.clock() - started, clientMB(), mem, table.concat(trend, ','))
 			if index then
 				traceLines[index] = text
 				pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
@@ -111,7 +127,7 @@ if traceOn then
 	end)
 end
 
-stage('main.lua running')
+stage('main.lua running, client='..clientMB()..'MB (pistonware not loaded yet)')
 
 -- isfile is not the question. A zero-byte file reads back as PRESENT through every executor's
 -- real isfile, and only the fallback above treats empty as absent -- so on executors that ship
@@ -498,9 +514,9 @@ end
 	if not isfolder('pistonware/assets/'..ASSET_FOLDER) then
 		makefolder('pistonware/assets/'..ASSET_FOLDER)
 	end
-	stage('downloading gui')
+	stage('downloading gui, client='..clientMB()..'MB')
 	vape = loadstring(downloadFile('pistonware/guis/'..GUI_FILE..'.lua'), 'gui')()
-	stage('gui chunk returned')
+	stage('gui chunk returned, client='..clientMB()..'MB')
 	shared.vape = vape
 
 if not shared.VapeIndependent then
@@ -519,11 +535,11 @@ if not shared.VapeIndependent then
 	end
 	-- pcall'd: an error thrown while universal.lua *executes* would otherwise propagate out of
 	-- main.lua entirely, skipping the game script below and finishLoading() with it.
-	stage('universal.lua start')
+	stage('universal.lua start, client='..clientMB()..'MB')
 	pcall(function()
 		loadstring(downloadFile('pistonware/games/universal.lua'), 'universal')()
 	end)
-	stage('universal.lua done')
+	stage('universal.lua done, client='..clientMB()..'MB')
 
 	-- Started, never waited on. There is no deadline here by design: a deadline would only be a
 	-- guess at how long the payload needs, and whatever number it held would become the time
