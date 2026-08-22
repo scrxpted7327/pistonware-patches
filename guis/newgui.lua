@@ -238,6 +238,50 @@ local function yieldBuild(budget)
 	end
 end
 
+--[[
+	A paced starter for modules switched on by a profile apply.
+
+	task.spawn resumes its function inline, on the calling thread, until that function first
+	yields -- so applying a profile used to run each module's whole setup synchronously inside
+	the apply loop, sixty of them nose to tail with no yield reachable in between.
+
+	task.defer fixes only half of that. It gets the setup out of the loop, but every deferred
+	function then runs back to back in the same resumption cycle: the same unbroken block of
+	work, moved rather than broken up.
+
+	So they go through a queue that yields between them, and modules come online over a second
+	or two instead of all in one instant. This is what the per-module trace was doing by
+	accident -- its file write yielded between one module's startup and the next -- which is why
+	tracing stopped the crash and removing it brought the crash back.
+
+	One drain thread at a time, and it exits when the queue empties, so nothing is left running
+	between applies.
+]]
+local startQueue = {}
+local startThread
+local function queueStart(callback)
+	table.insert(startQueue, callback)
+
+	if startThread then
+		return
+	end
+
+	startThread = task.spawn(function()
+		while #startQueue > 0 do
+			-- Yield BEFORE the first job, not after it. task.spawn resumes this thread inline on
+			-- the caller, so taking a job first would run one module synchronously inside the
+			-- apply loop -- the exact thing being fixed, just once instead of sixty times.
+			task.wait()
+			local job = table.remove(startQueue, 1)
+			-- spawn, not a direct call: a module that errors on startup must not take the drain
+			-- thread down with it and strand every module still queued behind it.
+			task.spawn(job, true)
+		end
+
+		startThread = nil
+	end)
+end
+
 local function loadJson(path)
 	local success, data = pcall(function()
 		return httpService:JSONDecode(readfile(path))
@@ -6756,18 +6800,17 @@ components = {
 				currently running. So the apply looked like it was yielding while in fact it was
 				executing every enabled module nose to tail without ever reaching a yield.
 
-				task.defer schedules for the end of the current resumption cycle instead. The
-				apply loop keeps its own yields and each module starts on its own thread, which
-				is what the removed per-module trace was accidentally doing -- its file write
-				yielded before props.Function was reached, and that is why tracing "fixed" the
-				crash and removing it brought it back.
+				queueStart hands them to a drain thread that yields between one module and the
+				next, so the apply loop keeps its own yields AND the startups are spread out
+				rather than arriving in one block. See queueStart for why deferring alone is not
+				enough.
 
 				Only while applying, and only for enable. Uninject tears modules down by toggling
 				them off and then destroys the GUI and empties the vape table, so a deferred
 				disable would run against a table loopClean has already cleared.
 			]]
 			if vape.Applying and self.Enabled then
-				task.defer(props.Function, true)
+				queueStart(props.Function)
 			else
 				task.spawn(props.Function, self.Enabled)
 			end
@@ -7253,7 +7296,7 @@ components = {
 			-- Deferred while applying, for the reason set out at the other module toggle: with
 			-- task.spawn the module's setup runs inline inside the apply loop.
 			if vape.Applying and self.Enabled then
-				task.defer(props.Function, true)
+				queueStart(props.Function)
 			else
 				task.spawn(props.Function, self.Enabled)
 			end
