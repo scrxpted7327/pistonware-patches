@@ -5464,16 +5464,32 @@ run(function()
 							stuff[v.Index] = not table.find(Hide.ListEnabled, i) and i..': '..v.Function(v.Value) or false
 						end
 	
+						--[[
+							Rebuilt, not compacted in place.
+
+							This used to walk `stuff` with next() and table.remove ENTRIES OUT OF IT
+							mid-traversal, then resume next() from the key before the one it had just
+							deleted. Removing a key other than the one next() is currently sitting on is
+							undefined in Lua, and table.remove reindexes the array part -- so the walk
+							could skip entries, revisit them, or take the VM down with it. That is the
+							same hazard that made vape:Save crash while the payload was registering, and
+							it is not catchable: it is a client crash, not an error.
+
+							It only fires when the blacklist has entries, which is why a default install
+							never sees it and a configured one dies a few seconds after the overlay is
+							switched on.
+
+							One pass into a fresh table costs nothing and cannot be undefined.
+						]]
 						if #Hide.ListEnabled > 0 then
-							local key, val
-							repeat
-								local oldkey = key
-								key, val = next(stuff, key)
-								if val == false then
-									table.remove(stuff, key)
-									key = oldkey
+							local kept = {}
+							for index = 1, #stuff do
+								local entry = stuff[index]
+								if entry ~= false and entry ~= nil then
+									table.insert(kept, entry)
 								end
-							until not key
+							end
+							stuff = kept
 						end
 	
 						if Custom.Enabled then
