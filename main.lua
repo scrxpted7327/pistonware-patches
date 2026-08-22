@@ -400,6 +400,10 @@ local function finishLoading()
 					teleportScript = 'shared.PistonwareLoadLimit = '..limit..'\n'..teleportScript
 				end
 
+				if (env.PistonwareIgnoreOptions or shared.PistonwareIgnoreOptions) then
+					teleportScript = 'shared.PistonwareIgnoreOptions = true\n'..teleportScript
+				end
+
 				if (env.PistonwareSkipGameScript or shared.PistonwareSkipGameScript) then
 					teleportScript = 'shared.PistonwareSkipGameScript = true\n'..teleportScript
 				end
@@ -659,6 +663,22 @@ if not shared.VapeIndependent then
 	if skipGameScript then
 		stage('game script SKIPPED by request, client='..clientMB()..'MB')
 		warn('[pistonware] PistonwareSkipGameScript is set -- no game modules will load. Unset it to play normally.')
+		--[[
+			And saving is off for the whole session, which the first version of this flag got
+			wrong and cost a config to prove.
+
+			vape:Save serialises the module set AS IT STANDS. With the game script withheld that
+			set is deliberately incomplete, so a save writes a profile missing every game module
+			-- and vape:Load's "no file yet" branch calls Save directly, so it does not even need
+			a toggle to trigger. A measurement run must not be able to touch what is on disk.
+
+			This is the same hazard the teleport handler below already guards with profileApplied;
+			the flag walked straight into it.
+		]]
+		pcall(function()
+			vape.Save = function() end
+			vape.SaveNeeded = nil
+		end)
 	end
 
 	local gamePath = 'pistonware/games/'..game.PlaceId..'.lua'
