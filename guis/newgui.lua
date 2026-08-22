@@ -1102,6 +1102,10 @@ function vape:Load(skipgui, profile)
 	-- Nothing may write to disk while a load is in progress: it would serialise a config that is
 	-- half the old profile and half the new one. Restored at the end.
 	self.Loaded = false
+	-- Read by the module toggles, which defer a module's function instead of running it inline
+	-- while this is set. Deliberately NOT cleared on the generation-abort returns below: those
+	-- happen because a newer load took over, and that load owns the flag until it finishes.
+	self.Applying = true
 	local guiData = {Categories = {}}
 	local oldProfile = self.Profile
 	local canSave = true
@@ -1209,6 +1213,7 @@ function vape:Load(skipgui, profile)
 	end
 
 	self.Loaded = canSave
+	self.Applying = nil
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
 	self.LoadedCount = #self.ModuleOrder
@@ -1291,6 +1296,7 @@ function vape:LoadLate()
 
 	self.LoadGeneration += 1
 	local generation = self.LoadGeneration
+	self.Applying = true
 	local order = self.ModuleOrder
 	local first = (self.LoadedCount or 0) + 1
 	local applied = 0
@@ -1307,6 +1313,7 @@ function vape:LoadLate()
 	end
 
 	self.LoadedCount = #order
+	self.Applying = nil
 	return applied
 end
 
@@ -6736,7 +6743,34 @@ components = {
 			end
 		
 			vape:RequestSave()
-			task.spawn(props.Function, self.Enabled)
+			--[[
+				Deferred rather than spawned while a profile is being applied.
+
+				task.spawn runs its function INLINE, on the calling thread, until that function
+				first yields. So during an apply, module:Load switching a module on ran the whole
+				front of that module's setup -- its connections, its ESP objects, its walk of the
+				entity list -- synchronously inside the apply loop, before Load's next line.
+
+				Sixty modules in, that is one unbroken block of work, and yieldBuild cannot break
+				it up: the budget is only checked BETWEEN modules, never inside the one that is
+				currently running. So the apply looked like it was yielding while in fact it was
+				executing every enabled module nose to tail without ever reaching a yield.
+
+				task.defer schedules for the end of the current resumption cycle instead. The
+				apply loop keeps its own yields and each module starts on its own thread, which
+				is what the removed per-module trace was accidentally doing -- its file write
+				yielded before props.Function was reached, and that is why tracing "fixed" the
+				crash and removing it brought it back.
+
+				Only while applying, and only for enable. Uninject tears modules down by toggling
+				them off and then destroys the GUI and empties the vape table, so a deferred
+				disable would run against a table loopClean has already cleared.
+			]]
+			if vape.Applying and self.Enabled then
+				task.defer(props.Function, true)
+			else
+				task.spawn(props.Function, self.Enabled)
+			end
 		end
 		
 		bindComponents(component, settingschildren)
@@ -7216,7 +7250,13 @@ components = {
 			end
 		
 			vape:RequestSave()
-			task.spawn(props.Function, self.Enabled)
+			-- Deferred while applying, for the reason set out at the other module toggle: with
+			-- task.spawn the module's setup runs inline inside the apply loop.
+			if vape.Applying and self.Enabled then
+				task.defer(props.Function, true)
+			else
+				task.spawn(props.Function, self.Enabled)
+			end
 		end
 		
 		bindComponents(component, modulechildren)
