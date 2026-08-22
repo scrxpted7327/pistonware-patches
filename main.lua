@@ -53,6 +53,66 @@ local function debugWarn(...)
 	end
 end
 
+--[[
+	Breadcrumbs, off unless asked for:
+
+		getgenv().PistonwareTrace = true
+
+	The GUI keeps the same log (vape:Trace writes into this very table) but cannot record
+	anything before it is downloaded and run, and "the client died and there is no log" is
+	exactly the case where that window matters. Root of the filesystem, because reinstall.lua
+	deletes the pistonware folder and would take the evidence with it.
+]]
+local traceOn = false
+pcall(function()
+	traceOn = (((getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace) and true) or false
+end)
+shared.PistonwareTraceLines = {}
+local traceLines = shared.PistonwareTraceLines
+local function stage(text)
+	if not traceOn then return end
+	table.insert(traceLines, text)
+	if #traceLines > 200 then table.remove(traceLines, 1) end
+	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
+end
+local function heapKB()
+	local kb = 0
+	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
+	return kb
+end
+
+--[[
+	A heartbeat, so the log says WHEN it died and not only where.
+
+	Without it, a crash during a long silent stretch is indistinguishable from a crash at the
+	last thing that logged. Rewrites one line in place rather than appending, so a long session
+	costs one small write every two seconds and the log stays readable.
+]]
+if traceOn then
+	local started = os.clock()
+	local index
+	local trend = {}
+	task.spawn(function()
+		while true do
+			task.wait(2)
+			local mem = heapKB()
+			table.insert(trend, ('%d'):format(mem))
+			if #trend > 15 then table.remove(trend, 1) end
+			local text = ('alive %.1fs mem=%dKB trend=%s'):format(
+				os.clock() - started, mem, table.concat(trend, ','))
+			if index then
+				traceLines[index] = text
+				pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
+			else
+				stage(text)
+				index = #traceLines
+			end
+		end
+	end)
+end
+
+stage('main.lua running')
+
 -- isfile is not the question. A zero-byte file reads back as PRESENT through every executor's
 -- real isfile, and only the fallback above treats empty as absent -- so on executors that ship
 -- one (most of them), an interrupted write leaves a truncated file that nothing ever repairs.
@@ -172,7 +232,9 @@ local function finishLoading()
 		end
 		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
 			tostring(customProfile or '<saved>'), tostring(shared.vapereload and true or false)))
+		stage('applyProfile start, heap='..heapKB()..'KB')
 		vape:Load(nil, customProfile)
+		stage('applyProfile returned, heap='..heapKB()..'KB')
 		debugWarn('[pistonware] profile load returned')
 
 		--[[
@@ -302,8 +364,12 @@ local function finishLoading()
 			if shared.VapeSmoothBoot then
 				teleportScript = 'shared.VapeSmoothBoot = true\n'..teleportScript
 			end
-			-- getgenv() and shared are both wiped by a teleport, so a budget set in the lobby
-			-- would be gone in the match -- which is where profile switches actually happen.
+			-- getgenv() and shared are both wiped by a teleport, so a flag set in the lobby would
+			-- be gone in the match -- which is the only place worth tracing, and where profile
+			-- switches actually happen.
+			if traceOn then
+				teleportScript = 'shared.PistonwareTrace = true\n'..teleportScript
+			end
 			do
 				local env = (getgenv and getgenv()) or {}
 				local budget = tonumber(env.PistonwareYieldBudget or shared.PistonwareYieldBudget)
@@ -416,7 +482,9 @@ end
 	if not isfolder('pistonware/assets/'..ASSET_FOLDER) then
 		makefolder('pistonware/assets/'..ASSET_FOLDER)
 	end
+	stage('downloading gui')
 	vape = loadstring(downloadFile('pistonware/guis/'..GUI_FILE..'.lua'), 'gui')()
+	stage('gui chunk returned')
 	shared.vape = vape
 
 if not shared.VapeIndependent then
@@ -435,9 +503,11 @@ if not shared.VapeIndependent then
 	end
 	-- pcall'd: an error thrown while universal.lua *executes* would otherwise propagate out of
 	-- main.lua entirely, skipping the game script below and finishLoading() with it.
+	stage('universal.lua start')
 	pcall(function()
 		loadstring(downloadFile('pistonware/games/universal.lua'), 'universal')()
 	end)
+	stage('universal.lua done')
 
 	-- Started, never waited on. There is no deadline here by design: a deadline would only be a
 	-- guess at how long the payload needs, and whatever number it held would become the time
