@@ -444,12 +444,21 @@ local function watchSettled()
 					without waiting for a crash.
 				]]
 				local client, lua = clientMB(), heapKB() / 1024
-				local span = math.max(elapsed, 0.001)
-				trace(('settled %.0fs client=%dMB (%+.1f/s) lua=%.0fMB (%+.1f/s) dt=%s'):format(
-					elapsed,
-					client, (client - baseClient) / span,
-					lua, (lua - baseLua) / span,
-					table.concat(deltas, ',')))
+				--[[
+					No rate until a second has passed.
+
+					Dividing by a fraction of a second turns ordinary sampling jitter into a
+					headline number -- the first sample of the previous run read "+281.7/s" off
+					seventy milliseconds of noise, which is exactly the kind of figure a
+					bisection would be judged on and get wrong.
+				]]
+				local rate = ''
+				if elapsed >= 1 then
+					rate = (' client%+.1f/s lua%+.1f/s'):format(
+						(client - baseClient) / elapsed, (lua - baseLua) / elapsed)
+				end
+				trace(('settled %.1fs client=%dMB lua=%.0fMB%s dt=%s'):format(
+					elapsed, client, lua, rate, table.concat(deltas, ',')))
 			end
 		end
 
