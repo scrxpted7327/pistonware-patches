@@ -400,6 +400,10 @@ local function finishLoading()
 					teleportScript = 'shared.PistonwareLoadLimit = '..limit..'\n'..teleportScript
 				end
 
+				if (env.PistonwareSkipGameScript or shared.PistonwareSkipGameScript) then
+					teleportScript = 'shared.PistonwareSkipGameScript = true\n'..teleportScript
+				end
+
 				local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
 				if type(skip) == 'table' and #skip > 0 then
 					local quoted = {}
@@ -597,10 +601,30 @@ if not shared.VapeIndependent then
 		-- was spending them. For BedWars this brackets the LuaArmor payload specifically.
 		local beforeClient = clientMB()
 		stage(chunkname..' start, client='..beforeClient..'MB')
+		--[[
+			Waits for the SIGNAL, not for the call to return.
+
+			The first version of this crumb sat after pcall(fn, ...) and could never fire for
+			BedWars: the LuaArmor payload keeps the thread it was invoked on and never returns,
+			which is the reason waitForModules exists a few dozen lines up. So the one file whose
+			cost needed measuring was the one file that could not be measured.
+
+			Either signal closes it, and a deadline stops the watcher parking forever on a
+			payload that never arrives.
+		]]
+		task.spawn(function()
+			local deadline = os.clock() + 180
+			repeat
+				task.wait(0.25)
+			until gameScriptFinished or shared.PistonwareBedwarsLoaded or os.clock() > deadline
+
+			local now = clientMB()
+			stage(('%s registered in %.1fs, client=%dMB (%+dMB since it started)'):format(
+				chunkname, os.clock() - started, now, now - beforeClient))
+		end)
 		task.spawn(function()
 			local ok, err = pcall(fn, table.unpack(gameArgs, 1, gameArgs.n))
 			gameScriptFinished = true
-			stage(chunkname..' done, client='..clientMB()..'MB (+'..(clientMB() - beforeClient)..'MB)')
 			-- Only for a payload slow enough that the split-load path actually engaged; a normal
 			-- game script never trips it. Keeps the real cost of protecting bedwars.lua visible
 			-- instead of guessed at.
@@ -614,12 +638,37 @@ if not shared.VapeIndependent then
 		end)
 	end
 
+	--[[
+		Run without the game script at all.
+
+			getgenv().PistonwareSkipGameScript = true
+
+		Two runs and a subtraction is the only honest way to price the payload. Everything the
+		crumbs can see between 'game script start' and the profile apply is the payload AND the
+		match still loading around it, and no amount of instrumentation inside this process can
+		tell those apart -- but a run with the game script withheld measures the match on its
+		own, and the difference is what protecting bedwars.lua actually costs.
+
+		Deliberately loud: this leaves you with the universal modules and no game modules, which
+		looks exactly like a broken install if you forget the flag is set.
+	]]
+	local skipGameScript = false
+	pcall(function()
+		skipGameScript = (((getgenv and getgenv().PistonwareSkipGameScript) or shared.PistonwareSkipGameScript) and true) or false
+	end)
+	if skipGameScript then
+		stage('game script SKIPPED by request, client='..clientMB()..'MB')
+		warn('[pistonware] PistonwareSkipGameScript is set -- no game modules will load. Unset it to play normally.')
+	end
+
 	local gamePath = 'pistonware/games/'..game.PlaceId..'.lua'
 	-- A cached-but-empty file is treated as missing and refetched: a truncated write from an
 	-- earlier failed download reads back as "present", and loadstring('') silently does
 	-- nothing -- indistinguishable from the game script never loading at all.
-	local cached = isfile(gamePath) and readfile(gamePath) or nil
-	if cached and cached:gsub('%s', '') ~= '' then
+	local cached = (not skipGameScript) and isfile(gamePath) and readfile(gamePath) or nil
+	if skipGameScript then
+		-- nothing to run, and nothing to wait for
+	elseif cached and cached:gsub('%s', '') ~= '' then
 		runGameScript(cached, tostring(game.PlaceId))
 	elseif not shared.PistonwareDeveloper then
 		-- Single fetch (the old code requested this URL twice: once to probe, then again
