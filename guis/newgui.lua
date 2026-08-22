@@ -301,7 +301,7 @@ local function trace(text)
 	-- Rewritten whole rather than appended: appendfile is missing on several mobile executors,
 	-- and a breadcrumb that only works on desktop is no use for a crash that only happens on
 	-- mobile. Capped so the string being rebuilt each time stays small.
-	if #traceLog > 200 then
+	if #traceLog > 400 then
 		table.remove(traceLog, 1)
 	end
 	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLog, '\n'))
@@ -411,8 +411,18 @@ local function watchSettled()
 		local deltas = {}
 		local last = os.clock()
 		local started = last
+		--[[
+			Timed, not counted in frames.
 
-		for frame = 1, 900 do
+			The first version ran a fixed 900 frames, which on a phone rendering at 100fps was
+			nine seconds -- it wrote 'settled watch finished' and stopped well before the client
+			died, so the death itself went unrecorded. Three minutes covers it, and the write is
+			paced by the clock so a fast device does not spend the budget faster than a slow one.
+		]]
+		local baseClient, baseLua = clientMB(), heapKB() / 1024
+		local nextWrite = 0
+
+		while os.clock() - started < 180 do
 			task.wait()
 			local now = os.clock()
 			table.insert(deltas, ('%.0f'):format((now - last) * 1000))
@@ -421,10 +431,25 @@ local function watchSettled()
 			end
 			last = now
 
-			if frame % 15 == 0 then
-				trace(('settled %.1fs client=%dMB lua=%dMB dt=%s | %s'):format(
-					now - started, clientMB(), math.floor(heapKB() / 1024),
-					table.concat(deltas, ','), memBreakdown()))
+			local elapsed = now - started
+			if elapsed >= nextWrite then
+				nextWrite = elapsed + 0.5
+				--[[
+					The RATE is the finding, so it is computed here rather than left to be
+					eyeballed off a column of totals.
+
+					A leak and ordinary churn look identical in a single reading. Megabytes per
+					second, held against a baseline taken when the watch started, is the number
+					that separates them -- and the number a bisection run can be judged on
+					without waiting for a crash.
+				]]
+				local client, lua = clientMB(), heapKB() / 1024
+				local span = math.max(elapsed, 0.001)
+				trace(('settled %.0fs client=%dMB (%+.1f/s) lua=%.0fMB (%+.1f/s) dt=%s'):format(
+					elapsed,
+					client, (client - baseClient) / span,
+					lua, (lua - baseLua) / span,
+					table.concat(deltas, ',')))
 			end
 		end
 
