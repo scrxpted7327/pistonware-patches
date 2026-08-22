@@ -262,6 +262,33 @@ pcall(function()
 	traceOn = (((getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace) and true) or false
 end)
 
+--[[
+	Bisection, for isolating which modules cost the memory.
+
+		getgenv().PistonwareLoadLimit = 25          -- enable only the first 25 the profile lists
+		getgenv().PistonwareSkipModules = {'TexturePack'}
+
+	Halving the enabled set and reading the client-memory number is a direct measurement; there
+	is no amount of staring at a log that substitutes for it. Reported in the trace so a run
+	always says what it actually did.
+]]
+local loadLimit = math.huge
+local skipModules = {}
+pcall(function()
+	local env = (getgenv and getgenv()) or {}
+	local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
+	if limit then
+		loadLimit = limit
+	end
+
+	local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
+	if type(skip) == 'table' then
+		for _, name in skip do
+			skipModules[tostring(name)] = true
+		end
+	end
+end)
+
 local traceLog = shared.PistonwareTraceLines or {}
 shared.PistonwareTraceLines = traceLog
 
@@ -285,6 +312,54 @@ local function heapKB()
 	local kb = 0
 	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
 	return kb
+end
+
+--[[
+	What the client is ACTUALLY holding, which the Lua heap does not tell you.
+
+	gcinfo measures the Lua heap and nothing else. Instances, Drawing objects, meshes, sounds
+	and textures all live in the engine's own allocator, so a module that spawns a thousand
+	Instances or swaps every texture in the game barely moves gcinfo while costing the process
+	hundreds of megabytes. Several rounds of "the heap is fine, so it is not memory" were
+	measured with an instrument that could not see the memory in question.
+
+	Stats:GetTotalMemoryUsageMb is the whole client. The per-tag breakdown says which subsystem
+	is holding it, which is the difference between a fixable module and a guess.
+
+	pcall'd throughout: Stats is present on every live client, but this file also has to survive
+	an executor that hides services, and a missing number must degrade to 0 rather than throw
+	inside a breadcrumb.
+]]
+local statsService
+pcall(function() statsService = cloneref(game:GetService('Stats')) end)
+
+local function clientMB()
+	local mb = 0
+	pcall(function() mb = statsService and statsService:GetTotalMemoryUsageMb() or 0 end)
+	return math.floor(mb)
+end
+
+-- The tags worth naming. Instances and the graphics ones are where module memory lands;
+-- LuaHeap is included so the two numbers can be compared in one line.
+local memoryTags = {'Instances', 'GraphicsTexture', 'GraphicsMeshParts', 'GraphicsParts', 'Gui', 'Sounds', 'Signals', 'LuaHeap'}
+local function memBreakdown()
+	if not statsService then return '' end
+
+	local parts = {}
+	for _, tag in memoryTags do
+		local enum = Enum.DeveloperMemoryTag[tag]
+		if enum then
+			local ok, mb = pcall(function()
+				return statsService:GetMemoryUsageMbForTag(enum)
+			end)
+			-- Anything under a megabyte is noise on a client measured in hundreds.
+			if ok and type(mb) == 'number' and mb >= 1 then
+				table.insert(parts, tag..'='..math.floor(mb))
+			end
+		end
+	end
+
+	return table.concat(parts, ' ')
 end
 
 trace('gui chunk running')
@@ -347,7 +422,9 @@ local function watchSettled()
 			last = now
 
 			if frame % 15 == 0 then
-				trace(('settled %.1fs heap=%dKB dt=%s'):format(now - started, heapKB(), table.concat(deltas, ',')))
+				trace(('settled %.1fs client=%dMB lua=%dMB dt=%s | %s'):format(
+					now - started, clientMB(), math.floor(heapKB() / 1024),
+					table.concat(deltas, ','), memBreakdown()))
 			end
 		end
 
@@ -379,7 +456,7 @@ local function queueStart(name, callback)
 				The queue makes them strictly serial, one per frame, so a 'start X' with no
 				'ok X' after it is the module that took the client down.
 			]]
-			trace('start '..tostring(job.Name)..' heap='..heapKB()..'KB')
+			trace('start '..tostring(job.Name)..' lua='..math.floor(heapKB() / 1024)..'MB client='..clientMB()..'MB')
 			-- spawn, not a direct call: a module that errors on startup must not take the drain
 			-- thread down with it and strand every module still queued behind it.
 			task.spawn(job.Start, true)
@@ -1256,7 +1333,7 @@ function vape:Load(skipgui, profile)
 	-- half the old profile and half the new one. Restored at the end.
 	self.Loaded = false
 	trace('Load start profile='..tostring(profile or self.Profile)
-		..' modules='..tostring(#self.ModuleOrder)..' heap='..heapKB()..'KB')
+		..' modules='..tostring(#self.ModuleOrder)..' client='..clientMB()..'MB')
 	-- Read by the module toggles, which defer a module's function instead of running it inline
 	-- while this is set. Deliberately NOT cleared on the generation-abort returns below: those
 	-- happen because a newer load took over, and that load owns the flag until it finishes.
@@ -1322,10 +1399,23 @@ function vape:Load(skipgui, profile)
 			end
 		end
 
-		trace('Load applying modules, heap='..heapKB()..'KB')
+		trace('Load applying modules, client='..clientMB()..'MB'
+			..(loadLimit < math.huge and ' limit='..loadLimit or '')
+			..(next(skipModules) and ' skipping='..(function()
+				local names = {}
+				for skipped in skipModules do table.insert(names, skipped) end
+				return table.concat(names, ',')
+			end)() or ''))
+		local applied = 0
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
+			-- Skipping means leaving the module on its defaults, not touching it: applying the
+			-- saved state is the thing being withheld.
+			if module and (skipModules[name] or applied >= loadLimit) then
+				module = nil
+			end
 			if module then
+				applied += 1
 				module:Load(data)
 				toggleCount += module.Enabled and 1 or 0
 				yieldBuild()
@@ -1370,7 +1460,7 @@ function vape:Load(skipgui, profile)
 
 	self.Loaded = canSave
 	self.Applying = nil
-	trace('Load done, '..toggleCount..' enabled, '..#startQueue..' queued to start, heap='..heapKB()..'KB')
+	trace('Load done, '..toggleCount..' enabled, '..#startQueue..' queued to start, client='..clientMB()..'MB')
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
 	self.LoadedCount = #self.ModuleOrder
