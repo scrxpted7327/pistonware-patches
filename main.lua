@@ -36,13 +36,6 @@ local cloneref = cloneref or function(obj)
 end
 local playersService = cloneref(game:GetService('Players'))
 
--- Phones and tablets. Kept because the teleport path and a couple of notifications still ask, but
--- it no longer paces anything: the autosave loop it used to slow down on slow storage is gone.
-local isTouchDevice = false
-pcall(function()
-	isTouchDevice = cloneref(game:GetService('UserInputService')).TouchEnabled and true or false
-end)
-
 -- Telemetry the developer build prints and the public build does not.
 --
 -- Module counts and load timings are what you want in front of you while working on the loader,
