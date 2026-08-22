@@ -220,161 +220,15 @@ end
 
 	Ten milliseconds brings the multiplier to about four while keeping any single uninterrupted
 	block to under a third of a mobile frame, so the responsiveness this was added for is intact.
-	Overridable via getgenv().PistonwareYieldBudget, because the right number depends on how fast
-	the device is and how many modules the profile carries.
 ]]
 local buildclock = os.clock()
 local yieldBudget = 0.01
-pcall(function()
-	local override = tonumber(((getgenv and getgenv().PistonwareYieldBudget) or shared.PistonwareYieldBudget))
-	if override and override > 0 then
-		yieldBudget = override
-	end
-end)
 local function yieldBuild(budget)
 	if os.clock() - buildclock > (budget or yieldBudget) then
 		task.wait()
 		buildclock = os.clock()
 	end
 end
-
---[[
-	Breadcrumbs that survive a native crash. Off unless asked for.
-
-		getgenv().PistonwareTrace = true
-
-	A crash that takes the client's process down leaves no error and no traceback, so the only
-	record that outlives it is one already on disk. Each crumb is written BEFORE the thing it
-	names runs; after a crash the last line is where it got to.
-
-	Written to the filesystem ROOT, not under pistonware/, because reinstall.lua deletes that
-	folder and would take the evidence with it.
-
-	Where the crumbs go is deliberate. There are NONE inside the profile apply loop, because a
-	file write there yields, and that yield is what made the previous trace change the very
-	behaviour it was supposed to be observing -- turning it on "fixed" the crash and turning it
-	off brought it back, which cost a lot of time to untangle. The per-module crumbs live in the
-	start queue's drain thread instead, which already waits a whole frame per module: a write
-	there cannot change the pacing, because the thread is going to yield regardless.
-]]
-local traceOn = false
-pcall(function()
-	traceOn = (((getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace) and true) or false
-end)
-
---[[
-	Bisection, for isolating which modules cost the memory.
-
-		getgenv().PistonwareLoadLimit = 25          -- enable only the first 25 the profile lists
-		getgenv().PistonwareSkipModules = {'TexturePack'}
-
-	Halving the enabled set and reading the client-memory number is a direct measurement; there
-	is no amount of staring at a log that substitutes for it. Reported in the trace so a run
-	always says what it actually did.
-]]
---[[
-	Apply which modules are ON, but leave every option at its default.
-
-		getgenv().PistonwareIgnoreOptions = true
-
-	A profile carries two independent things: the enabled set, and the value of every option on
-	every module. A self-made profile with EVERY module enabled loads fine while a downloaded one
-	with fewer enabled does not, which rules the enabled set out and leaves the option values --
-	but nothing could test that half on its own. This does: same modules on, defaults underneath.
-]]
-local ignoreOptions = false
-local loadLimit = math.huge
-local skipModules = {}
-pcall(function()
-	local env = (getgenv and getgenv()) or {}
-	ignoreOptions = (((env.PistonwareIgnoreOptions) or shared.PistonwareIgnoreOptions) and true) or false
-	local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
-	if limit then
-		loadLimit = limit
-	end
-
-	local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
-	if type(skip) == 'table' then
-		for _, name in skip do
-			skipModules[tostring(name)] = true
-		end
-	end
-end)
-
-local traceLog = shared.PistonwareTraceLines or {}
-shared.PistonwareTraceLines = traceLog
-
-local function trace(text)
-	if not traceOn then
-		return
-	end
-
-	table.insert(traceLog, text)
-	-- Rewritten whole rather than appended: appendfile is missing on several mobile executors,
-	-- and a breadcrumb that only works on desktop is no use for a crash that only happens on
-	-- mobile. Capped so the string being rebuilt each time stays small.
-	if #traceLog > 400 then
-		table.remove(traceLog, 1)
-	end
-	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLog, '\n'))
-end
-
--- Lua heap in KB. gcinfo on Roblox, collectgarbage('count') as the portable fallback.
-local function heapKB()
-	local kb = 0
-	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
-	return kb
-end
-
---[[
-	What the client is ACTUALLY holding, which the Lua heap does not tell you.
-
-	gcinfo measures the Lua heap and nothing else. Instances, Drawing objects, meshes, sounds
-	and textures all live in the engine's own allocator, so a module that spawns a thousand
-	Instances or swaps every texture in the game barely moves gcinfo while costing the process
-	hundreds of megabytes. Several rounds of "the heap is fine, so it is not memory" were
-	measured with an instrument that could not see the memory in question.
-
-	Stats:GetTotalMemoryUsageMb is the whole client. The per-tag breakdown says which subsystem
-	is holding it, which is the difference between a fixable module and a guess.
-
-	pcall'd throughout: Stats is present on every live client, but this file also has to survive
-	an executor that hides services, and a missing number must degrade to 0 rather than throw
-	inside a breadcrumb.
-]]
-local statsService
-pcall(function() statsService = cloneref(game:GetService('Stats')) end)
-
-local function clientMB()
-	local mb = 0
-	pcall(function() mb = statsService and statsService:GetTotalMemoryUsageMb() or 0 end)
-	return math.floor(mb)
-end
-
--- The tags worth naming. Instances and the graphics ones are where module memory lands;
--- LuaHeap is included so the two numbers can be compared in one line.
-local memoryTags = {'Instances', 'GraphicsTexture', 'GraphicsMeshParts', 'GraphicsParts', 'Gui', 'Sounds', 'Signals', 'LuaHeap'}
-local function memBreakdown()
-	if not statsService then return '' end
-
-	local parts = {}
-	for _, tag in memoryTags do
-		local enum = Enum.DeveloperMemoryTag[tag]
-		if enum then
-			local ok, mb = pcall(function()
-				return statsService:GetMemoryUsageMbForTag(enum)
-			end)
-			-- Anything under a megabyte is noise on a client measured in hundreds.
-			if ok and type(mb) == 'number' and mb >= 1 then
-				table.insert(parts, tag..'='..math.floor(mb))
-			end
-		end
-	end
-
-	return table.concat(parts, ' ')
-end
-
-trace('gui chunk running')
 
 --[[
 	A paced starter for modules switched on by a profile apply.
@@ -388,96 +242,11 @@ trace('gui chunk running')
 	work, moved rather than broken up.
 
 	So they go through a queue that yields between them, and modules come online over a second
-	or two instead of all in one instant. This is what the per-module trace was doing by
-	accident -- its file write yielded between one module's startup and the next -- which is why
-	tracing stopped the crash and removing it brought the crash back.
+	or two instead of all in one instant.
 
 	One drain thread at a time, and it exits when the queue empties, so nothing is left running
 	between applies.
 ]]
---[[
-	What happens AFTER every module has started.
-
-	The crumbs used to stop at the last 'ok', and that turned out to be exactly where the
-	interesting part begins: a log showed all sixty modules starting and finishing cleanly, then
-	the client dying moments later with nothing else recorded. By then every enabled module is
-	running its own per-frame loop, all of them at once for the first time, and none of the
-	earlier instrumentation could see into that window.
-
-	So this samples the frames that follow. Frame delta says whether the client is choking on
-	CPU -- a number that climbs from 16ms into the hundreds is a client being killed for not
-	responding, which looks nothing like the heap number climbing instead.
-
-	Written every fifteenth frame rather than every frame, carrying the last twenty deltas with
-	it. A write per frame would be a file write inside the very window being measured, which is
-	the mistake the previous trace made and the reason it kept changing its own answer.
-]]
-local settledWatched = false
-local function watchSettled()
-	if not traceOn or settledWatched then
-		return
-	end
-
-	settledWatched = true
-	task.spawn(function()
-		local deltas = {}
-		local last = os.clock()
-		local started = last
-		--[[
-			Timed, not counted in frames.
-
-			The first version ran a fixed 900 frames, which on a phone rendering at 100fps was
-			nine seconds -- it wrote 'settled watch finished' and stopped well before the client
-			died, so the death itself went unrecorded. Three minutes covers it, and the write is
-			paced by the clock so a fast device does not spend the budget faster than a slow one.
-		]]
-		local baseClient, baseLua = clientMB(), heapKB() / 1024
-		local nextWrite = 0
-
-		while os.clock() - started < 180 do
-			task.wait()
-			local now = os.clock()
-			table.insert(deltas, ('%.0f'):format((now - last) * 1000))
-			if #deltas > 20 then
-				table.remove(deltas, 1)
-			end
-			last = now
-
-			local elapsed = now - started
-			if elapsed >= nextWrite then
-				nextWrite = elapsed + 0.5
-				--[[
-					The RATE is the finding, so it is computed here rather than left to be
-					eyeballed off a column of totals.
-
-					A leak and ordinary churn look identical in a single reading. Megabytes per
-					second, held against a baseline taken when the watch started, is the number
-					that separates them -- and the number a bisection run can be judged on
-					without waiting for a crash.
-				]]
-				local client, lua = clientMB(), heapKB() / 1024
-				--[[
-					No rate until a second has passed.
-
-					Dividing by a fraction of a second turns ordinary sampling jitter into a
-					headline number -- the first sample of the previous run read "+281.7/s" off
-					seventy milliseconds of noise, which is exactly the kind of figure a
-					bisection would be judged on and get wrong.
-				]]
-				local rate = ''
-				if elapsed >= 1 then
-					rate = (' client%+.1f/s lua%+.1f/s'):format(
-						(client - baseClient) / elapsed, (lua - baseLua) / elapsed)
-				end
-				trace(('settled %.1fs client=%dMB lua=%.0fMB%s dt=%s'):format(
-					elapsed, client, lua, rate, table.concat(deltas, ',')))
-			end
-		end
-
-		trace('settled watch finished')
-	end)
-end
-
 local startQueue = {}
 local startThread
 local function queueStart(name, callback)
@@ -494,32 +263,12 @@ local function queueStart(name, callback)
 			-- apply loop -- the exact thing being fixed, just once instead of sixty times.
 			task.wait()
 			local job = table.remove(startQueue, 1)
-			--[[
-				Crumbs on both sides, and here they mean something they could not mean before.
-
-				Startups used to overlap across sixty threads, so an unmatched 'start X' named
-				nothing -- any module whose function is a loop never reaches its closing crumb.
-				The queue makes them strictly serial, one per frame, so a 'start X' with no
-				'ok X' after it is the module that took the client down.
-			]]
-			local before = clientMB()
-			trace('start '..tostring(job.Name)..' client='..before..'MB')
 			-- spawn, not a direct call: a module that errors on startup must not take the drain
 			-- thread down with it and strand every module still queued behind it.
 			task.spawn(job.Start, true)
-			--[[
-				What this module cost, in client megabytes, on the closing crumb.
-
-				Only the part it allocates before its first yield -- anything it builds later, in
-				its own loop, lands in the settled samples instead. That is still the number that
-				names a module holding hundreds of megabytes of textures or instances, which is
-				what the Lua-heap figure could never show.
-			]]
-			trace('ok '..tostring(job.Name)..' (+'..(clientMB() - before)..'MB)')
 		end
 
 		startThread = nil
-		watchSettled()
 	end)
 end
 
@@ -1387,8 +1136,6 @@ function vape:Load(skipgui, profile)
 	-- Nothing may write to disk while a load is in progress: it would serialise a config that is
 	-- half the old profile and half the new one. Restored at the end.
 	self.Loaded = false
-	trace('Load start profile='..tostring(profile or self.Profile)
-		..' modules='..tostring(#self.ModuleOrder)..' client='..clientMB()..'MB')
 	-- Read by the module toggles, which defer a module's function instead of running it inline
 	-- while this is set. Deliberately NOT cleared on the generation-abort returns below: those
 	-- happen because a newer load took over, and that load owns the flag until it finishes.
@@ -1454,40 +1201,9 @@ function vape:Load(skipgui, profile)
 			end
 		end
 
-		trace('Load applying modules, client='..clientMB()..'MB'
-			..(loadLimit < math.huge and ' limit='..loadLimit or '')
-			..(ignoreOptions and ' OPTIONS IGNORED' or '')
-			..(next(skipModules) and ' skipping='..(function()
-				local names = {}
-				for skipped in skipModules do table.insert(names, skipped) end
-				return table.concat(names, ',')
-			end)() or ''))
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
-			--[[
-				The limit counts modules ENABLED, not profile entries walked.
-
-				A profile holds an entry for every module that exists -- 136 of them here -- and
-				only some are switched on. Counting entries meant a limit of 50 stopped a third
-				of the way through the file and enabled around twenty, so "50 is safe" said far
-				less than it appeared to. Counting what actually gets turned on makes the number
-				mean the same thing as the count in the line below, and the same thing as how
-				many 'start' crumbs the log will contain.
-
-				Skipping leaves a module on its defaults rather than applying its saved state,
-				which is the thing being withheld either way.
-			]]
-			if module and (skipModules[name] or toggleCount >= loadLimit) then
-				module = nil
-			end
 			if module then
-				-- Emptied rather than removed: vape:LoadOptions iterates the field, and `for _ in
-				-- nil` is an error, not a no-op. Cloned so the decoded profile is left intact for
-				-- anything that reads it afterwards.
-				if ignoreOptions and data.Options then
-					data = table.clone(data)
-					data.Options = {}
-				end
 				module:Load(data)
 				toggleCount += module.Enabled and 1 or 0
 				yieldBuild()
@@ -1532,7 +1248,6 @@ function vape:Load(skipgui, profile)
 
 	self.Loaded = canSave
 	self.Applying = nil
-	trace('Load done, '..toggleCount..' enabled, '..#startQueue..' queued to start, client='..clientMB()..'MB')
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
 	self.LoadedCount = #self.ModuleOrder
@@ -3799,10 +3514,8 @@ function vape:Save(newProfile)
 		return
 	end
 
-	trace('save '..tostring(self.Profile))
 	local guiSuccess, guiError = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
 	local mainSuccess, mainError = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
-	trace('save done')
 
 	if guiSuccess and mainSuccess then
 		self.SaveFailed = nil
@@ -3936,12 +3649,6 @@ end
 	task.defer rather than a flag checked elsewhere: it needs no cooperation from callers, and
 	a module removed between the request and the pass is handled above.
 ]]
--- The public form, so main.lua's crumbs and the GUI's end up in ONE ordered log rather than
--- each overwriting the other's file. Silent unless the trace flag is set.
-function vape:Trace(text)
-	trace(tostring(text))
-end
-
 function vape:SortCategories()
 	if self.SortQueued then return end
 	self.SortQueued = true
