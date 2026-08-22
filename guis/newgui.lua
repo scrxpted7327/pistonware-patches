@@ -308,6 +308,53 @@ trace('gui chunk running')
 	One drain thread at a time, and it exits when the queue empties, so nothing is left running
 	between applies.
 ]]
+--[[
+	What happens AFTER every module has started.
+
+	The crumbs used to stop at the last 'ok', and that turned out to be exactly where the
+	interesting part begins: a log showed all sixty modules starting and finishing cleanly, then
+	the client dying moments later with nothing else recorded. By then every enabled module is
+	running its own per-frame loop, all of them at once for the first time, and none of the
+	earlier instrumentation could see into that window.
+
+	So this samples the frames that follow. Frame delta says whether the client is choking on
+	CPU -- a number that climbs from 16ms into the hundreds is a client being killed for not
+	responding, which looks nothing like the heap number climbing instead.
+
+	Written every fifteenth frame rather than every frame, carrying the last twenty deltas with
+	it. A write per frame would be a file write inside the very window being measured, which is
+	the mistake the previous trace made and the reason it kept changing its own answer.
+]]
+local settledWatched = false
+local function watchSettled()
+	if not traceOn or settledWatched then
+		return
+	end
+
+	settledWatched = true
+	task.spawn(function()
+		local deltas = {}
+		local last = os.clock()
+		local started = last
+
+		for frame = 1, 900 do
+			task.wait()
+			local now = os.clock()
+			table.insert(deltas, ('%.0f'):format((now - last) * 1000))
+			if #deltas > 20 then
+				table.remove(deltas, 1)
+			end
+			last = now
+
+			if frame % 15 == 0 then
+				trace(('settled %.1fs heap=%dKB dt=%s'):format(now - started, heapKB(), table.concat(deltas, ',')))
+			end
+		end
+
+		trace('settled watch finished')
+	end)
+end
+
 local startQueue = {}
 local startThread
 local function queueStart(name, callback)
@@ -340,6 +387,7 @@ local function queueStart(name, callback)
 		end
 
 		startThread = nil
+		watchSettled()
 	end)
 end
 
