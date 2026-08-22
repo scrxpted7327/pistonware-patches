@@ -239,6 +239,57 @@ local function yieldBuild(budget)
 end
 
 --[[
+	Breadcrumbs that survive a native crash. Off unless asked for.
+
+		getgenv().PistonwareTrace = true
+
+	A crash that takes the client's process down leaves no error and no traceback, so the only
+	record that outlives it is one already on disk. Each crumb is written BEFORE the thing it
+	names runs; after a crash the last line is where it got to.
+
+	Written to the filesystem ROOT, not under pistonware/, because reinstall.lua deletes that
+	folder and would take the evidence with it.
+
+	Where the crumbs go is deliberate. There are NONE inside the profile apply loop, because a
+	file write there yields, and that yield is what made the previous trace change the very
+	behaviour it was supposed to be observing -- turning it on "fixed" the crash and turning it
+	off brought it back, which cost a lot of time to untangle. The per-module crumbs live in the
+	start queue's drain thread instead, which already waits a whole frame per module: a write
+	there cannot change the pacing, because the thread is going to yield regardless.
+]]
+local traceOn = false
+pcall(function()
+	traceOn = (((getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace) and true) or false
+end)
+
+local traceLog = shared.PistonwareTraceLines or {}
+shared.PistonwareTraceLines = traceLog
+
+local function trace(text)
+	if not traceOn then
+		return
+	end
+
+	table.insert(traceLog, text)
+	-- Rewritten whole rather than appended: appendfile is missing on several mobile executors,
+	-- and a breadcrumb that only works on desktop is no use for a crash that only happens on
+	-- mobile. Capped so the string being rebuilt each time stays small.
+	if #traceLog > 200 then
+		table.remove(traceLog, 1)
+	end
+	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLog, '\n'))
+end
+
+-- Lua heap in KB. gcinfo on Roblox, collectgarbage('count') as the portable fallback.
+local function heapKB()
+	local kb = 0
+	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
+	return kb
+end
+
+trace('gui chunk running')
+
+--[[
 	A paced starter for modules switched on by a profile apply.
 
 	task.spawn resumes its function inline, on the calling thread, until that function first
@@ -259,8 +310,8 @@ end
 ]]
 local startQueue = {}
 local startThread
-local function queueStart(callback)
-	table.insert(startQueue, callback)
+local function queueStart(name, callback)
+	table.insert(startQueue, {Name = name, Start = callback})
 
 	if startThread then
 		return
@@ -273,9 +324,19 @@ local function queueStart(callback)
 			-- apply loop -- the exact thing being fixed, just once instead of sixty times.
 			task.wait()
 			local job = table.remove(startQueue, 1)
+			--[[
+				Crumbs on both sides, and here they mean something they could not mean before.
+
+				Startups used to overlap across sixty threads, so an unmatched 'start X' named
+				nothing -- any module whose function is a loop never reaches its closing crumb.
+				The queue makes them strictly serial, one per frame, so a 'start X' with no
+				'ok X' after it is the module that took the client down.
+			]]
+			trace('start '..tostring(job.Name)..' heap='..heapKB()..'KB')
 			-- spawn, not a direct call: a module that errors on startup must not take the drain
 			-- thread down with it and strand every module still queued behind it.
-			task.spawn(job, true)
+			task.spawn(job.Start, true)
+			trace('ok '..tostring(job.Name))
 		end
 
 		startThread = nil
@@ -1146,6 +1207,8 @@ function vape:Load(skipgui, profile)
 	-- Nothing may write to disk while a load is in progress: it would serialise a config that is
 	-- half the old profile and half the new one. Restored at the end.
 	self.Loaded = false
+	trace('Load start profile='..tostring(profile or self.Profile)
+		..' modules='..tostring(#self.ModuleOrder)..' heap='..heapKB()..'KB')
 	-- Read by the module toggles, which defer a module's function instead of running it inline
 	-- while this is set. Deliberately NOT cleared on the generation-abort returns below: those
 	-- happen because a newer load took over, and that load owns the flag until it finishes.
@@ -1211,6 +1274,7 @@ function vape:Load(skipgui, profile)
 			end
 		end
 
+		trace('Load applying modules, heap='..heapKB()..'KB')
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
 			if module then
@@ -1258,6 +1322,7 @@ function vape:Load(skipgui, profile)
 
 	self.Loaded = canSave
 	self.Applying = nil
+	trace('Load done, '..toggleCount..' enabled, '..#startQueue..' queued to start, heap='..heapKB()..'KB')
 	-- Everything registered up to here now holds its saved settings. vape:LoadLate applies the
 	-- profile to whatever appears past this index.
 	self.LoadedCount = #self.ModuleOrder
@@ -3524,8 +3589,10 @@ function vape:Save(newProfile)
 		return
 	end
 
+	trace('save '..tostring(self.Profile))
 	local guiSuccess, guiError = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
 	local mainSuccess, mainError = writeJson('pistonware/profiles/'..self.Profile..self.Place..'.txt', mainData)
+	trace('save done')
 
 	if guiSuccess and mainSuccess then
 		self.SaveFailed = nil
@@ -3659,6 +3726,12 @@ end
 	task.defer rather than a flag checked elsewhere: it needs no cooperation from callers, and
 	a module removed between the request and the pass is handled above.
 ]]
+-- The public form, so main.lua's crumbs and the GUI's end up in ONE ordered log rather than
+-- each overwriting the other's file. Silent unless the trace flag is set.
+function vape:Trace(text)
+	trace(tostring(text))
+end
+
 function vape:SortCategories()
 	if self.SortQueued then return end
 	self.SortQueued = true
@@ -6810,7 +6883,7 @@ components = {
 				disable would run against a table loopClean has already cleared.
 			]]
 			if vape.Applying and self.Enabled then
-				queueStart(props.Function)
+				queueStart(props.Name, props.Function)
 			else
 				task.spawn(props.Function, self.Enabled)
 			end
@@ -7296,7 +7369,7 @@ components = {
 			-- Deferred while applying, for the reason set out at the other module toggle: with
 			-- task.spawn the module's setup runs inline inside the apply loop.
 			if vape.Applying and self.Enabled then
-				queueStart(props.Function)
+				queueStart(props.Name, props.Function)
 			else
 				task.spawn(props.Function, self.Enabled)
 			end
