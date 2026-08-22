@@ -456,11 +456,20 @@ local function queueStart(name, callback)
 				The queue makes them strictly serial, one per frame, so a 'start X' with no
 				'ok X' after it is the module that took the client down.
 			]]
-			trace('start '..tostring(job.Name)..' lua='..math.floor(heapKB() / 1024)..'MB client='..clientMB()..'MB')
+			local before = clientMB()
+			trace('start '..tostring(job.Name)..' client='..before..'MB')
 			-- spawn, not a direct call: a module that errors on startup must not take the drain
 			-- thread down with it and strand every module still queued behind it.
 			task.spawn(job.Start, true)
-			trace('ok '..tostring(job.Name))
+			--[[
+				What this module cost, in client megabytes, on the closing crumb.
+
+				Only the part it allocates before its first yield -- anything it builds later, in
+				its own loop, lands in the settled samples instead. That is still the number that
+				names a module holding hundreds of megabytes of textures or instances, which is
+				what the Lua-heap figure could never show.
+			]]
+			trace('ok '..tostring(job.Name)..' (+'..(clientMB() - before)..'MB)')
 		end
 
 		startThread = nil
@@ -1406,16 +1415,25 @@ function vape:Load(skipgui, profile)
 				for skipped in skipModules do table.insert(names, skipped) end
 				return table.concat(names, ',')
 			end)() or ''))
-		local applied = 0
 		for name, data in mainData.Modules do
 			local module = self.Modules[name]
-			-- Skipping means leaving the module on its defaults, not touching it: applying the
-			-- saved state is the thing being withheld.
-			if module and (skipModules[name] or applied >= loadLimit) then
+			--[[
+				The limit counts modules ENABLED, not profile entries walked.
+
+				A profile holds an entry for every module that exists -- 136 of them here -- and
+				only some are switched on. Counting entries meant a limit of 50 stopped a third
+				of the way through the file and enabled around twenty, so "50 is safe" said far
+				less than it appeared to. Counting what actually gets turned on makes the number
+				mean the same thing as the count in the line below, and the same thing as how
+				many 'start' crumbs the log will contain.
+
+				Skipping leaves a module on its defaults rather than applying its saved state,
+				which is the thing being withheld either way.
+			]]
+			if module and (skipModules[name] or toggleCount >= loadLimit) then
 				module = nil
 			end
 			if module then
-				applied += 1
 				module:Load(data)
 				toggleCount += module.Enabled and 1 or 0
 				yieldBuild()
