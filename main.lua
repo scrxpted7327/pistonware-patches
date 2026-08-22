@@ -376,6 +376,22 @@ local function finishLoading()
 				if budget and budget > 0 then
 					teleportScript = 'shared.PistonwareYieldBudget = '..budget..'\n'..teleportScript
 				end
+
+				-- Same reason as the trace flag: bisecting a crash that only happens in a match
+				-- is useless if the setting doing the bisecting is wiped on the way into it.
+				local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
+				if limit then
+					teleportScript = 'shared.PistonwareLoadLimit = '..limit..'\n'..teleportScript
+				end
+
+				local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
+				if type(skip) == 'table' and #skip > 0 then
+					local quoted = {}
+					for _, name in skip do
+						table.insert(quoted, string.format('%q', tostring(name)))
+					end
+					teleportScript = 'shared.PistonwareSkipModules = {'..table.concat(quoted, ',')..'}\n'..teleportScript
+				end
 			end
 			-- %q, matching the key above: profile names are user-supplied (the Profiles tab lets
 			-- you name one anything), and a name containing a quote or backslash used to produce
