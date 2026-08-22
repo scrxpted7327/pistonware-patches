@@ -272,10 +272,22 @@ end)
 	is no amount of staring at a log that substitutes for it. Reported in the trace so a run
 	always says what it actually did.
 ]]
+--[[
+	Apply which modules are ON, but leave every option at its default.
+
+		getgenv().PistonwareIgnoreOptions = true
+
+	A profile carries two independent things: the enabled set, and the value of every option on
+	every module. A self-made profile with EVERY module enabled loads fine while a downloaded one
+	with fewer enabled does not, which rules the enabled set out and leaves the option values --
+	but nothing could test that half on its own. This does: same modules on, defaults underneath.
+]]
+local ignoreOptions = false
 local loadLimit = math.huge
 local skipModules = {}
 pcall(function()
 	local env = (getgenv and getgenv()) or {}
+	ignoreOptions = (((env.PistonwareIgnoreOptions) or shared.PistonwareIgnoreOptions) and true) or false
 	local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
 	if limit then
 		loadLimit = limit
@@ -1444,6 +1456,7 @@ function vape:Load(skipgui, profile)
 
 		trace('Load applying modules, client='..clientMB()..'MB'
 			..(loadLimit < math.huge and ' limit='..loadLimit or '')
+			..(ignoreOptions and ' OPTIONS IGNORED' or '')
 			..(next(skipModules) and ' skipping='..(function()
 				local names = {}
 				for skipped in skipModules do table.insert(names, skipped) end
@@ -1468,6 +1481,13 @@ function vape:Load(skipgui, profile)
 				module = nil
 			end
 			if module then
+				-- Emptied rather than removed: vape:LoadOptions iterates the field, and `for _ in
+				-- nil` is an error, not a no-op. Cloned so the decoded profile is left intact for
+				-- anything that reads it afterwards.
+				if ignoreOptions and data.Options then
+					data = table.clone(data)
+					data.Options = {}
+				end
 				module:Load(data)
 				toggleCount += module.Enabled and 1 or 0
 				yieldBuild()
