@@ -53,82 +53,6 @@ local function debugWarn(...)
 	end
 end
 
---[[
-	Breadcrumbs, off unless asked for:
-
-		getgenv().PistonwareTrace = true
-
-	The GUI keeps the same log (vape:Trace writes into this very table) but cannot record
-	anything before it is downloaded and run, and "the client died and there is no log" is
-	exactly the case where that window matters. Root of the filesystem, because reinstall.lua
-	deletes the pistonware folder and would take the evidence with it.
-]]
-local traceOn = false
-pcall(function()
-	traceOn = (((getgenv and getgenv().PistonwareTrace) or shared.PistonwareTrace) and true) or false
-end)
-shared.PistonwareTraceLines = {}
-local traceLines = shared.PistonwareTraceLines
-local function stage(text)
-	if not traceOn then return end
-	table.insert(traceLines, text)
-	if #traceLines > 400 then table.remove(traceLines, 1) end
-	pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
-end
-local function heapKB()
-	local kb = 0
-	pcall(function() kb = gcinfo and gcinfo() or collectgarbage('count') end)
-	return kb
-end
-
---[[
-	Whole-client memory, which is what the OS kills on -- gcinfo above sees only the Lua heap.
-
-	Measured at each stage of the load rather than once, because the question the crash log
-	could not answer was how much of the client's total is the GAME and how much is this script.
-	A run reports its own share by subtraction: whatever the first line says is the client with
-	pistonware not yet loaded.
-]]
-local statsService
-pcall(function() statsService = cloneref(game:GetService('Stats')) end)
-local function clientMB()
-	local mb = 0
-	pcall(function() mb = statsService and statsService:GetTotalMemoryUsageMb() or 0 end)
-	return math.floor(mb)
-end
-
---[[
-	A heartbeat, so the log says WHEN it died and not only where.
-
-	Without it, a crash during a long silent stretch is indistinguishable from a crash at the
-	last thing that logged. Rewrites one line in place rather than appending, so a long session
-	costs one small write every two seconds and the log stays readable.
-]]
-if traceOn then
-	local started = os.clock()
-	local index
-	local trend = {}
-	task.spawn(function()
-		while true do
-			task.wait(2)
-			local mem = heapKB()
-			table.insert(trend, ('%d'):format(mem))
-			if #trend > 15 then table.remove(trend, 1) end
-			local text = ('alive %.1fs client=%dMB lua=%dKB trend=%s'):format(
-				os.clock() - started, clientMB(), mem, table.concat(trend, ','))
-			if index then
-				traceLines[index] = text
-				pcall(writefile, 'pistonware_trace.txt', table.concat(traceLines, '\n'))
-			else
-				stage(text)
-				index = #traceLines
-			end
-		end
-	end)
-end
-
-stage('main.lua running, client='..clientMB()..'MB (pistonware not loaded yet)')
-
 -- isfile is not the question. A zero-byte file reads back as PRESENT through every executor's
 -- real isfile, and only the fallback above treats empty as absent -- so on executors that ship
 -- one (most of them), an interrupted write leaves a truncated file that nothing ever repairs.
@@ -248,9 +172,7 @@ local function finishLoading()
 		end
 		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
 			tostring(customProfile or '<saved>'), tostring(shared.vapereload and true or false)))
-		stage('applyProfile start, heap='..heapKB()..'KB')
 		vape:Load(nil, customProfile)
-		stage('applyProfile returned, heap='..heapKB()..'KB')
 		debugWarn('[pistonware] profile load returned')
 
 		--[[
@@ -380,43 +302,6 @@ local function finishLoading()
 			if shared.VapeSmoothBoot then
 				teleportScript = 'shared.VapeSmoothBoot = true\n'..teleportScript
 			end
-			-- getgenv() and shared are both wiped by a teleport, so a flag set in the lobby would
-			-- be gone in the match -- which is the only place worth tracing, and where profile
-			-- switches actually happen.
-			if traceOn then
-				teleportScript = 'shared.PistonwareTrace = true\n'..teleportScript
-			end
-			do
-				local env = (getgenv and getgenv()) or {}
-				local budget = tonumber(env.PistonwareYieldBudget or shared.PistonwareYieldBudget)
-				if budget and budget > 0 then
-					teleportScript = 'shared.PistonwareYieldBudget = '..budget..'\n'..teleportScript
-				end
-
-				-- Same reason as the trace flag: bisecting a crash that only happens in a match
-				-- is useless if the setting doing the bisecting is wiped on the way into it.
-				local limit = tonumber(env.PistonwareLoadLimit or shared.PistonwareLoadLimit)
-				if limit then
-					teleportScript = 'shared.PistonwareLoadLimit = '..limit..'\n'..teleportScript
-				end
-
-				if (env.PistonwareIgnoreOptions or shared.PistonwareIgnoreOptions) then
-					teleportScript = 'shared.PistonwareIgnoreOptions = true\n'..teleportScript
-				end
-
-				if (env.PistonwareSkipGameScript or shared.PistonwareSkipGameScript) then
-					teleportScript = 'shared.PistonwareSkipGameScript = true\n'..teleportScript
-				end
-
-				local skip = env.PistonwareSkipModules or shared.PistonwareSkipModules
-				if type(skip) == 'table' and #skip > 0 then
-					local quoted = {}
-					for _, name in skip do
-						table.insert(quoted, string.format('%q', tostring(name)))
-					end
-					teleportScript = 'shared.PistonwareSkipModules = {'..table.concat(quoted, ',')..'}\n'..teleportScript
-				end
-			end
 			-- %q, matching the key above: profile names are user-supplied (the Profiles tab lets
 			-- you name one anything), and a name containing a quote or backslash used to produce
 			-- a chunk that would not compile -- which silently costs the whole re-injection, not
@@ -522,9 +407,7 @@ end
 	if not isfolder('pistonware/assets/'..ASSET_FOLDER) then
 		makefolder('pistonware/assets/'..ASSET_FOLDER)
 	end
-	stage('downloading gui, client='..clientMB()..'MB')
 	vape = loadstring(downloadFile('pistonware/guis/'..GUI_FILE..'.lua'), 'gui')()
-	stage('gui chunk returned, client='..clientMB()..'MB')
 	shared.vape = vape
 
 if not shared.VapeIndependent then
@@ -543,11 +426,9 @@ if not shared.VapeIndependent then
 	end
 	-- pcall'd: an error thrown while universal.lua *executes* would otherwise propagate out of
 	-- main.lua entirely, skipping the game script below and finishLoading() with it.
-	stage('universal.lua start, client='..clientMB()..'MB')
 	pcall(function()
 		loadstring(downloadFile('pistonware/games/universal.lua'), 'universal')()
 	end)
-	stage('universal.lua done, client='..clientMB()..'MB')
 
 	-- Started, never waited on. There is no deadline here by design: a deadline would only be a
 	-- guess at how long the payload needs, and whatever number it held would become the time
@@ -600,32 +481,6 @@ if not shared.VapeIndependent then
 		end
 
 		local started = os.clock()
-		-- Measured on both sides, because the gap between 'universal.lua done' and the profile
-		-- apply is where the client gained a couple of hundred megabytes and nothing said what
-		-- was spending them. For BedWars this brackets the LuaArmor payload specifically.
-		local beforeClient = clientMB()
-		stage(chunkname..' start, client='..beforeClient..'MB')
-		--[[
-			Waits for the SIGNAL, not for the call to return.
-
-			The first version of this crumb sat after pcall(fn, ...) and could never fire for
-			BedWars: the LuaArmor payload keeps the thread it was invoked on and never returns,
-			which is the reason waitForModules exists a few dozen lines up. So the one file whose
-			cost needed measuring was the one file that could not be measured.
-
-			Either signal closes it, and a deadline stops the watcher parking forever on a
-			payload that never arrives.
-		]]
-		task.spawn(function()
-			local deadline = os.clock() + 180
-			repeat
-				task.wait(0.25)
-			until gameScriptFinished or shared.PistonwareBedwarsLoaded or os.clock() > deadline
-
-			local now = clientMB()
-			stage(('%s registered in %.1fs, client=%dMB (%+dMB since it started)'):format(
-				chunkname, os.clock() - started, now, now - beforeClient))
-		end)
 		task.spawn(function()
 			local ok, err = pcall(fn, table.unpack(gameArgs, 1, gameArgs.n))
 			gameScriptFinished = true
@@ -642,53 +497,12 @@ if not shared.VapeIndependent then
 		end)
 	end
 
-	--[[
-		Run without the game script at all.
-
-			getgenv().PistonwareSkipGameScript = true
-
-		Two runs and a subtraction is the only honest way to price the payload. Everything the
-		crumbs can see between 'game script start' and the profile apply is the payload AND the
-		match still loading around it, and no amount of instrumentation inside this process can
-		tell those apart -- but a run with the game script withheld measures the match on its
-		own, and the difference is what protecting bedwars.lua actually costs.
-
-		Deliberately loud: this leaves you with the universal modules and no game modules, which
-		looks exactly like a broken install if you forget the flag is set.
-	]]
-	local skipGameScript = false
-	pcall(function()
-		skipGameScript = (((getgenv and getgenv().PistonwareSkipGameScript) or shared.PistonwareSkipGameScript) and true) or false
-	end)
-	if skipGameScript then
-		stage('game script SKIPPED by request, client='..clientMB()..'MB')
-		warn('[pistonware] PistonwareSkipGameScript is set -- no game modules will load. Unset it to play normally.')
-		--[[
-			And saving is off for the whole session, which the first version of this flag got
-			wrong and cost a config to prove.
-
-			vape:Save serialises the module set AS IT STANDS. With the game script withheld that
-			set is deliberately incomplete, so a save writes a profile missing every game module
-			-- and vape:Load's "no file yet" branch calls Save directly, so it does not even need
-			a toggle to trigger. A measurement run must not be able to touch what is on disk.
-
-			This is the same hazard the teleport handler below already guards with profileApplied;
-			the flag walked straight into it.
-		]]
-		pcall(function()
-			vape.Save = function() end
-			vape.SaveNeeded = nil
-		end)
-	end
-
 	local gamePath = 'pistonware/games/'..game.PlaceId..'.lua'
 	-- A cached-but-empty file is treated as missing and refetched: a truncated write from an
 	-- earlier failed download reads back as "present", and loadstring('') silently does
 	-- nothing -- indistinguishable from the game script never loading at all.
-	local cached = (not skipGameScript) and isfile(gamePath) and readfile(gamePath) or nil
-	if skipGameScript then
-		-- nothing to run, and nothing to wait for
-	elseif cached and cached:gsub('%s', '') ~= '' then
+	local cached = isfile(gamePath) and readfile(gamePath) or nil
+	if cached and cached:gsub('%s', '') ~= '' then
 		runGameScript(cached, tostring(game.PlaceId))
 	elseif not shared.PistonwareDeveloper then
 		-- Single fetch (the old code requested this URL twice: once to probe, then again
