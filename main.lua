@@ -592,9 +592,15 @@ if not shared.VapeIndependent then
 		end
 
 		local started = os.clock()
+		-- Measured on both sides, because the gap between 'universal.lua done' and the profile
+		-- apply is where the client gained a couple of hundred megabytes and nothing said what
+		-- was spending them. For BedWars this brackets the LuaArmor payload specifically.
+		local beforeClient = clientMB()
+		stage(chunkname..' start, client='..beforeClient..'MB')
 		task.spawn(function()
 			local ok, err = pcall(fn, table.unpack(gameArgs, 1, gameArgs.n))
 			gameScriptFinished = true
+			stage(chunkname..' done, client='..clientMB()..'MB (+'..(clientMB() - beforeClient)..'MB)')
 			-- Only for a payload slow enough that the split-load path actually engaged; a normal
 			-- game script never trips it. Keeps the real cost of protecting bedwars.lua visible
 			-- instead of guessed at.
