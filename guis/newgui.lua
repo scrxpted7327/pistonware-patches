@@ -764,13 +764,20 @@ end
 	turns on and whether the player is in a menu -- so on plenty of phones our button landed on
 	top of one of Roblox's own.
 
-	So measure rather than guess: find the leftmost visible button on the right-hand half of the
-	top bar and sit immediately to its left, 7px clear -- the same gap the client puts between
-	its own buttons, so ours reads as one more of them. If TopBarAppGui is not there at all --
-	older clients, which is what mobile executors repackage -- nothing is measured and the old
-	offset stands.
+	So measure rather than guess: find where the run of buttons on the right of the bar BEGINS,
+	and sit immediately to its left, 7px clear -- the same gap the client puts between its own
+	buttons, so ours reads as one more of them. Where that run begins is walked rather than
+	guessed at, because the count and the widths both vary: the lobby adds a wide Patch Notes
+	button, and mobile shows one more than PC. If TopBarAppGui is not there at all -- older
+	clients, which is what mobile executors repackage -- nothing is measured and the old offset
+	stands.
 ]]
 local topbarGap = 7
+-- How far apart two boxes can be and still count as the same run of buttons. The client spaces
+-- its own by topbarGap; the slack is for the padding a wrapper adds around one. It has to stay
+-- well under the empty stretch between the right cluster and the chat button on the far left,
+-- or the walk below would cross the bar and anchor to the wrong end.
+local topbarClusterSlack = 20
 local vapeButtonSize = 32
 local vapeButtonFallback = UDim2.new(1, -90, 0, 4)
 
@@ -785,20 +792,15 @@ local function vapeButtonPosition()
 	end
 
 	--[[
-		Descendants, not children.
+		Descendants, not children: TopBarApp's own children are layout containers, as wide as the
+		stretch of bar they own rather than as wide as the buttons inside them. The buttons sit a
+		level or two further down.
 
-		TopBarApp's direct children are layout containers, and a container is as wide as the
-		stretch of bar it owns rather than as wide as the buttons inside it -- so measuring those
-		gave an edge tens of pixels away from anything actually drawn. The buttons themselves sit
-		a level or two down (the leftmost of the right cluster is the one named '1'), so the walk
-		has to reach them.
-
-		Bounded by height: a container that happens to be button-sized is harmless, but the full
-		-height wrappers are not, and 60px is comfortably above any real top-bar button.
+		Bounded by height, which is what separates a button from the full-height wrapper around it.
+		An inner icon or label passes the test too, but it lives inside its button's box and so can
+		never move either edge of it.
 	]]
-	local middle = topbar.AbsolutePosition.X + (topbar.AbsoluteSize.X / 2)
-	local edge, row
-
+	local boxes = {}
 	for _, obj in topbar:GetDescendants() do
 		if
 			obj:IsA('GuiObject') and obj.Visible
@@ -816,17 +818,53 @@ local function vapeButtonPosition()
 				parent = parent.Parent
 			end
 
-			local left = obj.AbsolutePosition.X
-			-- Right half only. The left of the bar is the Roblox logo and the chat button, which
-			-- is the side we do NOT want to be pushed onto.
-			if shown and (left + (obj.AbsoluteSize.X / 2)) > middle and (not edge or left < edge) then
-				edge = left
-				row = obj
+			if shown then
+				table.insert(boxes, {
+					Left = obj.AbsolutePosition.X,
+					Right = obj.AbsolutePosition.X + obj.AbsoluteSize.X,
+					Top = obj.AbsolutePosition.Y,
+					Height = obj.AbsoluteSize.Y
+				})
 			end
 		end
 	end
 
-	if not row then return nil end
+	if #boxes <= 0 then return nil end
+
+	--[[
+		Walk the run of buttons leftwards from the right edge of the bar.
+
+		Picking "the leftmost thing on the right half of the screen" is what put the button on top
+		of one of Roblox's: a wide button (the lobby's Patch Notes) has its centre left of the
+		screen middle, so it was skipped, and the run was measured from the button AFTER it.
+
+		Starting at the rightmost box and stepping left across every gap smaller than the slack
+		asks the question that actually matters -- where does this run of buttons begin -- and it
+		does not care how wide any one of them is, how many there are (mobile shows one more than
+		PC), or where the screen's midpoint happens to fall.
+
+		The repeat-until-settled walk is quadratic in the worst case, over a handful of boxes, once
+		a second. Sorting them to do it in one pass costs more than it saves at this size.
+	]]
+	local run
+	for _, box in boxes do
+		if not run or box.Right > run.Right then
+			run = box
+		end
+	end
+
+	local edge, row = run.Left, run
+	local extended = true
+	while extended do
+		extended = false
+		for _, box in boxes do
+			if box.Left < edge and box.Right >= (edge - topbarClusterSlack) then
+				edge = box.Left
+				row = box
+				extended = true
+			end
+		end
+	end
 
 	--[[
 		Our ScreenGui has IgnoreGuiInset set, so its offsets are true screen pixels. A ScreenGui
@@ -842,7 +880,7 @@ local function vapeButtonPosition()
 	-- The bar reports negative Y while the client has it slid off screen (in its own menu, or
 	-- mid-transition). Following it there would park our button off screen too, so only the
 	-- horizontal placement is taken from it and the row falls back to the default height.
-	local top = row.AbsolutePosition.Y + inset + ((row.AbsoluteSize.Y - vapeButtonSize) / 2)
+	local top = row.Top + inset + ((row.Height - vapeButtonSize) / 2)
 	if top < 0 then
 		top = 4
 	end
