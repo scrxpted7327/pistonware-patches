@@ -8206,6 +8206,15 @@ components = {
 		
 		function component:Load(data)
 			local newValue = data.Value == data.Max and data.Max ~= self.Max and self.Max or data.Value
+			-- Clamp to the CURRENT range. A saved value only rescales above when it was
+			-- sitting exactly on the old max; a value that was merely inside a larger old
+			-- range came through untouched, so lowering a Max in the module source left every
+			-- existing profile holding the old out-of-range number -- and Save writes it back
+			-- out with the new Max beside it, so it survives forever and spreads to anyone
+			-- who downloads the profile.
+			if isFiniteNumber(newValue) then
+				newValue = math.clamp(newValue, props.Min or 0, self.Max)
+			end
 			if self.Value ~= newValue then
 				self:SetValue(newValue, nil, true)
 			end
@@ -9307,12 +9316,22 @@ components = {
 		end
 		
 		function component:Load(data)
-			if self.ValueMin ~= data.ValueMin then
-				self:SetValue(false, data.ValueMin)
+			-- Same clamp as Slider:Load -- a lowered Max must not leave a stale saved value
+			-- above it (see the comment there).
+			local newMin, newMax = data.ValueMin, data.ValueMax
+			if isFiniteNumber(newMin) then
+				newMin = math.clamp(newMin, props.Min or 0, self.Max)
+			end
+			if isFiniteNumber(newMax) then
+				newMax = math.clamp(newMax, props.Min or 0, self.Max)
 			end
 		
-			if self.ValueMax ~= data.ValueMax then
-				self:SetValue(true, data.ValueMax)
+			if self.ValueMin ~= newMin then
+				self:SetValue(false, newMin)
+			end
+		
+			if self.ValueMax ~= newMax then
+				self:SetValue(true, newMax)
 			end
 		end
 		
