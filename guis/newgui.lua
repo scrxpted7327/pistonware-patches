@@ -764,11 +764,13 @@ end
 	turns on and whether the player is in a menu -- so on plenty of phones our button landed on
 	top of one of Roblox's own.
 
-	So measure rather than guess: find the leftmost visible element on the right-hand half of the
-	top bar and sit just clear of it. If TopBarAppGui is not there at all -- older clients, which
-	is what mobile executors repackage -- nothing is measured and the old offset stands.
+	So measure rather than guess: find the leftmost visible button on the right-hand half of the
+	top bar and sit immediately to its left, 7px clear -- the same gap the client puts between
+	its own buttons, so ours reads as one more of them. If TopBarAppGui is not there at all --
+	older clients, which is what mobile executors repackage -- nothing is measured and the old
+	offset stands.
 ]]
-local topbarGap = 8
+local topbarGap = 7
 local vapeButtonSize = 32
 local vapeButtonFallback = UDim2.new(1, -90, 0, 4)
 
@@ -782,17 +784,44 @@ local function vapeButtonPosition()
 		return nil
 	end
 
-	-- Right half only. The left of the bar is the Roblox logo and the chat button, which is the
-	-- side we do NOT want to be pushed onto.
+	--[[
+		Descendants, not children.
+
+		TopBarApp's direct children are layout containers, and a container is as wide as the
+		stretch of bar it owns rather than as wide as the buttons inside it -- so measuring those
+		gave an edge tens of pixels away from anything actually drawn. The buttons themselves sit
+		a level or two down (the leftmost of the right cluster is the one named '1'), so the walk
+		has to reach them.
+
+		Bounded by height: a container that happens to be button-sized is harmless, but the full
+		-height wrappers are not, and 60px is comfortably above any real top-bar button.
+	]]
 	local middle = topbar.AbsolutePosition.X + (topbar.AbsoluteSize.X / 2)
 	local edge, row
 
-	for _, child in topbar:GetChildren() do
-		if child:IsA('GuiObject') and child.Visible and child.AbsoluteSize.X > 0 and child.AbsoluteSize.Y > 0 then
-			local left = child.AbsolutePosition.X
-			if (left + (child.AbsoluteSize.X / 2)) > middle and (not edge or left < edge) then
+	for _, obj in topbar:GetDescendants() do
+		if
+			obj:IsA('GuiObject') and obj.Visible
+			and obj.AbsoluteSize.X > 0 and obj.AbsoluteSize.Y > 0 and obj.AbsoluteSize.Y <= 60
+		then
+			-- A visible button inside a hidden wrapper is still not on screen, and Visible is
+			-- per-object -- the client hides whole clusters by the wrapper, never the buttons.
+			local shown = true
+			local parent = obj.Parent
+			while parent and parent ~= topbar do
+				if parent:IsA('GuiObject') and not parent.Visible then
+					shown = false
+					break
+				end
+				parent = parent.Parent
+			end
+
+			local left = obj.AbsolutePosition.X
+			-- Right half only. The left of the bar is the Roblox logo and the chat button, which
+			-- is the side we do NOT want to be pushed onto.
+			if shown and (left + (obj.AbsoluteSize.X / 2)) > middle and (not edge or left < edge) then
 				edge = left
-				row = child
+				row = obj
 			end
 		end
 	end
@@ -810,9 +839,17 @@ local function vapeButtonPosition()
 		inset = guiService:GetGuiInset().Y
 	end
 
+	-- The bar reports negative Y while the client has it slid off screen (in its own menu, or
+	-- mid-transition). Following it there would park our button off screen too, so only the
+	-- horizontal placement is taken from it and the row falls back to the default height.
+	local top = row.AbsolutePosition.Y + inset + ((row.AbsoluteSize.Y - vapeButtonSize) / 2)
+	if top < 0 then
+		top = 4
+	end
+
 	return UDim2.fromOffset(
 		math.max(math.floor(edge - topbarGap - vapeButtonSize), 0),
-		math.max(math.floor(row.AbsolutePosition.Y + inset + ((row.AbsoluteSize.Y - vapeButtonSize) / 2)), 0)
+		math.floor(top)
 	)
 end
 
