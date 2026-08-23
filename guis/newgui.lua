@@ -755,6 +755,101 @@ local function blurEnabled(blur)
 	return blur.Visible
 end
 
+--[[
+	Where the mobile button sits.
+
+	It used to be a hardcoded (1, -90) from the right edge, measured against a top bar that no
+	longer looks like that. The current client draws its buttons out of TopBarAppGui.TopBarApp,
+	and where that cluster ends moves with the device, the notch, the buttons the game itself
+	turns on and whether the player is in a menu -- so on plenty of phones our button landed on
+	top of one of Roblox's own.
+
+	So measure rather than guess: find the leftmost visible element on the right-hand half of the
+	top bar and sit just clear of it. If TopBarAppGui is not there at all -- older clients, which
+	is what mobile executors repackage -- nothing is measured and the old offset stands.
+]]
+local topbarGap = 8
+local vapeButtonSize = 32
+local vapeButtonFallback = UDim2.new(1, -90, 0, 4)
+
+local function vapeButtonPosition()
+	local players = cloneref(game:GetService('Players'))
+	local localPlayer = players.LocalPlayer
+	local playerGui = localPlayer and localPlayer:FindFirstChildOfClass('PlayerGui')
+	local topbarGui = playerGui and playerGui:FindFirstChild('TopBarAppGui')
+	local topbar = topbarGui and topbarGui:FindFirstChild('TopBarApp')
+	if not (topbar and topbar:IsA('GuiObject')) or topbar.AbsoluteSize.X <= 0 then
+		return nil
+	end
+
+	-- Right half only. The left of the bar is the Roblox logo and the chat button, which is the
+	-- side we do NOT want to be pushed onto.
+	local middle = topbar.AbsolutePosition.X + (topbar.AbsoluteSize.X / 2)
+	local edge, row
+
+	for _, child in topbar:GetChildren() do
+		if child:IsA('GuiObject') and child.Visible and child.AbsoluteSize.X > 0 and child.AbsoluteSize.Y > 0 then
+			local left = child.AbsolutePosition.X
+			if (left + (child.AbsoluteSize.X / 2)) > middle and (not edge or left < edge) then
+				edge = left
+				row = child
+			end
+		end
+	end
+
+	if not row then return nil end
+
+	--[[
+		Our ScreenGui has IgnoreGuiInset set, so its offsets are true screen pixels. A ScreenGui
+		without it -- which TopBarAppGui may or may not be, depending on client version -- reports
+		AbsolutePosition with the inset already taken off, and lining the two up without adding it
+		back puts our button the height of the top bar too high.
+	]]
+	local inset = 0
+	if topbarGui:IsA('ScreenGui') and not topbarGui.IgnoreGuiInset then
+		inset = guiService:GetGuiInset().Y
+	end
+
+	return UDim2.fromOffset(
+		math.max(math.floor(edge - topbarGap - vapeButtonSize), 0),
+		math.max(math.floor(row.AbsolutePosition.Y + inset + ((row.AbsoluteSize.Y - vapeButtonSize) / 2)), 0)
+	)
+end
+
+--[[
+	Polled rather than driven off a signal.
+
+	The top bar does not move by tweening one frame around: it rebuilds its children when the
+	game toggles a core GUI, when the player rotates the device, and when the client swaps to its
+	in-experience menu -- so the instance any connection was bound to is frequently the one that
+	just got destroyed. A second is imperceptible for a button that only has to be out of the way
+	by the time a thumb reaches for it, and the read is four AbsolutePosition lookups.
+]]
+local function anchorVapeButton(button)
+	local current
+
+	local function apply()
+		local position = vapeButtonPosition() or vapeButtonFallback
+		if current ~= position then
+			current = position
+			button.Position = position
+		end
+	end
+
+	apply()
+
+	local thread = task.spawn(function()
+		while button.Parent do
+			task.wait(1)
+			pcall(apply)
+		end
+	end)
+
+	if vape.Clean then
+		vape:Clean(thread)
+	end
+end
+
 local function addCorner(parent, radius)
 	local corner = Instance.new('UICorner')
 	corner.CornerRadius = radius or UDim.new(0, 5)
@@ -994,16 +1089,58 @@ end
 	killing a client outright rather than throwing a Lua error. A Lua error prints red and the
 	game carries on; a crash on open is native, and this is the only native surface here.
 
-	Skipped on touch devices, where the cost is highest and the benefit is a cosmetic backdrop
-	nobody asked for. The toggle also defaults off there, so the setting matches the behaviour
-	rather than claiming a blur that is not happening.
+	Not on touch devices, where the cost is highest and where the older client mobile executors
+	ship does not have the method at all. Those get setMobileBlur below instead -- the toggle
+	used to be dead on a phone because this function bailed before doing anything.
 
 	pcall'd on top: the method is executor- and client-version dependent, and a throw here used
 	to abort whichever handler called it -- which includes the one that opens the menu.
 ]]
+local lighting = cloneref(game:GetService('Lighting'))
+local mobileBlur
+
+--[[
+	The blur a phone gets.
+
+	SetRobloxGuiFocused is off the table there (see above), so 'Blur background' did nothing on
+	every mobile executor -- the toggle saved, flipped, and had no effect.
+
+	A BlurEffect is a plain instance every client can create, and it needs no native call and no
+	elevated thread. It blurs the world behind the menu rather than the core UI, which is what
+	the toggle's own description promises and close enough to what the desktop path draws.
+
+	Destroyed rather than parked at Size 0 when the menu closes, so nothing of ours sits in
+	Lighting while the GUI is shut -- and, since it is a fresh instance each time, a client that
+	wipes Lighting between rounds cannot leave the toggle pointing at a dead effect.
+]]
+local function setMobileBlur(enabled)
+	if enabled then
+		if mobileBlur and mobileBlur.Parent then return end
+
+		local created, effect = pcall(Instance.new, 'BlurEffect')
+		if not created then return end
+
+		effect.Name = randomString()
+		effect.Size = 18
+		effect.Parent = lighting
+		mobileBlur = effect
+	elseif mobileBlur then
+		pcall(function()
+			mobileBlur:Destroy()
+		end)
+		mobileBlur = nil
+	end
+end
+
 function vape:BlurCheck()
-	if not self.ThreadFix then return end
-	if inputService.TouchEnabled then return end
+	-- self.Blur is the toggle, and it does not exist yet the first time the settings pane is
+	-- built -- every read of it goes through this, not just the mobile one.
+	local wanted = clickgui.Visible and self.Blur ~= nil and self.Blur.Enabled
+
+	if inputService.TouchEnabled or not self.ThreadFix then
+		setMobileBlur(wanted)
+		return
+	end
 
 	setthreadidentity(8)
 	pcall(function()
@@ -1272,8 +1409,8 @@ function vape:Load(skipgui, profile)
 		local button = Instance.new('TextButton')
 		button.BackgroundColor3 = Color3.new()
 		button.BackgroundTransparency = 0.2
-		button.Position = UDim2.new(1, -90, 0, 4)
-		button.Size = UDim2.fromOffset(32, 32)
+		button.Position = vapeButtonFallback
+		button.Size = UDim2.fromOffset(vapeButtonSize, vapeButtonSize)
 		button.Text = ''
 		button.Parent = gui
 		local image = Instance.new('ImageLabel')
@@ -1283,6 +1420,7 @@ function vape:Load(skipgui, profile)
 		image.Size = UDim2.fromOffset(20, 20)
 		image.Parent = button
 		addCorner(button, UDim.new(1, 0))
+		anchorVapeButton(button)
 
 		self.VapeButton = button
 		self.VapeButtonImage = image
@@ -2216,9 +2354,10 @@ function vape:LoadGUI()
 		Function = function()
 			vape:BlurCheck()
 		end,
-		-- Off by default on a phone. See BlurCheck: this drives a full-screen GPU pass, and it
-		-- is the only thing the menu does on open that a client can die on rather than error on.
-		Default = not inputService.TouchEnabled,
+		-- On everywhere now. A phone drives the BlurEffect path in BlurCheck rather than the
+		-- native SetRobloxGuiFocused call, which is the one thing the menu does on open that a
+		-- client can die on rather than error on -- so the reason this defaulted off is gone.
+		Default = true,
 		Tooltip = 'Blur the background of the GUI'
 	})
 	
@@ -3695,6 +3834,11 @@ function vape:Uninject()
 		clickgui.Visible = false
 		self:BlurCheck()
 	end
+
+	-- Unconditional: the BlurCheck above is behind ThreadFix, and the executors without it are
+	-- exactly the mobile ones that were using the BlurEffect. Unloading must not leave the world
+	-- blurred with no menu to turn it off from.
+	setMobileBlur(false)
 
 	gui:ClearAllChildren()
 	gui:Destroy()
