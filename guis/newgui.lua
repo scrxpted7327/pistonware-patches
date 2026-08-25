@@ -167,12 +167,52 @@ local function viewportWidth()
 	return width
 end
 
+--[[
+	Which executor this is, asked once.
+
+	identifyexecutor is missing on some executors and THROWS on others, so it goes behind a
+	pcall and the answer is kept -- main.lua guards its own call the same way, for the same
+	reason. Lower-cased because the name is a vendor string and nothing guarantees its casing
+	from one build to the next.
+]]
+local executorName = ''
+pcall(function()
+	executorName = identifyexecutor and tostring(({identifyexecutor()})[1] or '') or ''
+end)
+executorName = executorName:lower()
+
+--[[
+	The Mac executors report TouchEnabled = true on a desktop.
+
+	UserInputService.TouchEnabled is the only thing this GUI had to go on, and on Opiumware and
+	MacSploit it answers yes on a Mac with no touchscreen anywhere near it. Everything keyed off
+	it then treats the machine as a phone -- including the rescale, which is why a Mac user ends
+	up with a menu shrunk for a handset on a full-size display.
+
+	Kept as a separate question rather than replacing the touch check: TouchEnabled is still the
+	right thing to ask about INPUT (a hold gesture, an on-screen button), and it is only the
+	'this is a small screen' inference drawn from it that is wrong here.
+]]
+local isMacExecutor = executorName:find('opiumware') ~= nil or executorName:find('macsploit') ~= nil
+
+local function isMobile()
+	return inputService.TouchEnabled and not isMacExecutor
+end
+
 --[[ The old GUI's rescale, restored exactly: never below half size, never above 1:1.
 
 The rewrite had math.max(width / 1920, 0.6) -- no upper bound at all. Phones report their
 render resolution here, so a 2400-wide handset asked for a 1.25x menu on the smallest screen
 in the lineup, and the window ran off the edge with no way to drag it back. ]]
 local function autoScaleValue()
+	--[[ Left at 1:1 on the Mac executors. Their displays are full size and their windows are
+	narrower than 1920 as a matter of course, so the width rule alone shrinks a menu that has no
+	reason to shrink. Auto rescale can still be turned off and the slider used, exactly as
+	before; this only changes what AUTO means on a machine that was being misread as a phone. ]]
+	if isMacExecutor then
+		return 1
+	end
+
 	local width = viewportWidth()
 	if width <= 0 then return 1 end
 	return math.clamp(width / 1920, 0.4, 1)
@@ -291,6 +331,29 @@ local function writeJson(path, data)
 
 	local ok, err = pcall(writefile, path, encoded)
 	return ok, err
+end
+
+--[[
+	A profile name is a FILE PATH, not a label.
+
+	Every load and save builds 'pistonware/profiles/'..Profile..Place..'.txt' out of it and hands
+	that to the executor's filesystem. So whatever ends up in a profile name is what isfile,
+	readfile and writefile are called with -- and the Profiles tab's name box accepted anything
+	typed or pasted into it, including a 15KB exported profile. That name was then saved as the
+	active profile, and the isfile call at the top of the next vape:Load took the whole client
+	down. Once saved it recurred on every inject, because the crash happened before anything
+	could write a corrected file back.
+
+	Length and character set both matter: the length is what kills the filesystem call, and the
+	character set is what stops a name from escaping the profiles folder or being rejected
+	outright by the OS. Anything failing this is not repaired or truncated -- a truncated name
+	silently points at a different profile's file.
+]]
+local function usableProfileName(name)
+	return type(name) == 'string'
+		and name ~= ''
+		and #name <= 32
+		and not name:find('[^%w_%- ]')
 end
 
 --[[
@@ -1366,6 +1429,12 @@ function vape:Load(skipgui, profile)
 		end
 
 		self.Profile = profile or guiData.Profile or 'default'
+		--[[ The last line of defence, and the one that matters most: this is read straight out of
+		gui.txt, so a file already carrying a bad name has to be survivable. Falling back here is
+		what lets a client that is crashing on every inject boot once more and write a sane file. ]]
+		if not usableProfileName(self.Profile) then
+			self.Profile = 'default'
+		end
 		if self.ProfileLabel then
 			self.ProfileLabel.Text = #self.Profile > 10 and self.Profile:sub(1, 10)..'...' or self.Profile
 			self.ProfileLabel.Size = UDim2.fromOffset(getfontbounds(self.ProfileLabel.Text, self.ProfileLabel.TextSize, self.ProfileLabel.Font).X + 16, 24)
@@ -1383,6 +1452,20 @@ function vape:Load(skipgui, profile)
 
 	if not self.Categories.Profiles:GetValue('default') then
 		self.Categories.Profiles:ChangeValue('default', true)
+	end
+
+	--[[ The FFlags list gets the same guarantee the profile list gets above: one entry that is
+	always there. Every part of that tab -- import, export, apply -- is written against a set
+	existing to put flags in, so an install that has imported nothing would otherwise open on an
+	empty list with no obvious first move.
+
+	ChangeValue on a name the list does not hold is its ADD half, so this creates the row and,
+	through the list's own Function, pistonware/fflags and default.txt inside it. It is also
+	what the FFlags selection falls back to, which is why the list refuses to delete it.
+	Guarded on the category existing at all: Load runs against whatever LoadGUI built, and a
+	game file could be driving an older one. ]]
+	if self.Categories.FFlags and not self.Categories.FFlags:GetValue('default') then
+		self.Categories.FFlags:ChangeValue('default', true)
 	end
 
 	if isfile('pistonware/profiles/'..self.Profile..self.Place..'.txt') then
@@ -1476,7 +1559,9 @@ function vape:Load(skipgui, profile)
 	]]
 	self.SaveNeeded = nil
 
-	if inputService.TouchEnabled and not skipgui then
+	--[[ isMobile, not TouchEnabled: this is the on-screen button that exists because a phone has
+	no keyboard to press the GUI bind with, and a Mac reporting touch does have one. ]]
+	if isMobile() and not skipgui then
 		local button = Instance.new('TextButton')
 		button.BackgroundColor3 = Color3.new()
 		button.BackgroundTransparency = 0.2
@@ -1782,7 +1867,7 @@ function vape:LoadGUI()
 	})
 
 	--[[
-		Profile sync -- 'Sync to current profiles', plus the Blatant/Legit default picker.
+		Profile sync -- 'Sync to latest profiles', plus the Blatant/Legit default picker.
 
 		Redownloads pistonware/profiles the way loader.lua does on a first install: every file
 		the repo keeps in that folder, pulled from the raw host through the same 4-attempt retry
@@ -1979,7 +2064,7 @@ function vape:LoadGUI()
 		syncbutton.LayoutOrder = 999
 		syncbutton.Size = UDim2.fromOffset(200, 33)
 		syncbutton.BackgroundColor3 = color.Light(uipallet.Main, 0.02)
-		syncbutton.Text = 'Sync to current profiles'
+		syncbutton.Text = 'Sync to latest profiles'
 		-- Static black, and never touched again: the background under it is the GUI colour now,
 		-- so anything that varied with the colour or with hover read as the label flickering.
 		syncbutton.TextColor3 = Color3.new(0, 0, 0)
@@ -2023,7 +2108,7 @@ function vape:LoadGUI()
 			local synced, message = downloadProfiles(latest)
 			syncing = false
 			if not synced then
-				syncbutton.Text = 'Sync to current profiles'
+				syncbutton.Text = 'Sync to latest profiles'
 				vape:CreateNotification('Pistonware', message, 10, 'alert')
 				return
 			end
@@ -2111,7 +2196,7 @@ function vape:LoadGUI()
 
 		local function selectConfig(name)
 			if not isfile('pistonware/profiles/'..name..vape.Place..'.txt') then
-				vape:CreateNotification('Pistonware', 'There is no '..name..' config for this game yet, press Sync to current profiles first.', 10, 'alert')
+				vape:CreateNotification('Pistonware', 'There is no '..name..' config for this game yet, press Sync to latest profiles first.', 10, 'alert')
 				return
 			end
 			-- Always a full reload, never an in-place profile switch. The GUI theme colour, window
@@ -2213,6 +2298,892 @@ function vape:LoadGUI()
 		defaultrow.MouseEnter:Connect(refreshConfigButtons)
 		refreshConfigButtons()
 	end
+
+	--[[
+		Profile import / export.
+
+		A profile is one JSON file on disk (pistonware/profiles/<name><Place>.txt), so sharing
+		one is only a matter of moving that file's text around. It travels inside an envelope
+		rather than raw: the envelope carries the name it was exported under and the place it
+		belongs to, which is what lets Import name the new file and warn when a config from a
+		different game is pasted in. A raw config is still accepted -- pasting the file contents
+		straight in is the obvious thing to try -- it just arrives without a name.
+
+		Both directions go through the clipboard first and pistonware/exports second. Clipboard
+		access is an executor extension and plenty of them do not have it, so the folder is not
+		a fallback that only appears on failure: an export always writes it, and an import that
+		finds nothing on the clipboard reads pistonware/exports/import.txt.
+	]]
+	local EXPORT_FOLDER = 'pistonware/exports'
+
+	local function ensureFolder(path)
+		local ok, exists = pcall(isfolder, path)
+		if ok and exists then return end
+		pcall(makefolder, path)
+	end
+
+	local function setClipboard(text)
+		local setter = setclipboard or toclipboard or set_clipboard
+		return setter ~= nil and (pcall(setter, text))
+	end
+
+	local function getClipboard()
+		local getter = getclipboard or get_clipboard
+		if not getter then return nil end
+		local suc, res = pcall(getter)
+		return (suc and type(res) == 'string' and res ~= '') and res or nil
+	end
+
+	--[[
+		Exports are packed, because a phone cannot paste a big one.
+
+		A profile for this place is ~15KB of JSON. On desktop that pastes fine; on mobile the
+		on-screen keyboard truncates a paste that size, so what lands in the box is a broken
+		fragment that fails to decode with nothing useful to say about why.
+
+		LZW over the JSON, packed at 9-16 bits, then base64 -- roughly 2.3x smaller on a profile
+		and 1.8x on a flag set. Base64 rather than the raw bytes because the packed form is
+		binary, and a clipboard round trip through a TextBox is not binary-safe.
+
+		Reading stays permissive: anything that is not marked with the prefix is treated as plain
+		JSON, so an older export, a hand-written config and a flag set copied out of any other
+		tool all still work. Only writing changed.
+	]]
+	local PACK_PREFIX = 'PW1|'
+	local B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+	local b64Lookup
+
+	local function base64Encode(data)
+		local out = table.create(math.ceil(#data / 3) * 4)
+
+		for index = 1, #data, 3 do
+			local a, b, c = data:byte(index, index + 2)
+			local n = a * 65536 + (b or 0) * 256 + (c or 0)
+			local one = n // 262144
+			local two = (n // 4096) % 64
+			local three = (n // 64) % 64
+			local four = n % 64
+			out[#out + 1] = B64_CHARS:sub(one + 1, one + 1)
+			out[#out + 1] = B64_CHARS:sub(two + 1, two + 1)
+			out[#out + 1] = B64_CHARS:sub(three + 1, three + 1)
+			out[#out + 1] = B64_CHARS:sub(four + 1, four + 1)
+		end
+
+		local text = table.concat(out)
+		-- One or two bytes short of a group means one or two characters of that group are noise.
+		local remainder = #data % 3
+		if remainder == 1 then
+			return text:sub(1, -3)..'=='
+		elseif remainder == 2 then
+			return text:sub(1, -2)..'='
+		end
+		return text
+	end
+
+	local function base64Decode(text)
+		if not b64Lookup then
+			b64Lookup = {}
+			for index = 1, 64 do
+				b64Lookup[B64_CHARS:sub(index, index)] = index - 1
+			end
+		end
+
+		--[[ Padding and any whitespace a chat client wrapped the blob in are dropped rather than
+		rejected: how many bytes the last group carries is recoverable from how many characters
+		it has, so '=' tells us nothing we cannot see. ]]
+		text = text:gsub('[^A-Za-z0-9+/]', '')
+
+		local out = table.create((#text // 4) * 3)
+		for index = 1, #text, 4 do
+			local a = b64Lookup[text:sub(index, index)] or 0
+			local b = b64Lookup[text:sub(index + 1, index + 1)] or 0
+			local c = b64Lookup[text:sub(index + 2, index + 2)]
+			local d = b64Lookup[text:sub(index + 3, index + 3)]
+			local n = a * 262144 + b * 4096 + (c or 0) * 64 + (d or 0)
+			out[#out + 1] = string.char(n // 65536)
+			if c then
+				out[#out + 1] = string.char((n // 256) % 256)
+			end
+			if d then
+				out[#out + 1] = string.char(n % 256)
+			end
+		end
+
+		return table.concat(out)
+	end
+
+	--[[ Codes widen from 9 bits as the dictionary fills, which is most of where the saving over a
+	fixed 16-bit code comes from: the first 256 entries of a JSON blob are almost all single
+	characters and would otherwise cost two bytes each. Capped at 16 bits -- the dictionary stops
+	growing there rather than being reset, which costs a little on a very large input and keeps
+	both ends trivially in agreement about the width. ]]
+	local function lzwPack(text)
+		local dictionary = {}
+		for index = 0, 255 do
+			dictionary[string.char(index)] = index
+		end
+
+		local nextCode, width = 256, 9
+		local bytes = table.create(#text // 2)
+		local accumulator, accumulated = 0, 0
+
+		local function emit(code)
+			accumulator = accumulator * (2 ^ width) + code
+			accumulated += width
+			while accumulated >= 8 do
+				accumulated -= 8
+				local shift = 2 ^ accumulated
+				bytes[#bytes + 1] = string.char((accumulator // shift) % 256)
+				accumulator = accumulator % shift
+			end
+		end
+
+		local word = ''
+		for index = 1, #text do
+			local char = text:sub(index, index)
+			local candidate = word..char
+			if dictionary[candidate] then
+				word = candidate
+			else
+				emit(dictionary[word])
+				if nextCode < 65536 then
+					dictionary[candidate] = nextCode
+					nextCode += 1
+					if nextCode > (2 ^ width) - 1 and width < 16 then
+						width += 1
+					end
+				end
+				word = char
+			end
+		end
+
+		if word ~= '' then
+			emit(dictionary[word])
+		end
+
+		-- Trailing bits are padded out to a whole byte; the unpacker stops on the dictionary, not
+		-- on the byte count, so the padding is never mistaken for another code.
+		if accumulated > 0 then
+			bytes[#bytes + 1] = string.char((accumulator * (2 ^ (8 - accumulated))) % 256)
+		end
+
+		return table.concat(bytes)
+	end
+
+	local function lzwUnpack(data)
+		local dictionary = table.create(65536)
+		for index = 0, 255 do
+			dictionary[index] = string.char(index)
+		end
+
+		local nextCode, width = 256, 9
+		local out = {}
+		local accumulator, accumulated = 0, 0
+		local position = 1
+		local previous
+
+		--[[ The width has to step up ONE code earlier than the packer's dictionary does. The
+		packer widens after adding an entry, so the code it writes at the new width refers to an
+		entry this side has not added yet -- reading it at the old width would take the wrong
+		number of bits and desynchronise everything after it. ]]
+		local function readCode()
+			while accumulated < width do
+				if position > #data then
+					return nil
+				end
+				accumulator = accumulator * 256 + data:byte(position)
+				accumulated += 8
+				position += 1
+			end
+			accumulated -= width
+			local shift = 2 ^ accumulated
+			local code = accumulator // shift
+			accumulator = accumulator % shift
+			return code
+		end
+
+		while true do
+			local code = readCode()
+			if not code then break end
+
+			local entry
+			if dictionary[code] then
+				entry = dictionary[code]
+			elseif code == nextCode and previous then
+				-- The one self-referential case in LZW: a code for a sequence being defined by
+				-- the very code that emits it.
+				entry = previous..previous:sub(1, 1)
+			else
+				break
+			end
+
+			out[#out + 1] = entry
+
+			if previous then
+				if nextCode < 65536 then
+					dictionary[nextCode] = previous..entry:sub(1, 1)
+					nextCode += 1
+				end
+			end
+
+			if nextCode + 1 > (2 ^ width) - 1 and width < 16 then
+				width += 1
+			end
+
+			previous = entry
+		end
+
+		return table.concat(out)
+	end
+
+	local function packExport(text)
+		local ok, packed = pcall(function()
+			return PACK_PREFIX..base64Encode(lzwPack(text))
+		end)
+
+		--[[ Two reasons to hand back the plain JSON. It failed, in which case a blob that is
+		harder to paste still beats no blob at all -- and it came out LONGER, which it does on
+		anything small: base64 costs a third on top, and a set of two flags has nothing for the
+		dictionary to find. Packing there would be a bigger export that also cannot be read by
+		anything else. ]]
+		if not (ok and type(packed) == 'string' and packed ~= '') or #packed >= #text then
+			return text
+		end
+
+		return packed
+	end
+
+	local function unpackImport(text)
+		if text:sub(1, #PACK_PREFIX) ~= PACK_PREFIX then
+			return text
+		end
+		local ok, plain = pcall(function()
+			return lzwUnpack(base64Decode(text:sub(#PACK_PREFIX + 1)))
+		end)
+		return (ok and type(plain) == 'string' and plain ~= '') and plain or text
+	end
+
+	local function writeExport(name, blob)
+		ensureFolder(EXPORT_FOLDER)
+		return (pcall(writefile, EXPORT_FOLDER..'/'..name..'.txt', blob))
+	end
+
+	--[[ The blob the user pasted, wherever they managed to put it.
+
+	The text box is asked first and everything else is a fallback: it is the only one of the
+	three that the user can see, so when there is something in it, that is unambiguously what
+	they meant to import -- even on an executor whose clipboard also happens to hold an old
+	export. ]]
+	local function readImport(box, fallbackpath)
+		if box and type(box.Value) == 'string' then
+			local typed = box.Value:gsub('^%s+', ''):gsub('%s+$', '')
+			if typed ~= '' then return typed end
+		end
+		local blob = getClipboard()
+		if blob then return blob end
+		for _, path in {fallbackpath, EXPORT_FOLDER..'/import.txt'} do
+			local suc, res = pcall(readfile, path)
+			if suc and type(res) == 'string' and res ~= '' then
+				return res
+			end
+		end
+		return nil
+	end
+
+	local function decodeImport(blob)
+		local suc, res = pcall(function()
+			return httpService:JSONDecode(unpackImport(blob))
+		end)
+		return (suc and type(res) == 'table') and res or nil
+	end
+
+	--[[ Filenames are built out of these, so anything a filesystem could refuse -- a slash, a
+	colon, a leading space -- is dropped here rather than handed to writefile, which on most
+	executors fails with an error that says nothing about the name being the problem. ]]
+	local function sanitizeName(name)
+		if type(name) ~= 'string' then return nil end
+		name = name:gsub('[^%w_%- ]', '')
+		name = name:gsub('^%s+', ''):gsub('%s+$', '')
+		return name ~= '' and name:sub(1, 24) or nil
+	end
+
+	--[[ An import keeps the name it was exported under, so the entry that appears in the list is
+	the one the person who sent it is talking about. That means a name already in use is
+	REPLACED rather than sidestepped with a number: two rows called the same thing would be two
+	rows fighting over one file (see CreateProfile), and a numbered copy is not the profile
+	anyone asked to import. Nothing is written before the payload has been validated, and the
+	box is emptied only once it has. ]]
+
+	local function exportProfile()
+		--[[ Flushed first. Everything toggled since the last autosave is still in memory, and an
+		export read off the file alone would quietly ship the older state. ]]
+		pcall(function() vape:Save() end)
+
+		local path = 'pistonware/profiles/'..vape.Profile..vape.Place..'.txt'
+		local data = isfile(path) and loadJson(path)
+		if type(data) ~= 'table' then
+			vape:CreateNotification('Pistonware', 'Nothing to export -- the '..vape.Profile..' profile has no file for this game yet.', 10, 'alert')
+			return
+		end
+
+		local suc, blob = pcall(httpService.JSONEncode, httpService, {
+			Pistonware = 'profile',
+			Version = 1,
+			Name = vape.Profile,
+			Place = vape.Place,
+			GameId = tostring(game.GameId),
+			Data = data
+		})
+		if not suc then
+			vape:CreateNotification('Pistonware', 'Export failed, '..tostring(blob), 10, 'alert')
+			return
+		end
+
+		blob = packExport(blob)
+		local filename = 'profile-'..vape.Profile..vape.Place
+		local wrote = writeExport(filename, blob)
+		if setClipboard(blob) then
+			vape:CreateNotification('Pistonware', 'Copied the <font color="#FFAA00">'..vape.Profile..'</font> profile to your clipboard'..(wrote and ' and to '..EXPORT_FOLDER..'/'..filename..'.txt.' or '.'), 10)
+		elseif wrote then
+			vape:CreateNotification('Pistonware', 'Your executor has no clipboard access, so the profile was written to '..EXPORT_FOLDER..'/'..filename..'.txt instead.', 10)
+		else
+			vape:CreateNotification('Pistonware', 'Export failed -- could not reach the clipboard or write to '..EXPORT_FOLDER..'.', 10, 'alert')
+		end
+	end
+
+	-- Assigned below; importProfile is its own Function, so the two cannot be declared together.
+	local profileimportbox
+
+	local function importProfile()
+		local blob = readImport(profileimportbox, EXPORT_FOLDER..'/importprofile.txt')
+		if not blob then
+			vape:CreateNotification('Pistonware', 'Nothing to import -- paste a profile into the box above, or copy one to your clipboard.', 10, 'alert')
+			return
+		end
+
+		local decoded = decodeImport(blob)
+		if not decoded then
+			vape:CreateNotification('Pistonware', 'That does not look like a profile (it is not readable JSON).', 10, 'alert')
+			return
+		end
+
+		--[[ Two shapes are accepted: this GUI's envelope, and a bare config file. The bare one is
+		recognised by the keys vape:Save writes, so a random JSON object cannot land on disk as a
+		profile that then fails to load with no explanation. ]]
+		local payload, name = decoded, nil
+		if decoded.Pistonware == 'profile' and type(decoded.Data) == 'table' then
+			payload, name = decoded.Data, decoded.Name
+			if type(decoded.Place) == 'string' and decoded.Place ~= vape.Place then
+				vape:CreateNotification('Pistonware', 'Heads up: that profile was exported for a different game, most of its modules will not exist here.', 10, 'alert')
+			end
+		elseif type(payload.Modules) ~= 'table' and type(payload.Categories) ~= 'table' then
+			vape:CreateNotification('Pistonware', 'That JSON is not a pistonware profile.', 10, 'alert')
+			return
+		end
+
+		-- Only a bare config arrives without one, and it has to be filed under something.
+		name = sanitizeName(name) or 'imported'
+		local existed = profilescategory:GetValue(name) ~= nil
+
+		local ok, err = writeJson('pistonware/profiles/'..name..vape.Place..'.txt', payload)
+		if not ok then
+			vape:CreateNotification('Pistonware', 'Import failed, '..tostring(err), 10, 'alert')
+			return
+		end
+
+		--[[ Adds the row to the Profiles list, but only when it is not already there: on a name
+		that IS listed, ChangeValue is the delete half of this list's toggle and would remove the
+		row (and the file) that was just written. Either way the profile is not loaded -- switching
+		is a save-and-reload the user should be the one to ask for. ]]
+		if not existed then
+			profilescategory:ChangeValue(name)
+		end
+
+		-- Emptied only on the success path, so a rejected paste is still there to be fixed.
+		if profileimportbox then
+			profileimportbox:SetValue('')
+		end
+
+		vape:CreateNotification('Pistonware', (existed and 'Replaced <font color="#FFAA00">' or 'Imported as <font color="#FFAA00">')..name..'</font>, click it in the Profiles list to load it.', 10)
+	end
+
+	--[[
+		In the list itself rather than behind the gear, in the gap between the profile rows and
+		the sync button.
+
+		The layout here is ordered, not stacked: the rows are built with the default LayoutOrder
+		of 0, 'Sync to latest profiles' pins itself at 999 and the Blatant/Legit picker at 1000,
+		both so that ChangeValue rebuilding every row cannot reshuffle them. 1001-1003 puts this
+		group last -- under the sync button and under the config picker -- and holds that position
+		through a rebuild for the same reason.
+
+		Being last is what keeps a first run tidy. The Blatant/Legit row hides itself until those
+		configs are actually on disk (see refreshConfigButtons), and an invisible child is skipped
+		by the list layout rather than leaving a gap. So on a fresh install this group sits
+		directly under the sync button, and the moment a sync puts the configs there the picker
+		appears between them and pushes this group down by one row. Ordering it above the sync
+		button instead would mean the picker appearing UNDER the import controls, separated from
+		the button that produced it.
+
+		Enter imports, so the box works on its own; the button below it is for the executors whose
+		FocusLost never reports one. The value is cleared after a successful import rather than
+		kept, which also keeps a whole config out of gui.txt -- TextBox saves what it holds.
+	]]
+	profilescategory.Inline:CreateButton({
+		Name = 'Export profile',
+		Darker = true,
+		LayoutOrder = 1003,
+		Function = exportProfile,
+		Tooltip = 'Copies the profile you are on to your clipboard and to '..EXPORT_FOLDER
+	})
+
+	profileimportbox = profilescategory.Inline:CreateTextBox({
+		Name = 'Import profile',
+		Darker = true,
+		LayoutOrder = 1001,
+		Placeholder = 'Paste an exported profile',
+		Function = function(enter)
+			if enter then
+				importProfile()
+			end
+		end,
+		Tooltip = 'Paste a profile here and press Enter, or use the button below'
+	})
+
+	profilescategory.Inline:CreateButton({
+		Name = 'Import pasted profile',
+		Darker = true,
+		LayoutOrder = 1002,
+		Function = importProfile,
+		Tooltip = 'Imports what is in the box above, falling back to your clipboard or '..EXPORT_FOLDER..'/import.txt'
+	})
+
+	--[[
+		FFlags
+
+		Fast flags are Roblox's own client switches, and it is the executor that sets them --
+		pistonware never can on its own. What this tab owns is the LIST: one named set of flags
+		per file in pistonware/fflags, of which exactly one is current.
+
+		Built on the same list shape as the Profiles tab (Swap = true, see CategoryList), so the
+		rows are identical to look at and to use: type a name to add one, click a row to make it
+		current, the current one wears the GUI colour, the dots menu removes it, and the keybind
+		on the row swaps to it without opening the GUI. What selecting MEANS is the only
+		difference -- a profile swap loads a config, this writes flags into the client.
+
+		A new entry starts as an empty set. It gets filled in either by importing one or by
+		editing pistonware/fflags/<name>.txt by hand, which is why Apply exists as a button as
+		well: a file edited outside the GUI should be applicable without swapping away and back.
+	]]
+	local FFLAG_FOLDER = 'pistonware/fflags'
+	local fflags
+	--[[ Made once, here, rather than on the first write. The folder is where the user is told to
+	go and edit their sets by hand, and an install that has imported nothing yet would otherwise
+	send them looking for a folder that does not exist. Both calls inside are pcall'd, so an
+	executor without makefolder gets nothing rather than a failed inject. ]]
+	ensureFolder(FFLAG_FOLDER)
+
+	local function fflagPath(name)
+		return FFLAG_FOLDER..'/'..name..'.txt'
+	end
+
+	--[[ Which set is current. Mirrors vape.Profile for the Profiles tab, and is persisted the same
+	way -- through the list's own Save, into gui.txt. Declared before the list because the list's
+	callbacks read and write it. ]]
+	local selectedFFlag = 'default'
+	local applyFFlags
+
+	fflags = vape:CreateCategoryList({
+		Name = 'FFlags',
+		--[[ The rewrite ships no fflags icon, and getvapeasset on a path it does not know returns
+		a value that throws 'ContentId formatting failed' the moment it is assigned to .Image --
+		so this borrows utility.png the way the Minigames category above does. ]]
+		Icon = getvapeasset('pistonware/assets/new/utility.png'),
+		Size = UDim2.fromOffset(15, 14),
+		Placeholder = 'Type name',
+		Swap = true,
+		Current = function()
+			return selectedFFlag
+		end,
+		--[[ Swapping applies, because a set that is current but not written to the client is a
+		row that claims something untrue. This is the counterpart of a profile click loading the
+		config it names. ]]
+		Select = function(name)
+			selectedFFlag = name
+			applyFFlags()
+		end,
+		--[[ Removing a row deletes its file, exactly as removing a profile deletes the config it
+		names. Falls back to the entry that can never be removed. ]]
+		Delete = function(name)
+			pcall(function()
+				if isfile(fflagPath(name)) and delfile then
+					delfile(fflagPath(name))
+				end
+			end)
+			if selectedFFlag == name then
+				selectedFFlag = 'default'
+			end
+		end,
+		-- Restoring a saved selection must not write flags into the client on every inject.
+		Restore = function(name)
+			selectedFFlag = name
+		end,
+		Function = function()
+			--[[ Every name in the list gets a file, so a set added by typing is something the user
+			can actually go and edit rather than a row that silently refers to nothing.
+
+			Wrapped, because this is no longer only a click handler: vape:Load seeds the default
+			entry through ChangeValue, which calls this, and an executor whose filesystem calls
+			are missing or restricted would take the whole load down from here. Losing the file
+			for a row costs an empty set the user can still import into. ]]
+			pcall(function()
+				ensureFolder(FFLAG_FOLDER)
+				for _, entry in fflags.List do
+					if type(entry) == 'table' and type(entry.Name) == 'string' and not isfile(fflagPath(entry.Name)) then
+						writeJson(fflagPath(entry.Name), {})
+					end
+				end
+			end)
+		end
+	})
+
+	--[[ Counts string keys rather than using #: a flag set is a map, so its length is always 0. ]]
+	local function countFlags(data)
+		local count = 0
+		for flag in data do
+			if type(flag) == 'string' then
+				count += 1
+			end
+		end
+		return count
+	end
+
+	--[[ The tail both the Apply button and the adder put on their message. Kept in one place so
+	the two can never disagree about what just happened, and so the explanation for a flag that
+	did not stick is written once. ]]
+	local function applySuffix(total, failed, verified, verifiable)
+		local text = failed > 0 and ' ('..failed..' rejected)' or ''
+
+		if not verifiable then
+			-- No getfflag: nothing here can tell a flag that took from one that did not.
+			return text..'. Restart Roblox to apply changes.'
+		end
+
+		if verified >= (total - failed) then
+			return text..'. All of them read back changed; restart Roblox to apply changes that are read at startup.'
+		end
+
+		if verified <= 0 then
+			return text..", but none of them read back changed -- these are read once while the client starts, so they have to go in your executor's own FastFlag settings. Restart Roblox to apply changes."
+		end
+
+		return text..", but only "..verified.." read back changed -- the rest are read once while the client starts. Restart Roblox to apply changes."
+	end
+
+	local function selectedFlags()
+		local data = loadJson(fflagPath(selectedFFlag))
+		return type(data) == 'table' and data or {}
+	end
+
+	--[[
+		A flag that was SET is not a flag that CHANGED.
+
+		setfflag is the executor's function, not Roblox's, and on most of them it returns nothing
+		and throws nothing -- so a pcall around it succeeds whether the engine took the value or
+		ignored it. Counting those successes is what produced 'applied 11 of 11' for a set that
+		visibly did nothing, which is a worse answer than an error would have been.
+
+		Nearly every flag worth setting -- the render, graphics and scheduler ones people share
+		lists for -- is read ONCE while the client starts, into a variable the engine keeps from
+		then on. Writing the flag afterwards changes the flag and not the variable, and a game
+		already running is always afterwards. That is a limit of setting flags from inside a
+		running client, not something this can code around.
+
+		So the value is read back where the executor can do it, and the two numbers are reported
+		separately: how many were set, and how many actually hold the value now. Where there is
+		no getfflag the verified count is not guessed at -- it is left out of the message.
+
+		Returns total, failed, verified, verifiable so the adder can say all of this in one line.
+	]]
+	function applyFFlags(quiet)
+		local setter = setfflag or set_fflag
+		local getter = getfflag or get_fflag
+		local flags = selectedFlags()
+		local total, failed, verified = 0, 0, 0
+
+		for flag, value in flags do
+			if type(flag) ~= 'string' then continue end
+			total += 1
+
+			--[[ The type prefix comes off before the call.
+
+			setfflag takes the BARE name -- 'DisablePostFx', not 'FFlagDisablePostFx' -- and works
+			out the type itself. The prefix is part of how a flag is written down in the JSON files
+			people share, not part of the name the engine knows it by. Handed the full name the
+			call matches nothing, returns cleanly, and changes nothing: the silent no-op this tab
+			was reporting as success.
+
+			Anchored to the front, where the version this is taken from gsubs each prefix anywhere
+			in the string. Identical for every real flag name, and it cannot eat a 'FInt' that
+			happens to sit in the middle of one. Anchoring also removes the ordering hazard --
+			'FFlag' can never match inside 'DFFlagX' and leave 'DX' behind.
+
+			FLog and DFLog are included because your own list uses them (FLogNetwork,
+			FLogIXPGraphicsOptimizationModeQualityScale); they resolve the same way. ]]
+			local name = flag
+			for _, prefix in {'DFFlag', 'DFInt', 'DFString', 'DFLog', 'FFlag', 'FInt', 'FString', 'FLog'} do
+				local stripped = name:match('^'..prefix..'(.+)$')
+				if stripped then
+					name = stripped
+					break
+				end
+			end
+			--[[ Stringified: the executors that take a value at all take it as a string, and the
+			sets people share are a mix of "true", true and numbers. ]]
+			local wanted = tostring(value)
+
+			--[[ Booleans go in lower case, whatever spelling the list used.
+
+			These lists are written for bootstrappers, which hand Roblox a JSON file and let its
+			settings loader coerce "True" into a boolean. setfflag is a different route into the
+			same flags, and the engine parses the string strictly there: "True" is not "true", so
+			the flag keeps its default and nothing is reported -- the call still returns cleanly,
+			which is exactly the silent no-op this tab was showing as success.
+
+			Worth doing across the board: 122 of the 234 values in the list you pasted are
+			capitalised, so this is most of the file rather than an edge case.
+
+			Only booleans are touched. FInt/DFInt values are numbers, and FString values are
+			content -- asset ids, URLs, embedded JSON -- where case is meaningful. ]]
+			local lowered = wanted:lower()
+			if lowered == 'true' or lowered == 'false' then
+				wanted = lowered
+			end
+			if not (setter and pcall(setter, name, wanted)) then
+				failed += 1
+				continue
+			end
+
+			if getter then
+				--[[ Compared case-insensitively: these lists are written for bootstrappers, which
+				accept "True" where the engine reports back "true". A case difference here is the
+				same value, not a flag that refused to take. ]]
+				local ok, got = pcall(getter, name)
+				if ok and got ~= nil and tostring(got):lower() == wanted:lower() then
+					verified += 1
+				end
+			end
+		end
+
+		local verifiable = getter ~= nil
+
+		if total <= 0 then
+			if not quiet then
+				vape:CreateNotification('Pistonware', 'Switched to <font color="#FFAA00">'..selectedFFlag..'</font>, which has no flags in it yet.', 5)
+			end
+			return 0, 0, 0, verifiable
+		end
+
+		if not setter then
+			vape:CreateNotification('Pistonware', 'Your executor cannot set fast flags (no setfflag), so the list here is stored but not applied.', 10, 'alert')
+			return total, total, 0, verifiable
+		end
+
+		if failed >= total then
+			vape:CreateNotification('Pistonware', 'None of the '..total..' flags in '..selectedFFlag..' could be applied.', 10, 'alert')
+			return total, failed, 0, verifiable
+		end
+
+		if not quiet then
+			vape:CreateNotification('Pistonware', 'Applied '..(total - failed)..' of '..total..' flags from <font color="#FFAA00">'..selectedFFlag..'</font>'..applySuffix(total, failed, verified, verifiable), 10,
+				(verifiable and verified <= 0) and 'alert' or nil)
+		end
+
+		return total, failed, verified, verifiable
+	end
+
+	local function exportFFlags()
+		local flags = selectedFlags()
+		local count = countFlags(flags)
+		if count <= 0 then
+			vape:CreateNotification('Pistonware', 'Nothing to export -- '..selectedFFlag..' has no flags in it.', 10, 'alert')
+			return
+		end
+
+		local suc, blob = pcall(httpService.JSONEncode, httpService, {
+			Pistonware = 'fflags',
+			Version = 1,
+			Name = selectedFFlag,
+			Data = flags
+		})
+		if not suc then
+			vape:CreateNotification('Pistonware', 'Export failed, '..tostring(blob), 10, 'alert')
+			return
+		end
+
+		blob = packExport(blob)
+		local filename = 'fflags-'..(sanitizeName(selectedFFlag) or 'export')
+		local wrote = writeExport(filename, blob)
+		if setClipboard(blob) then
+			vape:CreateNotification('Pistonware', 'Copied '..count..' flag'..(count == 1 and '' or 's')..' from <font color="#FFAA00">'..selectedFFlag..'</font> to your clipboard'..(wrote and ' and to '..EXPORT_FOLDER..'/'..filename..'.txt.' or '.'), 10)
+		elseif wrote then
+			vape:CreateNotification('Pistonware', 'Your executor has no clipboard access, so '..count..' flags were written to '..EXPORT_FOLDER..'/'..filename..'.txt instead.', 10)
+		else
+			vape:CreateNotification('Pistonware', 'Export failed -- could not reach the clipboard or write to '..EXPORT_FOLDER..'.', 10, 'alert')
+		end
+	end
+
+	local fflagimportbox
+
+	--[[
+		Adding, not importing-as-a-new-thing.
+
+		A pasted set goes into the profile you are ON, the way pasting into a document puts the
+		text where the cursor is. Filing it under a name of its own instead was the wrong model:
+		it left you looking at a profile you did not choose, called 'imported', while the one you
+		had selected was untouched -- so the obvious next question was always "now how do I get
+		these into MY profile".
+
+		Building up a named set is still exactly as possible, and reads better this way round:
+		type the name, click the row, paste. The destination is chosen before the paste rather
+		than discovered after it.
+
+		The flags land in the client immediately, because the set they were added to is the one
+		that is current -- leaving it selected but not applied would be a row claiming something
+		untrue. Applying is asked to stay quiet so this reports the whole thing in one line.
+	]]
+	local function importFFlags()
+		local blob = readImport(fflagimportbox, FFLAG_FOLDER..'/import.txt')
+		if not blob then
+			vape:CreateNotification('Pistonware', 'Nothing to add -- paste an FFlag set into the box above, or copy one to your clipboard.', 10, 'alert')
+			return
+		end
+
+		local decoded = decodeImport(blob)
+		if not decoded then
+			vape:CreateNotification('Pistonware', 'That does not look like an FFlag set (it is not readable JSON).', 10, 'alert')
+			return
+		end
+
+		--[[ A bare flag map is accepted as well as this GUI's envelope. That shape is what every
+		other fast-flag tool hands out, and it is what a user pasting from one of them will have.
+		The envelope's name is deliberately ignored now -- where the flags go is the row you have
+		selected, not something the sender gets to decide. ]]
+		local payload = decoded
+		if decoded.Pistonware == 'fflags' and type(decoded.Data) == 'table' then
+			payload = decoded.Data
+		end
+
+		if countFlags(payload) <= 0 then
+			vape:CreateNotification('Pistonware', 'That JSON has no flags in it.', 10, 'alert')
+			return
+		end
+
+		--[[ Merged over what is already there rather than replacing it, so pasting a second set
+		builds the profile up. A flag present in both takes the pasted value: the paste is the
+		more recent instruction, and counting those separately is what lets the message below
+		distinguish 'added 40' from 'added 40, changed 3'. ]]
+		local target = selectedFFlag
+		local flags = selectedFlags()
+		local added, changed = 0, 0
+
+		for flag, value in payload do
+			if type(flag) ~= 'string' then continue end
+			if flags[flag] == nil then
+				added += 1
+			elseif flags[flag] ~= value then
+				changed += 1
+			end
+			flags[flag] = value
+		end
+
+		ensureFolder(FFLAG_FOLDER)
+		local ok, err = writeJson(fflagPath(target), flags)
+		if not ok then
+			vape:CreateNotification('Pistonware', 'Could not save to '..target..', '..tostring(err), 10, 'alert')
+			return
+		end
+
+		if fflagimportbox then
+			fflagimportbox:SetValue('')
+		end
+
+		local total, failed, verified, verifiable = applyFFlags(true)
+		vape:CreateNotification('Pistonware',
+			'Added '..added..' flag'..(added == 1 and '' or 's')..
+			(changed > 0 and ' and updated '..changed or '')..
+			' in <font color="#FFAA00">'..target..'</font> -- applied '..(total - failed)..' of '..total..
+			applySuffix(total, failed, verified, verifiable), 10,
+			(verifiable and verified <= 0) and 'alert' or nil)
+	end
+
+	--[[ In the list rather than behind the gear, and directly under the rows: what a paste does
+	depends entirely on which row is selected, so the two belong in the same glance. The profile
+	importer opposite is the other way round precisely because it does NOT read the selection. ]]
+	fflagimportbox = fflags.Inline:CreateTextBox({
+		Name = 'Add FFlags',
+		Darker = true,
+		LayoutOrder = 1001,
+		Placeholder = 'Paste flags to add',
+		Function = function(enter)
+			if enter then
+				importFFlags()
+			end
+		end,
+		Tooltip = 'Paste flags here and press Enter to add them to the selected profile'
+	})
+
+	fflags.Inline:CreateButton({
+		Name = 'Add pasted FFlags',
+		Darker = true,
+		LayoutOrder = 1002,
+		Function = importFFlags,
+		Tooltip = 'Adds what is in the box above to the selected profile, falling back to your clipboard or '..FFLAG_FOLDER..'/import.txt'
+	})
+
+	fflags.Inline:CreateButton({
+		Name = 'Export FFlags',
+		Darker = true,
+		LayoutOrder = 1003,
+		Function = exportFFlags,
+		Tooltip = 'Copies the selected flag profile to your clipboard and to '..EXPORT_FOLDER
+	})
+
+	fflags.Inline:CreateButton({
+		Name = 'Reset current fflag profile',
+		Darker = true,
+		LayoutOrder = 1004,
+		Function = function()
+			local target = selectedFFlag
+			local emptied = countFlags(selectedFlags())
+
+			--[[ Emptied, not deleted. The row stays exactly where it was and stays selected --
+			this clears what is IN the profile, which is what makes it the counterpart of adding
+			to it. Removing the profile itself is the dots menu on its row. ]]
+			local ok, err = pcall(function()
+				ensureFolder(FFLAG_FOLDER)
+				return writeJson(fflagPath(target), {})
+			end)
+			if not ok then
+				vape:CreateNotification('Pistonware', 'Could not clear '..target..', '..tostring(err), 10, 'alert')
+				return
+			end
+
+			if emptied <= 0 then
+				vape:CreateNotification('Pistonware', '<font color="#FFAA00">'..target..'</font> was already empty.', 5)
+				return
+			end
+
+			--[[ Nothing is unset in the running client, because nothing can be: a flag written
+			this session is read back out of the engine, not out of this file. Clearing the file
+			means the profile stops setting them on the next apply, and the ones already in the
+			client stay until it restarts. Saying so is the honest version -- silently emptying
+			the list while the game still looks flagged is what would confuse. ]]
+			vape:CreateNotification('Pistonware', 'Cleared '..emptied..' flag'..(emptied == 1 and '' or 's')..' from <font color="#FFAA00">'..target..'</font>. Flags already set stay until you restart Roblox.', 10)
+		end,
+		Tooltip = 'Removes every flag from the selected profile, keeping the profile itself'
+	})
+
 	
 	--[[
 		Targets
@@ -4340,6 +5311,10 @@ components = {
 		button.BorderSizePixel = 0
 		button.Size = UDim2.new(1, 0, 0, 31)
 		button.Text = ''
+		--[[ Only meaningful for the bindings whose frame is laid out by LayoutOrder -- a settings
+		pane stacks in creation order and ignores it. Set unconditionally so a caller does not
+		have to know which frame it is building into. ]]
+		button.LayoutOrder = props.LayoutOrder or 0
 		button.Parent = children
 		addTooltip(button, props.Tooltip)
 		local holder = Instance.new('Frame')
@@ -4373,6 +5348,12 @@ components = {
 		end)
 		
 		button.MouseButton1Click:Connect(props.Function)
+
+		-- Returned so a caller can reach the instance; nothing needed one before.
+		return {
+			Object = button,
+			Type = 'Button'
+		}
 	end,
 	Category = function(props, children, api)
 		local component = {
@@ -4644,7 +5625,44 @@ components = {
 			Type = 'CategoryList'
 		}
 		props.Color = props.Color or Color3.fromRGB(5, 134, 105)
-		
+
+		--[[
+			Two list shapes live in this component, and this is the switch between them.
+
+			The plain shape is Friends and Targets: many entries, each independently on or off,
+			a coloured dot and an X. The other is the Profiles tab: named entries where exactly
+			ONE is current, the current one wears the GUI colour, and the row carries a keybind
+			and a dots menu instead of a checkbox.
+
+			`Profiles` selects the second shape AND hardcodes what selecting means -- save the
+			old config, load the new one. `Swap` selects the same shape but takes the meaning as
+			callbacks (Current/Select/Delete), so anything else that is a set of named things
+			with one active can look and behave identically without pretending to be a config.
+
+			Everything below branches on `swapStyle`; only the three places that actually touch
+			config files still ask for `props.Profiles` specifically.
+		]]
+		local swapStyle = (props.Profiles or props.Swap) and true or false
+		local function currentEntry()
+			if props.Swap then
+				return props.Current and props.Current() or nil
+			end
+			return vape.Profile
+		end
+		--[[ Selecting is the one thing the two shapes genuinely do differently, so it is the one
+		thing kept behind a function: a config swap has to flush the profile it is leaving before
+		it loads the next, and a Swap list must not touch profiles at all. ]]
+		local function selectEntry(name)
+			if props.Swap then
+				if props.Select then
+					props.Select(name)
+				end
+				return
+			end
+			vape:Save(name)
+			vape:Load(true)
+		end
+
 		local window = Instance.new('TextButton')
 		window.AutoButtonColor = false
 		window.BackgroundColor3 = uipallet.Main
@@ -4697,6 +5715,12 @@ components = {
 		children.Size = UDim2.new(1, 0, 1, -45)
 		children.Position = UDim2.fromOffset(0, 45)
 		children.BackgroundTransparency = 1
+		--[[ Never drawn -- it is transparent -- but it IS read. Button and TextBox take their own
+		background from the frame they are built into (color.Dark of this), which is why the
+		settings pane below sets the same colour on childrentwo despite also being transparent.
+		This frame was left on the Instance default of white, so anything built inline came out a
+		white slab instead of matching the pane. ]]
+		children.BackgroundColor3 = color.Dark(uipallet.Main, 0.02)
 		children.BorderSizePixel = 0
 		children.Visible = false
 		children.ScrollBarThickness = 2
@@ -4780,8 +5804,12 @@ components = {
 		
 		function component:CreateProfile(value, data)
 			--[[ Names are the identity here: GetValue, ChangeValue and the profile file on disk all
-			key off them, so two entries with the same name are two rows fighting over one file. ]]
-			if type(value) ~= 'string' or value == '' or self:GetValue(value) then
+			key off them, so two entries with the same name are two rows fighting over one file.
+
+			usableProfileName is checked here too, not only where names are entered: this is what
+			Load feeds the saved list through, so a bad name already written to gui.txt is dropped
+			on the way back in rather than rebuilt into a row that crashes the next save. ]]
+			if not usableProfileName(value) or self:GetValue(value) then
 				return
 			end
 		
@@ -4795,9 +5823,8 @@ components = {
 			}, nil, profile)
 			profile.Bind.Object.Position = UDim2.new(1, -30, 0, 7)
 			profile.Bind.Triggered:Connect(function(isPressed)
-				if isPressed and vape.Profile ~= value then
-					vape:Save(value)
-					vape:Load(true)
+				if isPressed and currentEntry() ~= value then
+					selectEntry(value)
 					self:ChangeValue()
 				end
 			end)
@@ -4811,14 +5838,21 @@ components = {
 		
 		function component:ChangeValue(value, skipGUI)
 			if value then
-				if props.Profiles then
+				if swapStyle then
 					local index, profile = self:GetValue(value)
 					if index then
+						--[[ 'default' is the one entry that cannot be removed, in both shapes. It is
+						what everything falls back to, so a list with no default is a list where the
+						fallback names a row that does not exist. ]]
 						if value ~= 'default' then
 							profile.Bind:Destroy()
 							table.remove(self.List, index)
-		
-							if isfile('pistonware/profiles/'..value..vape.Place..'.txt') and delfile then
+
+							if props.Swap then
+								if props.Delete then
+									props.Delete(value)
+								end
+							elseif isfile('pistonware/profiles/'..value..vape.Place..'.txt') and delfile then
 								delfile('pistonware/profiles/'..value..vape.Place..'.txt')
 							end
 						end
@@ -4853,7 +5887,7 @@ components = {
 			end
 		
 			for _, name in self.List do
-				if props.Profiles then
+				if swapStyle then
 					local obj = Instance.new('TextButton')
 					obj.Name = name.Name
 					obj.Size = UDim2.fromOffset(200, 32)
@@ -4894,7 +5928,7 @@ components = {
 					dots.Size = UDim2.fromOffset(3, 16)
 					dots.Parent = dotsbutton
 					name.Bind:SetParent(obj)
-					name.Enabled = name.Name == vape.Profile
+					name.Enabled = name.Name == currentEntry()
 		
 					dotsbutton.MouseButton1Click:Connect(function()
 						if not name.Enabled then
@@ -4916,8 +5950,7 @@ components = {
 		
 		
 					obj.MouseButton1Click:Connect(function()
-						vape:Save(name.Name)
-						vape:Load(true)
+						selectEntry(name.Name)
 						self:ChangeValue()
 					end)
 		
@@ -5086,7 +6119,7 @@ components = {
 				self:Expand()
 			end
 		
-			if props.Profiles then
+			if swapStyle then
 				--[[
 					Rebuilt, not appended to.
 
@@ -5110,6 +6143,14 @@ components = {
 					end
 				end
 		
+				--[[ Which entry is current is state the list owns only in Swap mode. For a profile
+				list it lives in gui.txt's own Profile field (vape:Load reads it before this runs),
+				so restoring it here would be a second, competing writer. Restored BEFORE the
+				rebuild below so the right row comes back wearing the GUI colour. ]]
+				if props.Swap and props.Restore and usableProfileName(data.Selected) then
+					props.Restore(data.Selected)
+				end
+
 				self:ChangeValue(nil, true)
 			else
 				if data.List and (#self.List > 0 or #data.List > 0) then
@@ -5137,7 +6178,11 @@ components = {
 				}
 			}
 		
-			if props.Profiles then
+			if swapStyle then
+				if props.Swap then
+					data[props.Name].Selected = currentEntry()
+				end
+
 				local newList = {}
 		
 				for _, profile in self.List do
@@ -5154,6 +6199,24 @@ components = {
 		end
 		
 		bindComponents(component, childrentwo)
+
+		--[[
+			A second binding, into the list itself rather than the settings pane.
+
+			bindComponents points every Create* method at ONE frame, and for this component that
+			frame is childrentwo -- the pane behind the gear. That is right for options ABOUT a
+			list and wrong for a control the user has to find in order to use the list at all.
+			Import is the second kind: behind the gear it reads as a setting about importing
+			rather than the place you paste an export.
+
+			Options is the same table, not a copy, so anything built through this still saves and
+			loads with the list. Ordering is by LayoutOrder here (childrentwo stacks in creation
+			order), which is why the components accept one.
+		]]
+		component.Inline = {
+			Options = component.Options
+		}
+		bindComponents(component.Inline, children)
 		
 		addbutton.MouseEnter:Connect(function()
 			addbutton.ImageTransparency = 0
@@ -5163,12 +6226,31 @@ components = {
 			addbutton.ImageTransparency = 0.3
 		end)
 		
-		addbutton.MouseButton1Click:Connect(function()
-			if not table.find(component.List, addvalue.Text) then
-				component:ChangeValue(addvalue.Text)
+		--[[ One path for both ways of submitting this box, and where the paste-an-export mistake is
+		caught. On a profile list the text becomes a file name, so a pasted config used to be
+		accepted, saved as the active profile, and crash the client on every inject afterwards.
+		Turned away with an explanation rather than silently: pasting an export here is a
+		reasonable thing to try, it is simply the wrong box. ]]
+		local function submitEntry()
+			local text = addvalue.Text
+			if text == '' then
+				return
+			end
+
+			if swapStyle and not usableProfileName(text) then
+				vape:CreateNotification('Pistonware', #text > 32
+					and 'That is too long for a profile name. To bring in an exported profile, paste it into the Import profile box in this window\'s settings instead.'
+					or 'A profile name can only use letters, numbers, spaces, - and _.', 10, 'alert')
+				return
+			end
+
+			if not table.find(component.List, text) then
+				component:ChangeValue(text)
 				addvalue.Text = ''
 			end
-		end)
+		end
+
+		addbutton.MouseButton1Click:Connect(submitEntry)
 		
 		arrowbutton.MouseEnter:Connect(function()
 			arrow.ImageColor3 = Color3.fromRGB(220, 220, 220)
@@ -5187,9 +6269,8 @@ components = {
 		end)
 		
 		addvalue.FocusLost:Connect(function(enter)
-			if enter and not table.find(component.List, addvalue.Text) then
-				component:ChangeValue(addvalue.Text)
-				addvalue.Text = ''
+			if enter then
+				submitEntry()
 			end
 		end)
 		
@@ -8879,6 +9960,7 @@ components = {
 		textbox.BorderSizePixel = 0
 		textbox.Size = UDim2.new(1, 0, 0, 58)
 		textbox.Text = ''
+		textbox.LayoutOrder = props.LayoutOrder or 0
 		textbox.Visible = props.Visible == nil or props.Visible
 		textbox.Parent = children
 		component.Object = textbox
