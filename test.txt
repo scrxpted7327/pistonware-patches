@@ -1,2 +1,0 @@
-Temporary test file for the pistonware-patches publish workflow.
-Safe to delete.
