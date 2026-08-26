@@ -1,9 +1,9 @@
 --[[ The loader is the only supported entry point: it runs the LuaArmor key gate and publishes
 script_key (which the protected bedwars.lua reads) before any of this downloads or executes.
-main.lua is re-run directly in two places -- the queued teleport script below, and the GUI's
-reinject buttons -- and both re-establish that state first, so reaching here without it means
-the gate was skipped. Checked before the uninject below, so a failed check cannot tear down a
-working instance on its way out. ]]
+main.lua is re-run directly by the public queued teleport script and the GUI's reinject buttons;
+the developer queued path restores loaderdev.lua before it reaches here. All paths re-establish
+that state first, so reaching here without it means the gate was skipped. Checked before the
+uninject below, so a failed check cannot tear down a working instance on its way out. ]]
 if not shared.PistonwareAuthenticated then
 	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
 	return
@@ -16,11 +16,25 @@ local release = type(shared.PistonwareRelease) == 'table' and shared.PistonwareR
 	cacheReady = true
 }
 
-local function reportRuntimeError(stage, err)
+local function errorTrace(err)
+	local traceback
+	pcall(function()
+		if debug and type(debug.traceback) == 'function' then
+			traceback = debug.traceback(tostring(err), 2)
+		end
+	end)
+	return traceback or tostring(err)
+end
+
+local function reportRuntimeError(stage, err, trace)
 	local reporter = shared.PistonwareTelemetry
 	if type(reporter) == 'table' and type(reporter.report) == 'function' then
 		pcall(function()
-			reporter:report('runtime_error', tostring(err), {stage = stage, fatal = false})
+			reporter:report('runtime_error', tostring(err), {
+				stage = stage,
+				fatal = false,
+				traceback = trace or errorTrace(err)
+			})
 		end)
 	end
 end
@@ -43,7 +57,7 @@ local function rewriteReleaseUrl(url)
 	value = value:gsub('https://raw%.githubusercontent%.com/themagicpiston/pistonware/main/', function()
 		return 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/'
 	end)
-	value = value:gsub('https://codeberg%.org/pistonware/pistonware/raw/branch/main/', function()
+	value = value:gsub('https://raw%.githubusercontent%.com/themagicpiston/pistonware/main/', function()
 		return 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/'
 	end)
 	value = value:gsub('https://gitlab%.com/pistonware/pistonware/%-/raw/main/', function()
@@ -425,13 +439,36 @@ local function finishLoading()
 		if teleportState == Enum.TeleportState.Failed then return end
 		if (not teleportedServers) and (not shared.VapeIndependent) then
 			teleportedServers = true
-			--[[ Re-runs main.lua, not the loader. The loader is a full boot -- duplicate-run
-			guard, GitHub API calls for the update check, the console window, the config
-			prompt -- and any one of those bailing on the new server leaves the script
-			uninjected. main.lua only needs the files the loader already cached, so it
-			comes back reliably; the loader still runs on a manual execute. ]]
+			--[[ The public path re-runs main.lua, not the loader. The loader is a full boot --
+			duplicate-run guard, GitHub API calls for the update check, the console window, the
+			config prompt -- and any one of those bailing on the new server leaves the script
+			uninjected. A developer path restores loaderdev.lua first so its local auth seam is
+			available before main.lua loads the local BedWars payload. ]]
 					local teleportScript = [[
 						shared.vapereload = true
+						-- A developer teleport must restore the developer loader first. loaderdev.lua
+						-- installs the local LuaArmor test seam; jumping straight into main.lua loses
+						-- that seam in the new Roblox execution context and the local payload reports
+						-- an authorization failure even though the original boot was valid.
+						if rawget(shared, 'PistonwareDeveloper') == true then
+							pcall(rawset, shared, 'PistonwareSessionRejected', nil)
+							pcall(rawset, shared, 'PistonwareLoaderBoot', nil)
+							local developerSource
+							pcall(function()
+								if type(readfile) == 'function' then
+									developerSource = readfile('pistonware/loaderdev.lua')
+								end
+							end)
+							if type(developerSource) == 'string' and developerSource ~= '' then
+								local developerChunk, developerError = loadstring(developerSource, 'loaderdev')
+								if developerChunk then
+									return developerChunk()
+								end
+								warn('[pistonware] queued developer loader did not compile: '..tostring(developerError))
+							else
+								warn('[pistonware] queued developer loader is unavailable; using main.lua directly')
+							end
+						end
 						local release = shared.PistonwareRelease
 						local cacheReady = type(release) == 'table' and release.cacheReady ~= false
 						local cached = cacheReady and isfile and isfile('pistonware/main.lua') and readfile('pistonware/main.lua')
@@ -460,17 +497,19 @@ local function finishLoading()
 					..', version='..string.format('%q', version)
 					..', cacheReady=true, resolved=true}\n'..teleportScript
 			end
-			--[[ Globals and shared do not survive a teleport, and the new server re-runs main.lua
-			directly rather than the loader -- so the key gate's output has to be re-published
-			by hand here. Without it the guard at the top of this file would reject the
-			re-injection, and bedwars.lua would be handed to loadstring with no script_key.
+			--[[ Globals and shared do not survive a teleport, and the public new-server path
+			re-runs main.lua directly rather than the loader -- so the key gate's output has to
+			be re-published by hand here. The developer path carries the same state before it
+			re-enters loaderdev.lua. Without it the guard at the top of this file would reject
+			the re-injection, and bedwars.lua would be handed to loadstring with no script_key.
 			%q so a key containing a quote or backslash still produces a valid chunk. ]]
-			if shared.PistonwareKey then
-				local quoted = string.format('%q', shared.PistonwareKey)
-				teleportScript = 'script_key = '..quoted..'\nshared.PistonwareKey = '..quoted..'\nshared.PistonwareAuthenticated = true\n'..teleportScript
+			local teleportKey = rawget(shared, 'PistonwareKey')
+			if type(teleportKey) == 'string' and teleportKey ~= '' then
+				local quoted = string.format('%q', teleportKey)
+				teleportScript = 'script_key = '..quoted..'\nrawset(shared, "PistonwareKey", '..quoted..')\nrawset(shared, "PistonwareAuthenticated", true)\n'..teleportScript
 			end
-			if shared.PistonwareDeveloper then
-				teleportScript = 'shared.PistonwareDeveloper = true\n'..teleportScript
+			if rawget(shared, 'PistonwareDeveloper') == true then
+				teleportScript = 'rawset(shared, "PistonwareDeveloper", true)\n'..teleportScript
 			end
 			if shared.VapeSmoothBoot then
 				teleportScript = 'shared.VapeSmoothBoot = true\n'..teleportScript
@@ -612,11 +651,19 @@ if not shared.VapeIndependent then
 		task.wait(executorName == 'Opiumware' and 30 or 5)
 	end
 	--[[ pcall'd: an error thrown while universal.lua executes would otherwise propagate out of
-	main.lua entirely, skipping the game script below and finishLoading() with it. ]]
+	main.lua entirely, skipping the game script below and finishLoading() with it. The error is
+	reported rather than swallowed: a silent universal failure used to look like random missing
+	modules, because nothing downstream re-raises it. ]]
 	stage('universal.lua start')
-	pcall(function()
-		runChunk(downloadFile('pistonware/games/universal.lua'), 'universal')
-	end)
+	do
+		local okUniversal, universalError = xpcall(function()
+			runChunk(downloadFile('pistonware/games/universal.lua'), 'universal')
+		end, errorTrace)
+		if not okUniversal then
+			reportRuntimeError('universal.load', universalError, universalError)
+			warn('[pistonware] universal.lua errored while loading: '..tostring(universalError))
+		end
+	end
 
 	--[[ Started, never waited on. There is no deadline here by design: a deadline would only be a
 	guess at how long the payload needs, and whatever number it held would become the time
@@ -641,8 +688,9 @@ if not shared.VapeIndependent then
 		local fn, compileError = loadstring(source, chunkname)
 		if not fn then
 			gameScriptFinished = true
-			reportRuntimeError('game.compile', compileError)
-			warn('[pistonware] '..chunkname..' did not compile: '..tostring(compileError))
+			local trace = errorTrace(compileError)
+			reportRuntimeError('game.compile', compileError, trace)
+			warn('[pistonware] '..chunkname..' did not compile: '..trace)
 			return false
 		end
 		gameScriptFinished = false
@@ -675,7 +723,9 @@ if not shared.VapeIndependent then
 
 		local started = os.clock()
 		task.spawn(function()
-			local ok, err = pcall(fn, table.unpack(gameArgs, 1, gameArgs.n))
+			local ok, err = xpcall(function()
+				return fn(table.unpack(gameArgs, 1, gameArgs.n))
+			end, errorTrace)
 			gameScriptFinished = true
 			--[[ Only for a payload slow enough that the split-load path actually engaged; a normal
 			game script never trips it. Keeps the real cost of protecting bedwars.lua visible
@@ -685,7 +735,7 @@ if not shared.VapeIndependent then
 				debugWarn(('[pistonware] %s finished in %.1fs -- its modules now have their saved settings'):format(chunkname, elapsed))
 			end
 			if not ok then
-				reportRuntimeError('game.execute', err)
+				reportRuntimeError('game.execute', err, err)
 				warn('[pistonware] '..chunkname..' errored: '..tostring(err))
 			end
 		end)

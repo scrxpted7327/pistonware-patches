@@ -26,7 +26,7 @@ local function downloadFile(path, func)
 	end
 	if not isfile(path) then
 		local suc, res = pcall(function()
-			return pistonwareHttpGet('https://codeberg.org/pistonware/pistonware/raw/branch/main/'..select(1, path:gsub('pistonware/', '')), true)
+			return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..select(1, path:gsub('pistonware/', '')), true)
 		end)
 		if not suc or res == '404: Not Found' then
 			error(res)

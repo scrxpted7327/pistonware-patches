@@ -3,6 +3,16 @@ if not shared.PistonwareAuthenticated then
 	return
 end
 
+local function errorTrace(err)
+	local traceback
+	pcall(function()
+		if debug and type(debug.traceback) == 'function' then
+			traceback = debug.traceback(tostring(err), 2)
+		end
+	end)
+	return traceback or tostring(err)
+end
+
 --[[ Every module in this file and in bedwars.lua is registered inside one of these -- 60 blocks
 here, 59 there, all at top level, and bedwars.lua takes this same function through bw.run.
 Unprotected, an error anywhere in any of them aborted the rest of the file: every module
@@ -10,9 +20,31 @@ below the failure never registered, and in bedwars.lua the completion signal on 
 line never ran either, so main.lua sat in waitForModules for the full 120s before loading a
 profile against a half-built module set. One game update touching one API took the whole
 script down that way. Contained here, a bad block costs its own modules and nothing else. ]]
+local function callWithThreadFix(func)
+	local setIdentity = setthreadidentity
+	local oldIdentity
+	local switched = false
+	if type(setIdentity) == 'function' then
+		if type(getthreadidentity) == 'function' then
+			local ok, identity = pcall(getthreadidentity)
+			if ok then oldIdentity = identity end
+		end
+		oldIdentity = oldIdentity or 2
+		if oldIdentity ~= 8 then
+			switched = pcall(setIdentity, 8)
+		end
+	end
+
+	local ok, err = xpcall(func, errorTrace)
+	if switched then
+		pcall(setIdentity, oldIdentity)
+	end
+	return ok, err
+end
+
 local run = function(func)
 	if shared.VapeSmoothBoot then task.wait() end
-	local ok, err = pcall(func)
+	local ok, err = callWithThreadFix(func)
 	if not ok then
 		warn('[pistonware] a module block failed to load: '..tostring(err))
 	end
@@ -46,6 +78,7 @@ local coreGui = cloneref(game:GetService('CoreGui'))
 local starterGui = cloneref(game:GetService('StarterGui'))
 local lightingService = cloneref(game:GetService('Lighting'))
 local teleportService = cloneref(game:GetService("TeleportService"))
+local pathfindingService = cloneref(game:GetService('PathfindingService'))
 local virtualInputManager = cloneref(game:GetService('VirtualInputManager'))
 
 --[[ identifyexecutor exists but THROWS on several mobile executors, and this runs at the top
@@ -78,6 +111,28 @@ local whitelist = vape.Libraries.whitelist
 local prediction = vape.Libraries.prediction
 local getfontsize = vape.Libraries.getfontsize
 local getcustomasset = vape.Libraries.getcustomasset
+
+local function priorityRank(entity, mode)
+	local isPlayer = entity and entity.Player ~= nil
+	if mode == 'NPCs first' then return isPlayer and 1 or 0 end
+	return isPlayer and 0 or 1
+end
+
+local function priorityTarget(options, priority)
+	if not priority or priority.Value == 'Closest' then
+		return entitylib.EntityPosition(options)
+	end
+	local targets = entitylib.AllPosition(options)
+	local originalOrder = {}
+	for index, entity in targets do originalOrder[entity] = index end
+	table.sort(targets, function(left, right)
+		local leftRank = priorityRank(left, priority.Value)
+		local rightRank = priorityRank(right, priority.Value)
+		if leftRank ~= rightRank then return leftRank < rightRank end
+		return (originalOrder[left] or 0) < (originalOrder[right] or 0)
+	end)
+	return targets[1]
+end
 
 local store = {
 	attackReach = 0,
@@ -416,6 +471,37 @@ local function getTableSize(tab)
 		ind += 1
 	end
 	return ind
+end
+
+local function ensureSessionInfo()
+	sessioninfo = sessioninfo or vape.Libraries.sessioninfo
+	if type(sessioninfo) == 'table' and type(sessioninfo.Objects) == 'table' and type(sessioninfo.AddItem) == 'function' then
+		return sessioninfo
+	end
+
+	local added = 0
+	sessioninfo = {
+		Objects = {},
+		AddItem = function(self, name, startvalue, func, saved)
+			added += 1
+			self.Objects[name] = {
+				Function = func or function(val) return val end,
+				Saved = saved == nil or saved,
+				Value = startvalue or 0,
+				Index = getTableSize(self.Objects) + 2
+			}
+			return {
+				Increment = function(_, val)
+					self.Objects[name].Value += (val or 1)
+				end,
+				Get = function()
+					return self.Objects[name].Value
+				end
+			}
+		end
+	}
+	vape.Libraries.sessioninfo = sessioninfo
+	return sessioninfo
 end
 
 local function hotbarSwitch(slot)
@@ -876,6 +962,7 @@ path cost is one hash lookup; handlers only ever run for instances somebody
 actually asked about. ]]
 local namecallWatch = {}
 local namecallGuard = {}
+local namecallObservers = {}
 
 --[[ handler may be `true` to swallow the call outright, or a function. From a function:
   nil / false       -- let the call through unchanged
@@ -932,6 +1019,48 @@ function namecallGuard.unwatchIf(inst, method, handler)
     return true
 end
 
+-- Observers never change the result of a watched call. They are separate from the
+-- replacement/block table so a diagnostic listener can coexist with a module that
+-- rewrites or suppresses the same remote.
+function namecallGuard.observe(inst, method, handler)
+    if typeof(inst) ~= 'Instance' or type(method) ~= 'string' or type(handler) ~= 'function' then
+        return nil
+    end
+    local byMethod = namecallObservers[inst]
+    if not byMethod then
+        byMethod = {}
+        namecallObservers[inst] = byMethod
+    end
+    local observers = byMethod[method]
+    if not observers then
+        observers = {}
+        byMethod[method] = observers
+    end
+    local token = {instance = inst, method = method, handler = handler}
+    table.insert(observers, token)
+    return token
+end
+
+function namecallGuard.unobserve(token)
+    if type(token) ~= 'table' then return false end
+    local byMethod = namecallObservers[token.instance]
+    local observers = byMethod and byMethod[token.method]
+    if not observers then return false end
+    for index = #observers, 1, -1 do
+        if observers[index] == token then
+            table.remove(observers, index)
+            if #observers == 0 then
+                byMethod[token.method] = nil
+            end
+            if next(byMethod) == nil then
+                namecallObservers[token.instance] = nil
+            end
+            return true
+        end
+    end
+    return false
+end
+
 local getnamecallmethod = getnamecallmethod
 local mt = getrawmetatable(game)
 setreadonly(mt, false)
@@ -969,6 +1098,14 @@ local namecallHook = function(self, ...)
             return CFrame.new()
         end
     end
+    local observerMethods = namecallObservers[self]
+    local observers = observerMethods and observerMethods[method]
+    if observers then
+        for _, token in observers do
+            pcall(token.handler, self, ...)
+        end
+    end
+
     local entry = namecallWatch[self]
     if entry then
         local handler = entry[method]
@@ -1023,6 +1160,7 @@ setreadonly(mt, true)
 
 vape:Clean(function()
     table.clear(namecallWatch)
+    table.clear(namecallObservers)
     if mt.__namecall == namecallHook then
         setreadonly(mt, false)
         mt.__namecall = oldNamecall
@@ -1037,6 +1175,285 @@ vape:Clean(function()
 end)
 
 local blankFunction = function(...) return ... end
+
+--[[ == runtime diagnostics ==
+This small native service owns only bounded observation, call formatting, and connection
+bookkeeping. When it is stopped, observers and event connections are disconnected. ]]
+local connectionLister = {}
+
+function connectionLister.list(signal)
+    if type(getconnections) ~= 'function' or not signal then return {} end
+    local ok, connections = pcall(getconnections, signal)
+    return ok and type(connections) == 'table' and connections or {}
+end
+
+local function compactExploitValue(value, depth, seen)
+    depth = depth or 0
+    if depth > 2 then return '...' end
+
+    local valueType = typeof(value)
+    if valueType == 'Instance' then
+        local ok, fullName = pcall(function() return value:GetFullName() end)
+        return ok and fullName or tostring(value)
+    elseif valueType == 'Vector3' or valueType == 'Vector2' then
+        return tostring(value)
+    elseif valueType == 'CFrame' or valueType == 'Color3' then
+        return tostring(value)
+    end
+
+    if type(value) == 'string' then
+        return string.format('%q', value)
+    elseif type(value) ~= 'table' then
+        return tostring(value)
+    end
+
+    seen = seen or {}
+    if seen[value] then return '<cycle>' end
+    seen[value] = true
+    local fields, count = {}, 0
+    for key, item in value do
+        count += 1
+        if count > 8 then
+            fields[#fields + 1] = '...'
+            break
+        end
+        fields[#fields + 1] = '['..compactExploitValue(key, depth + 1, seen)..']='..compactExploitValue(item, depth + 1, seen)
+    end
+    seen[value] = nil
+    return '{'..table.concat(fields, ', ')..'}'
+end
+
+local function compactExploitArgs(args)
+    local fields = {}
+    for index = 1, math.min(args.n or #args, 8) do
+        fields[index] = compactExploitValue(args[index])
+    end
+    return table.concat(fields, ', ')
+end
+
+local exploitFinder = {
+    Active = false,
+    RecordRemotes = true,
+    RecordEvents = true,
+    MaxLogs = 400,
+    Logs = {},
+    RemoteNames = {},
+    RemoteRecords = {},
+    Observed = {},
+    EventConnections = {},
+    Listeners = {},
+    NextListener = 0,
+}
+
+function exploitFinder:subscribe(callback)
+    if type(callback) ~= 'function' then return nil end
+    self.NextListener += 1
+    self.Listeners[self.NextListener] = callback
+    return self.NextListener
+end
+
+function exploitFinder:unsubscribe(token)
+    self.Listeners[token] = nil
+end
+
+function exploitFinder:emit(kind, text, data)
+    local entry = {
+        time = os.clock(),
+        kind = kind,
+        text = text,
+        data = data,
+    }
+    self.Logs[#self.Logs + 1] = entry
+    while #self.Logs > self.MaxLogs do
+        table.remove(self.Logs, 1)
+    end
+    for _, callback in self.Listeners do
+        pcall(callback, entry)
+    end
+    return entry
+end
+
+function exploitFinder:clear()
+    table.clear(self.Logs)
+    self:emit('system', 'console cleared')
+end
+
+function exploitFinder:formatClientCall(remoteName, method, args)
+    local suffix = method == 'InvokeServer' and 'CallServer' or method == 'FireServer' and 'SendToServer' or method
+    local name = type(remoteName) == 'string' and remoteName or tostring(remoteName or 'UnknownRemote')
+    local call = 'bedwars.Client:Get('..string.format('%q', name)..'):'..suffix..'('
+    return call..compactExploitArgs(args or {n = 0})..')'
+end
+
+function exploitFinder:remoteName(instance)
+    local name = self.RemoteNames[instance]
+    if name then return name end
+    local ok, result = pcall(function() return instance.Name end)
+    return ok and result or 'UnknownRemote'
+end
+
+function exploitFinder:recordRemote(instance, method, ...)
+    if not self.Active or not self.RecordRemotes then return end
+    local args = table.pack(...)
+    local remoteName = self:remoteName(instance)
+    self:emit('remote', self:formatClientCall(remoteName, method, args), {
+        instance = instance,
+        method = method,
+        remoteName = remoteName,
+        args = args,
+    })
+end
+
+function exploitFinder:recordEvent(instance, ...)
+    if not self.Active or not self.RecordEvents then return end
+    local args = table.pack(...)
+    local remoteName = self:remoteName(instance)
+    self:emit('event', 'bedwars.Client:Get('..string.format('%q', remoteName)..').instance.OnClientEvent('..compactExploitArgs(args)..')', {
+        instance = instance,
+        remoteName = remoteName,
+        args = args,
+    })
+end
+
+function exploitFinder:observeRemote(instance)
+    if not instance or self.Observed[instance] then return end
+    local observed = {}
+    observed.fire = namecallGuard.observe(instance, 'FireServer', function(remote, ...)
+        self:recordRemote(remote, 'FireServer', ...)
+    end)
+    observed.invoke = namecallGuard.observe(instance, 'InvokeServer', function(remote, ...)
+        self:recordRemote(remote, 'InvokeServer', ...)
+    end)
+    self.Observed[instance] = observed
+end
+
+function exploitFinder:registerClient(remoteName, call)
+    if type(remoteName) ~= 'string' or not call then return end
+    local instance
+    pcall(function() instance = call.instance end)
+    if not instance then return end
+    self.RemoteNames[instance] = remoteName
+    self.RemoteRecords[remoteName] = instance
+    if self.Active then
+        self:observeRemote(instance)
+    end
+end
+
+function exploitFinder:listenRemote(instance)
+    if not self.Active or not self.RecordEvents or self.EventConnections[instance] then return end
+    local isRemoteEvent = false
+    pcall(function() isRemoteEvent = instance:IsA('RemoteEvent') end)
+    if not isRemoteEvent then return end
+    local signal
+    pcall(function() signal = instance.OnClientEvent end)
+    if not signal or type(signal.Connect) ~= 'function' then return end
+    local ok, connection = pcall(function()
+        return signal:Connect(function(...)
+            self:recordEvent(instance, ...)
+        end)
+    end)
+    if ok and connection then
+        self.EventConnections[instance] = connection
+    end
+end
+
+function exploitFinder:resolveNetFolder()
+    local folder = replicatedStorage
+    for _, name in {'rbxts_include', 'node_modules', '@rbxts', 'net', 'out', '_NetManaged'} do
+        local nextFolder
+        pcall(function() nextFolder = folder and folder:FindFirstChild(name) end)
+        if not nextFolder then return nil end
+        folder = nextFolder
+    end
+    return folder
+end
+
+function exploitFinder:scanRemotes(root)
+    root = root or self:resolveNetFolder()
+    if not root then
+        self:emit('system', 'remote scan: _NetManaged was not found')
+        return 0
+    end
+    local ok, descendants = pcall(function() return root:GetDescendants() end)
+    if not ok or type(descendants) ~= 'table' then return 0 end
+    local count = 0
+    for _, instance in descendants do
+        local isRemote = false
+        pcall(function()
+            isRemote = instance:IsA('RemoteEvent') or instance:IsA('RemoteFunction')
+        end)
+        if isRemote then
+            count += 1
+            local name
+            pcall(function() name = instance.Name end)
+            if name and not self.RemoteNames[instance] then
+                self.RemoteNames[instance] = name
+                self.RemoteRecords[name] = instance
+            end
+            if self.Active then
+                self:observeRemote(instance)
+                self:listenRemote(instance)
+            end
+        end
+    end
+    self:emit('system', 'remote scan: '..count..' RemoteEvent/RemoteFunction objects')
+    return count
+end
+
+function exploitFinder:scanConnections()
+    local signals = {
+        {'Players.PlayerAdded', playersService.PlayerAdded},
+        {'Players.PlayerRemoving', playersService.PlayerRemoving},
+        {'RunService.Heartbeat', runService.Heartbeat},
+        {'RunService.RenderStepped', runService.RenderStepped},
+    }
+    local total = 0
+    for _, entry in signals do
+        local connections = connectionLister.list(entry[2])
+        total += #connections
+        self:emit('connection', entry[1]..' -> '..#connections..' connections', {signal = entry[2], connections = connections})
+    end
+    self:emit('system', 'connection scan: '..total..' connections across '..#signals..' core signals')
+    return total
+end
+
+function exploitFinder:scan()
+    self:scanRemotes()
+    return self:scanConnections()
+end
+
+function exploitFinder:start(options)
+    if type(options) == 'table' then
+        if options.remotes ~= nil then self.RecordRemotes = options.remotes end
+        if options.events ~= nil then self.RecordEvents = options.events end
+    end
+    if self.Active then return end
+    self.Active = true
+    self:emit('system', 'exploit finder started')
+    self:scanRemotes()
+end
+
+function exploitFinder:stop()
+    if not self.Active then return end
+    self.Active = false
+    for _, connection in self.EventConnections do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(self.EventConnections)
+    for _, observed in self.Observed do
+        if observed.fire then namecallGuard.unobserve(observed.fire) end
+        if observed.invoke then namecallGuard.unobserve(observed.invoke) end
+    end
+    table.clear(self.Observed)
+    self:emit('system', 'exploit finder stopped')
+end
+
+vape:Clean(function()
+    exploitFinder:stop()
+    table.clear(exploitFinder.Listeners)
+    table.clear(exploitFinder.RemoteNames)
+    table.clear(exploitFinder.RemoteRecords)
+end)
 
 local fpsHooks = {}
 do
@@ -1879,6 +2296,7 @@ run(function()
 		BowConstantsTable = debug.getupvalue(Knit.Controllers.ProjectileController.enableBeam, 8),
 		ClickHold = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out.client.ui.lib.util['click-hold']).ClickHold,
 		Client = Client,
+		ClientSyncEvents = require(lplr.PlayerScripts.TS['client-sync-events']).ClientSyncEvents,
 		ClientConstructor = require(replicatedStorage['rbxts_include']['node_modules']['@rbxts'].net.out.client),
 		ClientDamageBlock = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['block-engine'].out.shared.remotes).BlockEngineRemotes.Client,
 		CombatConstant = require(replicatedStorage.TS.combat['combat-constant']).CombatConstant,
@@ -1921,8 +2339,10 @@ run(function()
 		SoundManager = resolveSoundManager(),
 		StatusEffectUtil = require(replicatedStorage.TS['status-effect']['status-effect-util']).StatusEffectUtil,
 		StatusEffectMeta = require(replicatedStorage.TS['status-effect']['status-effect-type']).StatusEffectType,
+		StatusEffectType = require(replicatedStorage.TS['status-effect']['status-effect-type']).StatusEffectType,
 		Store = require(lplr.PlayerScripts.TS.ui.store).ClientStore,
 		SummonerKitBalance = require(replicatedStorage.TS.games.bedwars.kit.kits.summoner['summoner-kit-balance']).SummonerKitBalance,
+		SyncEventPriority = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['sync-event'].out).SyncEventPriority,
 		TeamUpgradeMeta = debug.getupvalue(require(replicatedStorage.TS.games.bedwars['team-upgrade']['team-upgrade-meta']).getTeamUpgradeMetaForQueue, 7),
 		UILayers = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out).UILayers,
 		VisualizerUtils = require(lplr.PlayerScripts.TS.lib.visualizer['visualizer-utils']).VisualizerUtils,
@@ -1991,6 +2411,7 @@ run(function()
 
 	Client.Get = function(self, remoteName)
 		local call = OldGet(self, remoteName)
+		exploitFinder:registerClient(remoteName, call)
 
 		if remoteName == remotes.AttackEntity then
 			return {
@@ -2022,6 +2443,11 @@ run(function()
 		-- run() is there to survive). Indexing it then threw on every Client:Get for the trap
 		-- remote -- inside the hot path every remote in the game goes through.
 		elseif remoteName == 'StepOnSnapTrap' and TrapDisabler and TrapDisabler.Enabled then
+			return {SendToServer = function() end}
+		elseif remoteName == 'SwordSwingMiss'
+			and vape.Modules
+			and vape.Modules.NoClickDelay
+			and vape.Modules.NoClickDelay.Enabled then
 			return {SendToServer = function() end}
 		end
 
@@ -2275,11 +2701,24 @@ run(function()
 		return worldpos
 	end
 
-	bedwars.placeBlock = function(pos, item)
-		if getItem(item) then
-			store.blockPlacer.blockType = item
-			return store.blockPlacer:placeBlock(bedwars.BlockController:getBlockPosition(pos))
+	bedwars.placeBlock = function(pos, item, animate)
+		if not getItem(item) then return end
+
+		store.blockPlacer.blockType = item
+		local oldAnimation
+		if animate == false and bedwars.AnimationUtil then
+			oldAnimation = bedwars.AnimationUtil.playAnimation
+			bedwars.AnimationUtil.playAnimation = function() end
 		end
+
+		local ok, result = pcall(function()
+			return store.blockPlacer:placeBlock(bedwars.BlockController:getBlockPosition(pos))
+		end)
+		if oldAnimation then
+			bedwars.AnimationUtil.playAnimation = oldAnimation
+		end
+		if not ok then error(result, 0) end
+		return result
 	end
 
 	--[[ blockcheck: when true, walk the chosen dig spot back to whatever physically stands
@@ -2567,17 +3006,23 @@ run(function()
 	--[[ cache projectile names we care about ]]
 	local validProjectiles = {
 		arrow = true,
-		snowball = true
+		snowball = true,
+		telepearl = true,
+		pearl = true
 	}
+	local function isTrackedProjectile(name)
+		name = tostring(name):lower()
+		return validProjectiles[name] or name:find('telepearl', 1, true) ~= nil
+	end
 
 	--[[ optimized ZapNetworking hook ]]
 	vape:Clean(bedwars.ZapNetworking.ProjectileLaunchZap.On(function(origin, projectileType, tool, shooter)
 		task.defer(function()
 			local lowerType = tostring(projectileType):lower()
-			if validProjectiles[lowerType] then
+			if isTrackedProjectile(lowerType) then
 				--[[ only search nearby objects, not entire workspace ]]
 				for _, obj in ipairs(workspace:GetChildren()) do
-					if validProjectiles[obj.Name:lower()] then
+					if isTrackedProjectile(obj.Name) then
 						local root = obj:FindFirstChildWhichIsA("BasePart")
 						if root and (root.Position - origin).Magnitude < 25 then
 							vapeEvents.ProjectileFired:Fire({
@@ -2650,6 +3095,10 @@ run(function()
 			table.remove(tab, obj)
 		end
 	end)
+
+	-- Universal creates this library before the game-specific files. Keep the fallback here
+	-- for cached or partial universal copies, and reject incomplete stale tables as well.
+	sessioninfo = ensureSessionInfo()
 
 	local kills = sessioninfo:AddItem('Kills')
 	local beds = sessioninfo:AddItem('Beds')
@@ -2769,6 +3218,7 @@ run(function()
 	local KillauraTarget
 	local ClickAim
 	local Shake
+	local TargetPriority
 
 	--[[ Shake nudges the aim off the target's RootPart by a random angle. Rolled as an
 	ANGLE rather than a world-space offset so the slider means the same thing at 3
@@ -2820,6 +3270,18 @@ run(function()
 		return name ~= nil and (name == 'Falcon' or name:match('^Falcon%-') ~= nil)
 	end
 
+	local function findAimTarget()
+		if KillauraTarget.Enabled then return store.KillauraTarget end
+		return priorityTarget({
+			Range = Distance.Value,
+			Part = 'RootPart',
+			Wallcheck = Targets.Walls.Enabled,
+			Players = Targets.Players.Enabled,
+			NPCs = Targets.NPCs.Enabled,
+			Sort = sortmethods[Sort.Value]
+		}, TargetPriority)
+	end
+
 	AimAssist = vape.Categories.Combat:CreateModule({
 		Name = 'AimAssist',
 		Function = function(callback)
@@ -2833,14 +3295,7 @@ run(function()
 			if callback then
 				AimAssist:Clean(runService.Heartbeat:Connect(function(dt)
 					if entitylib.isAlive and store.hand.toolType == 'sword' and ((not ClickAim.Enabled) or (os.clock() - bedwars.SwordController.lastSwing) < 0.4) then
-						local ent = not KillauraTarget.Enabled and entitylib.EntityPosition({
-							Range = Distance.Value,
-							Part = 'RootPart',
-							Wallcheck = Targets.Walls.Enabled,
-							Players = Targets.Players.Enabled,
-							NPCs = Targets.NPCs.Enabled,
-							Sort = sortmethods[Sort.Value]
-						}) or store.KillauraTarget
+						local ent = findAimTarget()
 	
 						if ent then
 							if isFalconDecoy(ent) then return end
@@ -2872,6 +3327,11 @@ run(function()
 	Targets = AimAssist:CreateTargets({
 		Players = true,
 		Walls = true
+	})
+	TargetPriority = AimAssist:CreateDropdown({
+		Name = 'Target Priority',
+		List = {'Players first', 'NPCs first', 'Closest'},
+		Default = 'Players first'
 	})
 	local methods = {'Damage', 'Distance'}
 	for i in sortmethods do
@@ -2945,11 +3405,112 @@ end)
 	
 run(function()
 	local Value
+	local PlaceBlocks
+	local PlaceRange
+	local originalSwordReach
+	local patchedSelectors = {}
+	local placeReachConnection
+
+	local function copyOptions(options)
+		local result = {}
+		if type(options) == 'table' then
+			for key, value in options do
+				result[key] = value
+			end
+		end
+		return result
+	end
+
+	local function patchSelector(selector)
+		if not selector or patchedSelectors[selector] then return end
+
+		local ok, original = pcall(function()
+			return selector.getMouseInfo
+		end)
+		if not ok or type(original) ~= 'function' then return end
+
+		local wrapper
+		wrapper = function(self, mode, options)
+			if PlaceBlocks and PlaceBlocks.Enabled and mode == 0 then
+				options = copyOptions(options)
+				options.range = PlaceRange and PlaceRange.Value or 18
+			end
+			return original(self, mode, options)
+		end
+
+		if pcall(function()
+			selector.getMouseInfo = wrapper
+		end) then
+			patchedSelectors[selector] = {Original = original, Wrapper = wrapper}
+		end
+	end
+
+	local function patchPlacer(placer)
+		local ok, selector = pcall(function()
+			local manager = placer and placer.clientManager
+			return manager and manager:getBlockSelector()
+		end)
+		if ok then patchSelector(selector) end
+	end
+
+	local function patchPlaceReach()
+		callWithThreadFix(function()
+			patchPlacer(store.blockPlacer)
+			local controller = bedwars.BlockPlacementController
+			patchPlacer(controller and controller.blockPlacer)
+		end)
+	end
+
+	local function restorePlaceReach()
+		local restore = {}
+		for selector, data in patchedSelectors do
+			table.insert(restore, {Selector = selector, Data = data})
+		end
+		for _, entry in restore do
+			pcall(function()
+				if entry.Selector.getMouseInfo == entry.Data.Wrapper then
+					entry.Selector.getMouseInfo = entry.Data.Original
+				end
+			end)
+			patchedSelectors[entry.Selector] = nil
+		end
+	end
+
+	local function stopPlaceReach()
+		if placeReachConnection then
+			pcall(function() placeReachConnection:Disconnect() end)
+			placeReachConnection = nil
+		end
+		restorePlaceReach()
+	end
+
+	local function startPlaceReach()
+		patchPlaceReach()
+		if not placeReachConnection then
+			placeReachConnection = runService.Heartbeat:Connect(function()
+				if Reach.Enabled and PlaceBlocks and PlaceBlocks.Enabled then
+					patchPlaceReach()
+				else
+					stopPlaceReach()
+				end
+			end)
+			Reach:Clean(placeReachConnection)
+		end
+	end
 	
 	Reach = vape.Categories.Combat:CreateModule({
 		Name = 'Reach',
 		Function = function(callback)
-			bedwars.CombatConstant.RAYCAST_SWORD_CHARACTER_DISTANCE = callback and Value.Value + 2 or 14.4
+			if callback then
+				originalSwordReach = originalSwordReach or bedwars.CombatConstant.RAYCAST_SWORD_CHARACTER_DISTANCE
+				bedwars.CombatConstant.RAYCAST_SWORD_CHARACTER_DISTANCE = Value.Value + 2
+				if PlaceBlocks and PlaceBlocks.Enabled then
+					startPlaceReach()
+				end
+			else
+				bedwars.CombatConstant.RAYCAST_SWORD_CHARACTER_DISTANCE = originalSwordReach or 14.4
+				stopPlaceReach()
+			end
 		end,
 		Tooltip = 'Lets you hit from further away'
 	})
@@ -2967,6 +3528,39 @@ run(function()
 			return val == 1 and 'stud' or 'studs'
 		end
 	})
+	PlaceBlocks = Reach:CreateToggle({
+		Name = 'Place Blocks',
+		Function = function(callback)
+			if PlaceRange and PlaceRange.Object then
+				PlaceRange.Object.Visible = callback
+			end
+			if callback and Reach.Enabled then
+				startPlaceReach()
+			else
+				stopPlaceReach()
+			end
+		end,
+		Tooltip = 'Extends the distance used when selecting a block to place'
+	})
+	PlaceRange = Reach:CreateSlider({
+		Name = 'Place Range',
+		Min = 6,
+		Max = 60,
+		Default = 18,
+		Visible = false,
+		Darker = true,
+		Function = function()
+			if Reach.Enabled and PlaceBlocks and PlaceBlocks.Enabled then
+				patchPlaceReach()
+			end
+		end,
+		Suffix = function(val)
+			return val == 1 and 'stud' or 'studs'
+		end
+	})
+	if PlaceBlocks.Object then
+		PlaceBlocks.Object.Visible = PlaceBlocks.Enabled
+	end
 end)
 	
 run(function()
@@ -3001,7 +3595,18 @@ end)
 run(function()
 	local TriggerBot
 	local CPS
+	local AFKCheck
 	local rayParams = RaycastParams.new()
+
+	local function isPlayerAfk(player)
+		if not player then return false end
+		for _, attribute in {'AFK', 'IsAFK', 'Afk', 'afk'} do
+			local value
+			pcall(function() value = player:GetAttribute(attribute) end)
+			if value == true then return true end
+		end
+		return false
+	end
 	
 	TriggerBot = vape.Categories.Combat:CreateModule({
 		Name = 'TriggerBot',
@@ -3021,13 +3626,24 @@ run(function()
 							if ray and (localPos - ray.Instance.Position).Magnitude <= rayRange then
 								for _, ent in entitylib.List do
 									doAttack = ent.Targetable and ray.Instance:IsDescendantOf(ent.Character) and (localPos - ent.RootPart.Position).Magnitude <= rayRange
+										and not (AFKCheck.Enabled and isPlayerAfk(ent.Player))
 									if doAttack then
 										break
 									end
 								end
 							end
 	
-							doAttack = doAttack or bedwars.SwordController:getTargetInRegion(attackRange or 3.8 * 3, 0)
+							local regionTarget = bedwars.SwordController:getTargetInRegion(attackRange or 3.8 * 3, 0)
+							if regionTarget then
+								local targetPlayer
+								pcall(function()
+									local targetModel = regionTarget:getInstance()
+									targetPlayer = playersService:GetPlayerFromCharacter(targetModel)
+								end)
+								if not (AFKCheck.Enabled and isPlayerAfk(targetPlayer)) then
+									doAttack = true
+								end
+							end
 							if doAttack then
 								bedwars.SwordController:swingSwordAtMouse()
 							end
@@ -3046,6 +3662,11 @@ run(function()
 		Max = 9,
 		DefaultMin = 7,
 		DefaultMax = 7
+	})
+	AFKCheck = TriggerBot:CreateToggle({
+		Name = 'AFK check',
+		Default = true,
+		Tooltip = 'Skips players who expose an AFK attribute.'
 	})
 end)
 	
@@ -3108,7 +3729,74 @@ run(function()
 	})
 	TargetCheck = Velocity:CreateToggle({Name = 'Only when targeting'})
 end)
-	
+
+--[[
+run(function()
+	local NoFall
+	local groundHitConnection
+	local groundHitSent = false
+
+	local function findGroundBlock(root, humanoid)
+		local position = root.Position - Vector3.new(0, root.Size.Y / 2 + humanoid.HipHeight + 0.75, 0)
+		for _ = 1, 5 do
+			local block = getPlacedBlock(position)
+			if block then return block end
+			position -= Vector3.new(0, 3, 0)
+		end
+	end
+
+	local function stopGroundHit()
+		if groundHitConnection then
+			pcall(function() groundHitConnection:Disconnect() end)
+			groundHitConnection = nil
+		end
+		groundHitSent = false
+	end
+
+	NoFall = vape.Categories.Blatant:CreateModule({
+		Name = 'NoFall',
+		Function = function(callback)
+			if not callback then
+				stopGroundHit()
+				return
+			end
+
+			if groundHitConnection then return end
+			groundHitConnection = runService.PreSimulation:Connect(function()
+				if not entitylib.isAlive then
+					groundHitSent = false
+					return
+				end
+
+				local character = entitylib.character
+				local root = character.RootPart
+				local humanoid = character.Humanoid
+				if not root or not humanoid then return end
+
+				if humanoid.FloorMaterial ~= Enum.Material.Air then
+					groundHitSent = false
+					return
+				end
+
+				if not groundHitSent and root.AssemblyLinearVelocity.Y < -35 then
+					groundHitSent = true
+					pcall(function()
+						local remote = bedwars.Client:Get('GroundHit')
+						remote:SendToServer(
+							findGroundBlock(root, humanoid),
+							Vector3.new(0, 2.5, 0),
+							workspace:GetServerTimeNow()
+						)
+					end)
+				end
+			end)
+			NoFall:Clean(groundHitConnection)
+		end,
+		Tooltip = 'Reports a low landing velocity before fall damage is applied.'
+	})
+end)
+]]
+
 local AntiFallDirection
 run(function()
 	local AntiFall
@@ -3136,8 +3824,8 @@ run(function()
 				repeat task.wait(0.1) until store.matchState ~= 0 or (not AntiFall.Enabled)
 				if not AntiFall.Enabled then return end
 
-				local pos, debounce = getLowGround(), os.clock()
-				if pos ~= math.huge then
+				local ground, debounce = getLowGround(), os.clock()
+				if ground ~= math.huge then
 					AntiFallPart = Instance.new('Part')
 					AntiFallPart.Size = Vector3.new(10000, 1, 10000)
 					AntiFallPart.Transparency = 1 - Color.Opacity
@@ -3177,7 +3865,7 @@ run(function()
 												for _ = 1, 10 do
 													local dpos = roundPos(ray.Position + ray.Normal * 1.5) + Vector3.new(0, 3, 0)
 													if not getPlacedBlock(dpos) then
-														top = Vector3.new(top.X, pos.Y, top.Z)
+														top = Vector3.new(top.X, ground, top.Z)
 														break
 													end
 												end
@@ -3548,6 +4236,67 @@ run(function()
 		Suffix = function(val)
 			return val == 1 and 'stud' or 'studs'
 		end
+	})
+end)
+	
+run(function()
+	local ProjectileHitbox
+	local Expand
+	local objects = {}
+
+	local function createHitbox(ent)
+		if not (ent and ent.Targetable and ent.Player and ent.Character and ent.RootPart) then return end
+		if objects[ent] then return end
+		local hitbox = Instance.new('Part')
+		hitbox.Name = 'PistonwareProjectileHitbox'
+		hitbox.Size = Vector3.new(3, 6, 3) + Vector3.one * Expand.Value
+		hitbox.CFrame = ent.RootPart.CFrame
+		hitbox.CanCollide = false
+		hitbox.CanTouch = false
+		hitbox.Massless = true
+		hitbox.Transparency = 1
+		hitbox.Parent = ent.Character
+		local weld = Instance.new('WeldConstraint')
+		weld.Part0 = hitbox
+		weld.Part1 = ent.RootPart
+		weld.Parent = hitbox
+		objects[ent] = hitbox
+	end
+
+	local function clearHitboxes()
+		for ent, object in objects do
+			pcall(function() object:Destroy() end)
+			objects[ent] = nil
+		end
+	end
+
+	ProjectileHitbox = vape.Categories.Blatant:CreateModule({
+		Name = 'ProjectileHitbox',
+		Function = function(callback)
+			clearHitboxes()
+			if callback then
+				ProjectileHitbox:Clean(entitylib.Events.EntityAdded:Connect(createHitbox))
+				ProjectileHitbox:Clean(entitylib.Events.EntityRemoving:Connect(function(ent)
+					local object = objects[ent]
+					if object then object:Destroy(); objects[ent] = nil end
+				end))
+				for _, ent in entitylib.List do createHitbox(ent) end
+			end
+		end,
+		Tooltip = 'Expands player query parts so projectile hit checks have a larger target.'
+	})
+	Expand = ProjectileHitbox:CreateSlider({
+		Name = 'Expand amount',
+		Min = 0,
+		Max = 14.4,
+		Default = 5,
+		Decimal = 10,
+		Function = function(value)
+			for _, object in objects do
+				object.Size = Vector3.new(3, 6, 3) + Vector3.one * value
+			end
+		end,
+		Suffix = function(value) return value == 1 and 'stud' or 'studs' end
 	})
 end)
 	
@@ -4037,6 +4786,7 @@ run(function()
 	local Health
 	local Distance
 	local Equipment
+	local Inventory
 	local Rank
 	local Enchant
 	local Device
@@ -4193,6 +4943,35 @@ run(function()
 		return name ~= '' and deviceEmojis.keyboard or nil
 	end
 
+	local function getInventorySuffix(plr)
+		if not (Inventory and Inventory.ListEnabled and plr) then return '' end
+		local inventory = store.inventories[plr]
+		if not (inventory and inventory.items) then return '' end
+		local found, seen = {}, {}
+		for _, item in inventory.items do
+			local itemType = item and item.itemType
+			if itemType and not seen[itemType] then
+				local lower = itemType:lower()
+				for _, requested in Inventory.ListEnabled do
+					requested = tostring(requested):lower()
+					if requested ~= '' and lower:find(requested, 1, true) then
+						seen[itemType] = true
+						local amount = item.amount or item.count or item.quantity
+						found[#found + 1] = itemType:gsub('_', ' ')..(amount and amount > 1 and ' x'..tostring(amount) or '')
+						break
+					end
+				end
+			end
+		end
+		return #found > 0 and ' ['..table.concat(found, ', ')..']' or ''
+	end
+
+	local function appendInventory(ent)
+		if ent and ent.Player then
+			Strings[ent] = Strings[ent]..getInventorySuffix(ent.Player)
+		end
+	end
+
 	local Added = {
 		Normal = function(ent)
 			pcall(function()
@@ -4219,6 +4998,8 @@ run(function()
 				if Distance.Enabled then
 					Strings[ent] = '<font color="rgb(85, 255, 85)">[</font><font color="rgb(255, 255, 255)">%s</font><font color="rgb(85, 255, 85)">]</font> '..Strings[ent]
 				end
+
+				appendInventory(ent)
 
 				if Equipment.Enabled then
 					for i, v in {'Hand', 'Helmet', 'Chestplate', 'Boots', 'Kit'} do
@@ -4317,6 +5098,8 @@ run(function()
 					Strings[ent] = '[%s] '..Strings[ent]
 				end
 
+				appendInventory(ent)
+
 				nametag.Text.Text = Strings[ent]
 				nametag.Text.Color = entitylib.getEntityColor(ent) or Color3.fromHSV(Color.Hue, Color.Sat, Color.Value)
 				nametag.BG.Size = Vector2.new(nametag.Text.TextBounds.X + 8, nametag.Text.TextBounds.Y + 7)
@@ -4387,6 +5170,8 @@ run(function()
 					Strings[ent] = '<font color="rgb(85, 255, 85)">[</font><font color="rgb(255, 255, 255)">%s</font><font color="rgb(85, 255, 85)">]</font> '..Strings[ent]
 				end
 
+				appendInventory(ent)
+
 				if Equipment.Enabled and store.inventories[ent.Player] and nametag:FindFirstChild("Hand") then
 					local kit = ent.Player:GetAttribute('PlayingAsKit')
 					local inventory = store.inventories[ent.Player]
@@ -4441,6 +5226,12 @@ run(function()
 
 				if Distance.Enabled then
 					Strings[ent] = '[%s] '..Strings[ent]
+					nametag.Text.Text = entitylib.isAlive and string.format(Strings[ent], math.floor((entitylib.character.RootPart.Position - ent.RootPart.Position).Magnitude)) or Strings[ent]
+				else
+					nametag.Text.Text = Strings[ent]
+				end
+				appendInventory(ent)
+				if Distance.Enabled then
 					nametag.Text.Text = entitylib.isAlive and string.format(Strings[ent], math.floor((entitylib.character.RootPart.Position - ent.RootPart.Position).Magnitude)) or Strings[ent]
 				else
 					nametag.Text.Text = Strings[ent]
@@ -4642,6 +5433,11 @@ run(function()
 			end
 		end
 	})
+	NameTags:CreateDropdown({
+		Name = 'Target Priority',
+		List = {'Players first', 'NPCs first', 'Closest'},
+		Default = 'Players first'
+	})
 	FontOption = NameTags:CreateFont({
 		Name = 'Font',
 		Blacklist = 'Arial',
@@ -4712,6 +5508,17 @@ run(function()
 				NameTags:Toggle()
 			end
 		end
+	})
+	Inventory = NameTags:CreateTextList({
+		Name = 'Inventory',
+		Default = {'fireball', 'gloop', 'telepearl', 'tnt'},
+		Function = function()
+			if NameTags.Enabled then
+				NameTags:Toggle()
+				NameTags:Toggle()
+			end
+		end,
+		Tooltip = 'Shows matching item names and counts beside the tag.'
 	})
 	Rank = NameTags:CreateToggle({
 		Name = 'Show Rank',
@@ -6346,6 +7153,17 @@ run(function()
 	local Mode
 	local Targets
 	local Range
+	local TargetPriority
+
+	local function hasTarget()
+		return priorityTarget({
+			Part = 'RootPart',
+			Range = Range.Value,
+			Players = Targets.Players.Enabled,
+			NPCs = Targets.NPCs.Enabled,
+			Wallcheck = Targets.Walls.Enabled
+		}, TargetPriority) ~= nil
+	end
 	
 	ArmorSwitch = vape.Categories.Inventory:CreateModule({
 		Name = 'ArmorSwitch',
@@ -6353,13 +7171,7 @@ run(function()
 			if callback then
 				if Mode.Value == 'Toggle' then
 					repeat
-						local state = entitylib.EntityPosition({
-							Part = 'RootPart',
-							Range = Range.Value,
-							Players = Targets.Players.Enabled,
-							NPCs = Targets.NPCs.Enabled,
-							Wallcheck = Targets.Walls.Enabled
-						}) and true or false
+						local state = hasTarget()
 	
 						for i = 0, 2 do
 							if (store.inventory.inventory.armor[i + 1] ~= 'empty') ~= state and ArmorSwitch.Enabled then
@@ -6395,6 +7207,11 @@ run(function()
 	Targets = ArmorSwitch:CreateTargets({
 		Players = true,
 		NPCs = true
+	})
+	TargetPriority = ArmorSwitch:CreateDropdown({
+		Name = 'Target Priority',
+		List = {'Players first', 'NPCs first', 'Closest'},
+		Default = 'Players first'
 	})
 	Range = ArmorSwitch:CreateSlider({
 		Name = 'Range',
@@ -8944,6 +9761,7 @@ shared.bedwars = {
     starterGui          = starterGui,
     lightingService     = lightingService,
     teleportService     = teleportService,
+	pathfindingService   = pathfindingService,
 	virtualInputManager = virtualInputManager,
 
     --[[ Framework ]]
@@ -8992,6 +9810,8 @@ shared.bedwars = {
     updateVelocity      = updateVelocity,
     _baseGetSpeed       = _baseGetSpeed,
     namecallGuard       = namecallGuard,
+    exploitFinder       = exploitFinder,
+    connectionLister    = connectionLister,
     fpsHooks            = fpsHooks,
 }
 
@@ -9130,7 +9950,7 @@ if bedwarsSource then
             end)
             return
         end
-        local ok, err = pcall(bedwarsFn)
+        local ok, err = xpcall(bedwarsFn, errorTrace)
         if not ok then
             warn('[pistonware] bedwars.lua errored while running: '..tostring(err))
         end

@@ -1537,6 +1537,29 @@ function vape:Load(skipgui, profile)
 			end
 		end
 
+		-- PromptChanger combines the two older proximity-prompt modules. Merge their
+		-- saved options before the normal module pass so existing profiles keep working.
+		do
+			local modules = mainData.Modules
+			local promptData = modules.PromptChanger or modules.FastProxPrompt or modules.InteractExtender
+			if promptData then
+				promptData.Options = promptData.Options or {}
+				local fastOptions = modules.FastProxPrompt and modules.FastProxPrompt.Options or {}
+				local extenderOptions = modules.InteractExtender and modules.InteractExtender.Options or {}
+				for _, option in {'Mode', 'Modifier'} do
+					if fastOptions[option] and not promptData.Options[option] then
+						promptData.Options[option] = fastOptions[option]
+					end
+				end
+				if extenderOptions.Range and not promptData.Options.Range then
+					promptData.Options.Range = extenderOptions.Range
+				end
+				modules.PromptChanger = promptData
+				modules.FastProxPrompt = nil
+				modules.InteractExtender = nil
+			end
+		end
+
 		for name, data in mainData.Categories do
 			local category = self.Categories[name]
 			if category then
@@ -3342,8 +3365,8 @@ function vape:LoadGUI()
 			shared.vapereload = true
 			--[[ Back through the pistonware loader, which re-runs the key gate. That is deliberate:
 			shared.PistonwareAuthenticated is cleared and re-derived on every run, so a reinject
-			revalidates rather than inheriting a flag. The developer build lives on disk under a
-			different name and must never be fetched from GitHub -- it has the gate disabled. ]]
+			revalidates rather than inheriting a flag. The developer loader lives on disk under a
+			different name and must never be fetched from GitHub -- it uses the same key gate. ]]
 			if shared.PistonwareDeveloper and isfile('pistonware/loaderdev.lua') then
 				runChunk(readfile('pistonware/loaderdev.lua'), 'loader')
 			else
@@ -3367,8 +3390,8 @@ function vape:LoadGUI()
 			shared.vapereload = true
 			--[[ Back through the pistonware loader, which re-runs the key gate. That is deliberate:
 			shared.PistonwareAuthenticated is cleared and re-derived on every run, so a reinject
-			revalidates rather than inheriting a flag. The developer build lives on disk under a
-			different name and must never be fetched from GitHub -- it has the gate disabled. ]]
+			revalidates rather than inheriting a flag. The developer loader lives on disk under a
+			different name and must never be fetched from GitHub -- it uses the same key gate. ]]
 			if shared.PistonwareDeveloper and isfile('pistonware/loaderdev.lua') then
 				runChunk(readfile('pistonware/loaderdev.lua'), 'loader')
 			else

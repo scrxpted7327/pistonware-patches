@@ -20,6 +20,16 @@ local function pistonwareHttpGet(url, nocache, attempt)
 	return game:HttpGet(url, nocache)
 end
 
+local function errorTrace(err)
+	local traceback
+	pcall(function()
+		if debug and type(debug.traceback) == 'function' then
+			traceback = debug.traceback(tostring(err), 2)
+		end
+	end)
+	return traceback or tostring(err)
+end
+
 local function downloadFile(path, func)
 	local devLoader = shared.PistonwareDevLoadSource
 	if type(devLoader) == 'function' then
@@ -40,8 +50,38 @@ local function downloadFile(path, func)
 	end
 	return (func or readfile)(path)
 end
+local function callWithThreadFix(func)
+	local setIdentity = setthreadidentity
+	local oldIdentity
+	local switched = false
+	if type(setIdentity) == 'function' then
+		if type(getthreadidentity) == 'function' then
+			local ok, identity = pcall(getthreadidentity)
+			if ok then oldIdentity = identity end
+		end
+		oldIdentity = oldIdentity or 2
+		if oldIdentity ~= 8 then
+			switched = pcall(setIdentity, 8)
+		end
+	end
+
+	local ok, err = xpcall(func, errorTrace)
+	if switched then
+		pcall(setIdentity, oldIdentity)
+	end
+	return ok, err
+end
+
 local run = function(func)
-	func()
+	--[[ Same containment contract as the place files: a bad block costs its own
+	modules and nothing else. This used to call func() bare, so one thrown error
+	aborted the rest of the chunk -- silently, because main.lua pcalls this file --
+	and every later block, including the sessioninfo library other files capture,
+	simply never registered. ]]
+	local ok, err = callWithThreadFix(func)
+	if not ok then
+		warn('[pistonware] a module block failed to load: '..tostring(err))
+	end
 end
 local queue_on_teleport = queue_on_teleport or function() end
 local cloneref = cloneref or function(obj)
@@ -184,6 +224,37 @@ local function getTableSize(tab)
 	for _ in tab do ind += 1 end
 	return ind
 end
+
+local function ensureSessionInfo()
+	local current = vape.Libraries.sessioninfo
+	if type(current) == 'table' and type(current.Objects) == 'table' and type(current.AddItem) == 'function' then
+		return current
+	end
+
+	local session = {Objects = {}}
+	function session:AddItem(name, startvalue, func, saved)
+		func = func or function(val) return val end
+		saved = saved == nil or saved
+		self.Objects[name] = {
+			Function = func,
+			Saved = saved,
+			Value = startvalue or 0,
+			Index = getTableSize(self.Objects) + 2
+		}
+		return {
+			Increment = function(_, val)
+				self.Objects[name].Value += (val or 1)
+			end,
+			Get = function()
+				return self.Objects[name].Value
+			end
+		}
+	end
+	vape.Libraries.sessioninfo = session
+	return session
+end
+
+ensureSessionInfo()
 
 local function getTool()
 	return lplr.Character and lplr.Character:FindFirstChildWhichIsA('Tool', true) or nil
@@ -366,6 +437,14 @@ local whitelist = {
 	localprio = 0,
 	said = {}
 }
+function whitelist:get(plr)
+	local entry = self.data.WhitelistedUsers[tostring(plr.UserId)]
+	if entry then
+		local level = entry.level or 1
+		return level, entry.attackable or whitelist.localprio >= level, entry.tags
+	end
+	return 0, true
+end
 vape.Libraries.entity = entitylib
 vape.Libraries.whitelist = whitelist
 vape.Libraries.prediction = prediction
@@ -513,15 +592,6 @@ run(function()
 end)
 
 run(function()
-	function whitelist:get(plr)
-		local entry = self.data.WhitelistedUsers[tostring(plr.UserId)]
-		if entry then
-			local level = entry.level or 1
-			return level, entry.attackable or whitelist.localprio >= level, entry.tags
-		end
-		return 0, true
-	end
-
 	function whitelist:isingame()
 		for _, v in playersService:GetPlayers() do
 			if self:get(v) ~= 0 then return true end
@@ -5674,10 +5744,91 @@ run(function()
 				v.Transparency = val
 			end
 		end,
-		Decimal = 10
+	Decimal = 10
+})
+end)
+
+--[[ The sessioninfo library is pure data with no GUI dependency, so it registers in its own
+block ahead of the Session Info overlay. It used to be created at the tail of the overlay
+block, meaning any failure in the overlay's instance work (or in anything before it, while
+the runner was still unguarded) left vape.Libraries.sessioninfo unset -- and the place
+files capture it into a file-local exactly once, so they then indexed nil for the rest of
+the session no matter what universal did later. ]]
+run(function()
+	local sessioninfo = ensureSessionInfo()
+	if not sessioninfo.Objects['Time Played'] then
+		sessioninfo:AddItem('Time Played', os.clock(), function(value)
+			return os.date('!%X', math.floor(os.clock() - value))
+		end)
+	end
+end)
+
+run(function()
+	local MotionBlur
+	local Strength
+	local blur
+	local connection
+	local ownedBlur = false
+	local originalSize
+
+	local function updateBlur()
+		if not (blur and blur.Parent and Strength) then return end
+		local character = lplr.Character
+		local root = character and character:FindFirstChild('HumanoidRootPart')
+		local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
+		local horizontal = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+		blur.Size = math.clamp(horizontal / 30 * Strength.Value, 0, Strength.Value)
+	end
+
+	local function removeBlur()
+		if connection then
+			pcall(function() connection:Disconnect() end)
+			connection = nil
+		end
+		if blur then
+			if ownedBlur then
+				pcall(function() blur:Destroy() end)
+			elseif originalSize then
+				pcall(function() blur.Size = originalSize end)
+			end
+		end
+		blur = nil
+		ownedBlur = false
+		originalSize = nil
+	end
+
+	MotionBlur = vape.Categories.Render:CreateModule({
+		Name = 'MotionBlur',
+		Function = function(callback)
+			if not callback then
+				removeBlur()
+				return
+			end
+
+			removeBlur()
+			blur = lightingService:FindFirstChild('PistonwareMotionBlur')
+			if not (blur and blur:IsA('BlurEffect')) then
+				blur = Instance.new('BlurEffect')
+				blur.Name = 'PistonwareMotionBlur'
+				blur.Parent = lightingService
+				ownedBlur = true
+			else
+				originalSize = blur.Size
+			end
+			blur.Size = 0
+			connection = runService.RenderStepped:Connect(updateBlur)
+		end,
+		Tooltip = 'Adds a velocity-based camera blur while moving.'
+	})
+	Strength = MotionBlur:CreateSlider({
+		Name = 'Strength',
+		Min = 0,
+		Max = 24,
+		Default = 8,
+		Function = updateBlur
 	})
 end)
-	
+
 run(function()
 	local SessionInfo
 	local FontOption
@@ -5874,24 +6025,6 @@ run(function()
 	infostroke.Color = Color3.fromHSV(0.44, 1, 1)
 	infostroke.Parent = infoholder
 	addBlur(infoholder)
-	vape.Libraries.sessioninfo = {
-		Objects = {},
-		AddItem = function(self, name, startvalue, func, saved)
-			func, saved = func or function(val) return val end, saved == nil or saved
-			self.Objects[name] = {Function = func, Saved = saved, Value = startvalue or 0, Index = getTableSize(self.Objects) + 2}
-			return {
-				Increment = function(_, val)
-					self.Objects[name].Value += (val or 1)
-				end,
-				Get = function()
-					return self.Objects[name].Value
-				end
-			}
-		end
-	}
-	vape.Libraries.sessioninfo:AddItem('Time Played', os.clock(), function(value)
-		return os.date('!%X', math.floor(os.clock() - value))
-	end)
 end)
 	
 run(function()
@@ -6339,6 +6472,151 @@ run(function()
 		Name = 'Sort',
 		List = {'Descending', 'Ascending'},
 		Tooltip = 'Descending - Prefers full servers\nAscending - Prefers empty servers'
+	})
+end)
+
+run(function()
+	local PromptChanger
+	local Mode
+	local Modifier
+	local Range
+	local originalRanges = {}
+	local modified = {}
+	local thread
+
+	local function updatePrompt(prompt)
+		callWithThreadFix(function()
+			if not prompt or not prompt:IsA('ProximityPrompt') then return end
+			if originalRanges[prompt] == nil then
+				originalRanges[prompt] = prompt.MaxActivationDistance
+			end
+			prompt.MaxActivationDistance = Range.Value
+		end)
+	end
+
+	local function updateAllPrompts()
+		callWithThreadFix(function()
+			for _, prompt in workspace:GetDescendants() do
+				updatePrompt(prompt)
+			end
+		end)
+	end
+
+	local function applyHoldDuration(prompt)
+		if not prompt or not prompt:IsA('ProximityPrompt') then return end
+		if modified[prompt] == nil then
+			modified[prompt] = prompt.HoldDuration
+		end
+		prompt.HoldDuration = modified[prompt] * (Modifier.Value / 100)
+	end
+
+	local function restorePrompts()
+		if thread then
+			task.cancel(thread)
+			thread = nil
+		end
+
+		for prompt, distance in originalRanges do
+			callWithThreadFix(function()
+				if prompt.Parent then
+					prompt.MaxActivationDistance = distance
+				end
+			end)
+		end
+		table.clear(originalRanges)
+
+		for prompt, duration in modified do
+			callWithThreadFix(function()
+				if prompt.Parent then
+					prompt.HoldDuration = duration
+				end
+			end)
+		end
+		table.clear(modified)
+	end
+
+	PromptChanger = vape.Categories.Utility:CreateModule({
+		Name = 'PromptChanger',
+		Function = function(callback)
+			if callback then
+				updateAllPrompts()
+				PromptChanger:Clean(proxService.PromptShown:Connect(function(prompt)
+					updatePrompt(prompt)
+					if Mode.Value == 'Property' then
+						applyHoldDuration(prompt)
+					end
+				end))
+				PromptChanger:Clean(workspace.DescendantAdded:Connect(function(instance)
+					updatePrompt(instance)
+				end))
+
+				if Mode.Value == 'Signal' then
+					PromptChanger:Clean(proxService.PromptButtonHoldBegan:Connect(function(prompt, plr)
+						if plr == lplr then
+							thread = task.delay(prompt.HoldDuration * (Modifier.Value / 100), function()
+								fireproximityprompt(prompt)
+								thread = nil
+							end)
+						end
+					end))
+					PromptChanger:Clean(proxService.PromptButtonHoldEnded:Connect(function(prompt, plr)
+						if plr == lplr and thread then
+							task.cancel(thread)
+							thread = nil
+						end
+					end))
+				else
+					PromptChanger:Clean(proxService.PromptHidden:Connect(function(prompt)
+						if modified[prompt] then
+							prompt.HoldDuration = modified[prompt]
+							modified[prompt] = nil
+						end
+					end))
+				end
+			else
+				restorePrompts()
+			end
+		end,
+		Tooltip = 'Changes ProximityPrompt interaction range and hold time'
+	})
+	Range = PromptChanger:CreateSlider({
+		Name = 'Range',
+		Min = 1,
+		Max = 100,
+		Default = 32,
+		Suffix = function(val)
+			return val == 1 and 'stud' or 'studs'
+		end,
+		Function = function()
+			if PromptChanger.Enabled then
+				for prompt in originalRanges do
+					updatePrompt(prompt)
+				end
+			end
+		end
+	})
+	Mode = PromptChanger:CreateDropdown({
+		Name = 'Mode',
+		List = {'Signal', 'Property'},
+		Tooltip = 'Signal - Fires the prompt after the adjusted delay\nProperty - Sets the HoldDuration property',
+		Function = function()
+			if PromptChanger.Enabled then
+				PromptChanger:Toggle()
+				PromptChanger:Toggle()
+			end
+		end
+	})
+	Modifier = PromptChanger:CreateSlider({
+		Name = 'Modifier',
+		Min = 0,
+		Max = 100,
+		Default = 50,
+		Suffix = '%',
+		Function = function(val)
+			for prompt, duration in modified do
+				prompt.HoldDuration = duration * (val / 100)
+			end
+		end
 	})
 end)
 	
@@ -8263,89 +8541,6 @@ run(function()
 		Function = function(val)
 			if TimeChanger.Enabled then 
 				lightingService.TimeOfDay = val..':00:00'
-			end
-		end
-	})
-end)
-
-run(function()
-	local FastProxPrompt
-	local Mode
-	local Value
-	local modified = {}
-	local thread
-	
-	FastProxPrompt = vape.Categories.World:CreateModule({
-		Name = 'FastProxPrompt',
-		Function = function(callback)
-			if callback then
-				if Mode.Value == 'Signal' then
-					FastProxPrompt:Clean(proxService.PromptButtonHoldBegan:Connect(function(prompt, plr)
-						if plr == lplr then
-							thread = task.delay(prompt.HoldDuration * (Value.Value / 100), function()
-								fireproximityprompt(prompt)
-								thread = nil
-							end)
-						end
-					end))
-	
-					FastProxPrompt:Clean(proxService.PromptButtonHoldEnded:Connect(function(prompt, plr)
-						if plr == lplr and thread then
-							task.cancel(thread)
-							thread = nil
-						end
-					end))
-				else
-					FastProxPrompt:Clean(proxService.PromptShown:Connect(function(prompt)
-						if not modified[prompt] then
-							modified[prompt] = prompt.HoldDuration
-						end
-	
-						prompt.HoldDuration = modified[prompt] * (Value.Value / 100)
-					end))
-	
-					FastProxPrompt:Clean(proxService.PromptHidden:Connect(function(prompt)
-						if modified[prompt] then
-							prompt.HoldDuration = modified[prompt]
-							modified[prompt] = nil
-						end
-					end))
-				end
-			else
-				if thread then
-					task.cancel(thread)
-					thread = nil
-				end
-	
-				for i, v in modified do
-					i.HoldDuration = v
-				end
-	
-				table.clear(modified)
-			end
-		end,
-		Tooltip = 'Allow you to adjust the HoldDuration time of a ProximityPrompt'
-	})
-	Mode = FastProxPrompt:CreateDropdown({
-		Name = 'Mode',
-		List = {'Signal', 'Property'},
-		Tooltip = 'Signal - Uses fireproximityprompt after the calculated delay\nProperty - Sets the HoldDuration property',
-		Function = function()
-			if FastProxPrompt.Enabled then
-				FastProxPrompt:Toggle()
-				FastProxPrompt:Toggle()
-			end
-		end
-	})
-	Value = FastProxPrompt:CreateSlider({
-		Name = 'Modifier',
-		Min = 0,
-		Max = 100,
-		Default = 50,
-		Suffix = '%',
-		Function = function(val)
-			for i, v in modified do
-				i.HoldDuration = v * (val / 100)
 			end
 		end
 	})
