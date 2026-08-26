@@ -1288,6 +1288,33 @@ do
         options = options or {}
         local scope = newScope()
         scope.restoreProperties = options.restoreProperties ~= false
+        local renderFidelitySeen = setmetatable({}, {__mode = 'k'})
+        local renderFidelityOriginal = setmetatable({}, {__mode = 'k'})
+
+        local function applyRenderFidelity(instance)
+            if not options.renderFidelity then return end
+            local isMesh = false
+            pcall(function()
+                isMesh = instance:IsA('MeshPart') or instance:IsA('UnionOperation')
+            end)
+            if not isMesh then return end
+            if not renderFidelitySeen[instance] then
+                renderFidelitySeen[instance] = true
+                local ok, original = pcall(function() return instance.RenderFidelity end)
+                if ok then renderFidelityOriginal[instance] = original end
+            end
+            pcall(function()
+                instance.RenderFidelity = Enum.RenderFidelity.Performance
+            end)
+        end
+
+        scope:onStop(function()
+            for instance, original in next, renderFidelityOriginal do
+                pcall(function() instance.RenderFidelity = original end)
+                renderFidelityOriginal[instance] = nil
+            end
+            table.clear(renderFidelitySeen)
+        end)
         local map = workspace:FindFirstChild('Map')
         local camera = workspace.CurrentCamera or gameCamera
         local canEnable = {
@@ -1349,6 +1376,8 @@ do
                     scope:set(instance, 'CastShadow', false)
                 end
             end
+
+            applyRenderFidelity(instance)
 
             if instance:IsA('MeshPart') or instance:IsA('Union') then
                 scope:set(instance, 'DoubleSided', false)
@@ -1423,14 +1452,22 @@ do
                     pcall(function() rendering = settingsObject.Rendering end)
                     if physics then
                         scope:set(physics, 'AllowSleep', true)
-                        scope:set(physics, 'UseCSGv2', true)
-                        scope:set(physics, 'PhysicsEnvironmentalThrottle', Enum.EnviromentalPhysicsThrottle.Skip4)
+                        pcall(function()
+                            scope:set(physics, 'PhysicsEnvironmentalThrottle', Enum.EnviromentalPhysicsThrottle.Skip2)
+                        end)
                     end
                     if rendering then
-                        scope:set(rendering, 'MeshPartDetailLevel', Enum.MeshPartDetailLevel.Level04)
-                        scope:set(rendering, 'ViewMode', Enum.ViewMode.GeometryComplexity)
-                        scope:set(rendering, 'ExportMergeByMaterial', true)
                         scope:set(rendering, 'EagerBulkExecution', false)
+                        pcall(function()
+                            scope:set(rendering, 'QualityLevel', Enum.QualityLevel.Level01)
+                            scope:set(rendering, 'EditQualityLevel', Enum.QualityLevel.Level01)
+                            scope:set(rendering, 'ViewMode', Enum.ViewMode.None)
+                            scope:set(rendering, 'EnableFRM', true)
+                            scope:set(rendering, 'AutoFRMLevel', 1)
+                            scope:set(rendering, 'ShowBoundingBoxes', false)
+                            scope:set(rendering, 'RenderCSGTrianglesDebug', false)
+                            scope:set(rendering, 'ReloadAssets', false)
+                        end)
                     end
                 end
             end
@@ -1516,6 +1553,163 @@ do
             end
             pcall(function() blockController:remesh() end)
         end)
+        return scope
+    end
+
+    function fpsHooks.startVisualModuleBlocker(options)
+        options = options or {}
+        local scope = newScope()
+
+        local function noopCleanup()
+            return {
+                DoCleaning = function() end,
+                Destroy = function() end,
+                Disconnect = function() end,
+                GiveTask = function(self) return self end
+            }
+        end
+
+        local function setIgnored(instance, includeQuery)
+            if typeof(instance) ~= 'Instance' or not instance:IsA('BasePart') then return end
+            local queryUtil = options.queryUtil
+            if type(queryUtil) == 'table' and type(queryUtil.setQueryIgnored) == 'function' then
+                pcall(queryUtil.setQueryIgnored, queryUtil, instance, true)
+            end
+            pcall(function() instance.CanCollide = false end)
+            if includeQuery then
+                pcall(function() instance.CanQuery = false end)
+            end
+        end
+
+        local function setEnabled(instance, value)
+            if typeof(instance) ~= 'Instance' then return end
+            if not (instance:IsA('ParticleEmitter')
+                or instance:IsA('Beam')
+                or instance:IsA('Trail')
+                or instance:IsA('Light')) then
+                return
+            end
+            scope:set(instance, 'Enabled', value)
+        end
+
+        local function protectedRoot(instance, entity)
+            if typeof(instance) ~= 'Instance' then return true end
+            if typeof(entity) == 'Instance' then
+                local character = lplr and lplr.Character
+                if character and (entity == character or entity:IsDescendantOf(character)) then
+                    return true
+                end
+            end
+
+            local map = workspace:FindFirstChild('Map')
+            local camera = workspace.CurrentCamera or gameCamera
+            local playerGui = lplr and lplr:FindFirstChildOfClass('PlayerGui')
+            if (map and instance:IsDescendantOf(map))
+                or (camera and instance:IsDescendantOf(camera))
+                or (playerGui and instance:IsDescendantOf(playerGui))
+                or (coreGui and instance:IsDescendantOf(coreGui))
+                or instance:IsDescendantOf(replicatedStorage) then
+                return true
+            end
+
+            local current = instance
+            while current do
+                if current:IsA('BasePart') and current.CanCollide then
+                    return true
+                end
+                if current:IsA('Model') and current:FindFirstChildOfClass('Humanoid') then
+                    return true
+                end
+                if current:IsA('ScreenGui') then
+                    return true
+                end
+                local name = string.lower(current.Name)
+                if name:find('projectile', 1, true)
+                    or name:find('shield', 1, true)
+                    or name:find('ability', 1, true)
+                    or name:find('win_effect', 1, true)
+                    or name:find('win-effect', 1, true)
+                    or name:find('wineffect', 1, true) then
+                    return true
+                end
+                current = current.Parent
+            end
+
+            local ok, descendants = pcall(function()
+                return instance:GetDescendants()
+            end)
+            if ok and descendants then
+                for _, descendant in next, descendants do
+                    if descendant:IsA('BasePart') and descendant.CanCollide then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+
+        local function suppress(instance, includeQuery, processParts)
+            if typeof(instance) ~= 'Instance' then return end
+            local function process(candidate)
+                if not scope:isActive() then return end
+                if candidate:IsA('BasePart') then
+                    if processParts ~= false then
+                        setIgnored(candidate, includeQuery)
+                    end
+                else
+                    setEnabled(candidate, false)
+                end
+            end
+            pcall(process, instance)
+            local ok, descendants = pcall(function() return instance:GetDescendants() end)
+            if ok and descendants then
+                for _, descendant in next, descendants do
+                    if not scope:isActive() then return end
+                    pcall(process, descendant)
+                end
+            end
+        end
+
+        local function blockEffect(original, self, instance, entity, config)
+            if protectedRoot(instance, entity) then
+                return original(self, instance, entity, config)
+            end
+            suppress(instance, false)
+        end
+
+        local function blockInstanceEffect(original, self, instance, config)
+            if protectedRoot(instance) then
+                return original(self, instance, config)
+            end
+            suppress(instance, true)
+        end
+
+        local effectUtil = options.effectUtil
+        if type(effectUtil) == 'table' then
+            local originalPlayEffect = effectUtil.playEffect
+            if type(originalPlayEffect) == 'function' then
+                scope:patchFunction(effectUtil, 'playEffect', function(self, instance, entity, config)
+                    return blockEffect(originalPlayEffect, self, instance, entity, config)
+                end)
+            end
+            local originalPlayInstanceEffect = effectUtil.playInstanceEffect
+            if type(originalPlayInstanceEffect) == 'function' then
+                scope:patchFunction(effectUtil, 'playInstanceEffect', function(self, instance, config)
+                    return blockInstanceEffect(originalPlayInstanceEffect, self, instance, config)
+                end)
+            end
+            local originalEnableInstanceEffect = effectUtil.enableInstanceEffect
+            if type(originalEnableInstanceEffect) == 'function' then
+                scope:patchFunction(effectUtil, 'enableInstanceEffect', function(self, instance)
+                    if protectedRoot(instance) then
+                        return originalEnableInstanceEffect(self, instance)
+                    end
+                    suppress(instance, false, false)
+                    return noopCleanup()
+                end)
+            end
+        end
+
         return scope
     end
 
@@ -1664,6 +1858,7 @@ run(function()
 	local Flamework = require(replicatedStorage['rbxts_include']['node_modules']['@flamework'].core.out).Flamework
 	local InventoryUtil = require(replicatedStorage.TS.inventory['inventory-util']).InventoryUtil
 	local Client = require(replicatedStorage.TS.remotes).default.Client
+	local EffectUtil = require(replicatedStorage.TS.util.effect['effect-util']).EffectUtil
 	local OldGet, OldBreak = Client.Get
 
 	bedwars = setmetatable({
@@ -1689,6 +1884,7 @@ run(function()
 		CombatConstant = require(replicatedStorage.TS.combat['combat-constant']).CombatConstant,
 		DamageIndicator = Knit.Controllers.DamageIndicatorController.spawnDamageIndicator,
 		DefaultKillEffect = require(lplr.PlayerScripts.TS.controllers.global.locker["kill-effect"].effects['default-kill-effect']),
+		EffectUtil = EffectUtil,
 		EmoteType = require(replicatedStorage.TS.locker.emote['emote-type']).EmoteType,
 		EnchantMeta = require(replicatedStorage.TS.enchant['enchant-meta']).EnchantMeta,
 		GameAnimationUtil = require(replicatedStorage.TS.animation['animation-util']).GameAnimationUtil,
@@ -8874,7 +9070,9 @@ local function downloadBedwars()
 
     for attempt = 1, 4 do
         local suc, res = pcall(function()
-            return game:HttpGet('https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua', true)
+            local protectedUrl = shared.PistonwareProtectedRawUrl
+            return type(protectedUrl) == 'function' and game:HttpGet(protectedUrl(), true)
+                or game:HttpGet('https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua', true)
         end)
         --[[ compile check: during an outage HttpGet can hand back the 503/error page as the body,
         which the ~=''/'404' tests would accept ]]

@@ -1,5 +1,292 @@
 local PUBLIC_BUILD = true
 
+local VERSION_SCHEMA = 1
+local CHANNELS = {
+	main = {branch = 'main', label = 'stable'},
+	beta = {branch = 'beta', label = 'beta'},
+	nightly = {branch = 'nightly', label = 'nightly'}
+}
+
+local function configuredValue(name)
+	local value
+	pcall(function()
+		local env = type(getgenv) == 'function' and getgenv() or nil
+		if type(env) == 'table' then
+			value = env[name]
+		end
+	end)
+	if value == nil then
+		pcall(function()
+			value = shared[name]
+		end)
+	end
+	return value
+end
+
+local requestedChannel = configuredValue('PistonwareChannel')
+if type(requestedChannel) ~= 'string' then
+	requestedChannel = 'main'
+end
+requestedChannel = requestedChannel:lower():gsub('^%s*(.-)%s*$', '%1')
+local channelSpec = CHANNELS[requestedChannel]
+local invalidChannel = channelSpec == nil
+channelSpec = channelSpec or CHANNELS.main
+
+local release = {
+	schema = VERSION_SCHEMA,
+	channel = channelSpec.branch == requestedChannel and requestedChannel or 'main',
+	branch = channelSpec.branch,
+	label = channelSpec.label,
+	sourceRef = channelSpec.branch,
+	requestedChannel = requestedChannel,
+	cacheReady = false,
+	resolved = false
+}
+
+local function safeText(value, limit)
+	local text = tostring(value or '')
+	text = text:gsub('[\r\n]+', ' ')
+	text = text:gsub('([Ss]cript[_%s]*[Kk]ey%s*[:=]%s*)[^%s,;]+', '%1<redacted>')
+	text = text:gsub('([?&][Kk]ey=)[^&%s]+', '%1<redacted>')
+	limit = limit or 900
+	if #text > limit then
+		text = text:sub(1, limit - 3)..'...'
+	end
+	return text
+end
+
+local function jsonEncode(value)
+	local ok, encoded = pcall(function()
+		return game:GetService('HttpService'):JSONEncode(value)
+	end)
+	if ok and type(encoded) == 'string' then
+		return encoded
+	end
+	local text = safeText(value, 1800)
+	text = text:gsub('\\', '\\\\'):gsub('"', '\\"')
+	return '"'..text..'"'
+end
+
+local function appendText(path, text)
+	if type(appendfile) == 'function' then
+		local ok = pcall(appendfile, path, text)
+		if ok then return true end
+	end
+	if type(writefile) ~= 'function' then return false end
+	local previous = ''
+	if type(readfile) == 'function' then
+		pcall(function()
+			local body = readfile(path)
+			if type(body) == 'string' then previous = body end
+		end)
+	end
+	if #previous > 262144 then
+		previous = previous:sub(-131072)
+	end
+	return pcall(writefile, path, previous..text)
+end
+
+local function placeId()
+	local value
+	pcall(function() value = tonumber(game.PlaceId) end)
+	return value or 0
+end
+
+local function sessionId()
+	local guid
+	pcall(function()
+		guid = game:GetService('HttpService'):GenerateGUID(false)
+	end)
+	return type(guid) == 'string' and guid or (tostring(os.time())..'-'..tostring(math.floor(os.clock() * 1000)))
+end
+
+local function timestamp()
+	local value
+	pcall(function() value = os.date('!%Y-%m-%dT%H:%M:%SZ') end)
+	return value or tostring(os.time())
+end
+
+local loaderSession = sessionId()
+local logFiles = {'pistonware_loader.log'}
+local logFileSet = {['pistonware_loader.log'] = true}
+local telemetryFiles = {'pistonware_loader_telemetry.jsonl'}
+local telemetryFileSet = {['pistonware_loader_telemetry.jsonl'] = true}
+
+local function addFile(files, seen, path)
+	if type(path) ~= 'string' or path == '' or seen[path] then return end
+	seen[path] = true
+	table.insert(files, path)
+end
+
+local Logger = {}
+Logger.__index = Logger
+
+function Logger:addFile(path)
+	addFile(logFiles, logFileSet, path)
+end
+
+function Logger:bindConsole(console)
+	self.console = console
+	if self.lastLine then
+		pcall(function() console:SetLine(self.lastLine) end)
+	end
+end
+
+function Logger:emit(level, event, message, details)
+	local parts = {}
+	if type(details) == 'table' then
+		for key, value in pairs(details) do
+			if type(value) ~= 'table' and type(value) ~= 'function' then
+				table.insert(parts, tostring(key)..'='..safeText(value, 240))
+			end
+		end
+		table.sort(parts)
+	end
+	local line = ('[%s] [pistonware] [%s] [%s] %s'):format(timestamp(), level:upper(), event, safeText(message, 1200))
+	if #parts > 0 then line = line..' '..table.concat(parts, ' ') end
+	self.lastLine = line
+	for _, path in ipairs(logFiles) do
+		appendText(path, line..'\n')
+	end
+	if self.console then
+		pcall(function() self.console:SetLine(line) end)
+	end
+	if level == 'error' or level == 'warn' then
+		pcall(warn, line)
+	else
+		pcall(print, line)
+	end
+	return line
+end
+
+function Logger:info(event, message, details)
+	return self:emit('info', event, message, details)
+end
+
+function Logger:warn(event, message, details)
+	return self:emit('warn', event, message, details)
+end
+
+function Logger:error(event, message, details)
+	return self:emit('error', event, message, details)
+end
+
+local logger = setmetatable({}, Logger)
+
+local Telemetry = {}
+Telemetry.__index = Telemetry
+
+local function telemetryValue(value)
+	if type(value) == 'string' then return safeText(value, 3000) end
+	if type(value) == 'number' or type(value) == 'boolean' then return value end
+	return safeText(value, 3000)
+end
+
+function Telemetry:addFile(path)
+	addFile(telemetryFiles, telemetryFileSet, path)
+end
+
+function Telemetry:report(event, message, details)
+	local payload = {
+		schema = VERSION_SCHEMA,
+		event = event,
+		message = safeText(message, 1600),
+		session = loaderSession,
+		channel = release.channel,
+		branch = release.branch,
+		version = release.version,
+		placeId = placeId(),
+		at = os.clock()
+	}
+	if type(details) == 'table' then
+		for key, value in pairs(details) do
+			if type(value) ~= 'table' and type(value) ~= 'function' then
+				payload[key] = telemetryValue(value)
+			end
+		end
+	end
+	local encoded = jsonEncode(payload)
+	for _, path in ipairs(telemetryFiles) do
+		appendText(path, encoded..'\n')
+	end
+
+	local endpoint = self.endpoint
+	local requestFn = self.requestFn
+	if endpoint and requestFn then
+		pcall(requestFn, {
+			Url = endpoint,
+			Method = 'POST',
+			Headers = {['Content-Type'] = 'application/json'},
+			Body = encoded
+		})
+	end
+	return payload
+end
+
+local telemetry = setmetatable({}, Telemetry)
+local configuredTelemetryEndpoint = configuredValue('PistonwareTelemetryEndpoint') or configuredValue('PistonwareTelemetryUrl')
+if type(configuredTelemetryEndpoint) == 'string' and configuredTelemetryEndpoint:match('^https://') then
+	telemetry.endpoint = configuredTelemetryEndpoint
+end
+pcall(function()
+	local candidates = {
+		request,
+		http_request,
+		syn and syn.request,
+		http and http.request
+	}
+	for _, candidate in ipairs(candidates) do
+		if type(candidate) == 'function' then
+			telemetry.requestFn = candidate
+			break
+		end
+	end
+end)
+
+local function reportError(stage, err, trace, fatal)
+	local message = safeText(err, 1600)
+	logger:error('loader.error', message, {stage = stage, channel = release.channel})
+	telemetry:report('loader_error', message, {
+		stage = stage,
+		fatal = fatal == true,
+		traceback = trace and safeText(trace, 3000) or nil
+	})
+	return message
+end
+
+local loaderStopped = false
+local function stopExecution(console, stage, err, trace, display)
+	if loaderStopped then return false end
+	loaderStopped = true
+	local message = reportError(stage, err, trace, true)
+	shared.PistonwareLoaderBoot = nil
+	shared.vapereload = nil
+	if console then
+		pcall(function() console:Fail(display or ('Loader stopped: '..message)) end)
+		pcall(function() console:Halt() end)
+	end
+	return false
+end
+
+local function errorTrace(err)
+	local traceback
+	pcall(function()
+		if debug and type(debug.traceback) == 'function' then
+			traceback = debug.traceback(tostring(err), 2)
+		end
+	end)
+	return traceback or tostring(err)
+end
+
+logger:info('loader.start', 'loader started', {
+	channel = release.channel,
+	branch = release.branch,
+	session = loaderSession
+})
+if invalidChannel then
+	logger:warn('version.channel', 'unknown channel; using main', {requested = requestedChannel})
+end
+
 if PUBLIC_BUILD then
 	shared.PistonwareDeveloper = nil
 	pcall(function()
@@ -27,14 +314,17 @@ put a number on each one instead, in the executor output, for the build that is 
 care. Off entirely in the public build -- isDeveloper is false there by construction. ]]
 local phaseClock = os.clock()
 local function phase(name)
-	if not isDeveloper then return end
 	local now = os.clock()
-	warn(('[pistonware] boot: %s took %.2fs'):format(name, now - phaseClock))
+	local elapsed = now - phaseClock
+	logger:info('boot.phase', name..' completed', {seconds = ('%.2f'):format(elapsed)})
+	if isDeveloper then
+		warn(('[pistonware] boot: %s took %.2fs'):format(name, elapsed))
+	end
 	phaseClock = now
 end
 
 if shared.PistonwareLoaderBoot and os.clock() - shared.PistonwareLoaderBoot < 180 then
-	warn('[pistonware] loader is already running, ignoring duplicate execution')
+	logger:warn('loader.duplicate', 'loader is already running; ignoring duplicate execution')
 	return
 end
 shared.PistonwareLoaderBoot = os.clock()
@@ -59,9 +349,50 @@ local Watermark = '--This watermark is used to delete the file if its cached, re
 local SCRIPT_ID   = '2fb6964a070d89a7650354a0dcce302c'
 local GETKEY_URL  = 'https://ads.luarmor.net/get_key?for=Pistonware_Key-xnpnovpEljPO'
 local KEY_FILE    = 'pistonwarekey.json'
-local TARGET_URL  = 'https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua'
+local RELEASE_FILE = 'pistonware_release.json'
 local HELP_URL    = 'https://discord.gg/pistonware'
 --[[ ======================================================================== ]]
+
+local function sourceRef(ref)
+	return ref or release.sourceRef or release.branch
+end
+
+local function projectRawUrl(path, ref)
+	path = tostring(path or ''):gsub('^/', '')
+	return 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..sourceRef(ref)..'/'..path
+end
+
+local function protectedRawUrl(ref)
+	return 'https://gitlab.com/pistonware/pistonware/-/raw/'..(ref or release.branch)..'/bedwars.lua'
+end
+
+local function rewriteProjectUrl(url)
+	local value = tostring(url or '')
+	local ref = sourceRef()
+	value = value:gsub('https://raw%.githubusercontent%.com/themagicpiston/pistonware/refs/heads/main/', function() return projectRawUrl('', ref) end)
+	value = value:gsub('https://raw%.githubusercontent%.com/themagicpiston/pistonware/main/', function() return projectRawUrl('', ref) end)
+	value = value:gsub('https://codeberg%.org/pistonware/pistonware/raw/branch/main/', function() return projectRawUrl('', ref) end)
+	value = value:gsub('https://gitlab%.com/pistonware/pistonware/%-/raw/main/', function() return protectedRawUrl(release.branch):gsub('/bedwars%.lua$', '/') end)
+	value = value:gsub('(/git/trees/)main', '%1'..release.branch)
+	value = value:gsub('([?&]sha=)main', '%1'..ref)
+	value = value:gsub('([?&]ref=)main', '%1'..ref)
+	return value
+end
+
+shared.PistonwareRawUrl = projectRawUrl
+shared.PistonwareProtectedRawUrl = protectedRawUrl
+shared.PistonwareRewriteUrl = rewriteProjectUrl
+shared.PistonwareRelease = release
+shared.PistonwareTelemetry = telemetry
+shared.PistonwareChannel = release.channel
+if not isDeveloper then
+	shared.PistonwareDevHttpGet = function(url, nocache)
+		return game:HttpGet(rewriteProjectUrl(url), nocache)
+	end
+	shared.PistonwareDevProtectedHttpGet = function(url, nocache)
+		return game:HttpGet(rewriteProjectUrl(url), nocache)
+	end
+end
 
 local Strings = {
 	enter_key       = 'Enter your key below to continue.',
@@ -166,16 +497,16 @@ local function hasContent(path)
 end
 
 local function downloadFile(path, func)
-	if not hasContent(path) then
+	if not (release.cacheReady and hasContent(path)) then
 		local relPath = select(1, path:gsub('pistonware/', ''))
 		local isBedwars = relPath == 'games/bedwars.lua'
 		local content
 		for attempt = 1, 4 do
 			local suc, res = pcall(function()
 				if isBedwars then
-					return game:HttpGet(TARGET_URL, true)
+					return game:HttpGet(protectedRawUrl(), true)
 				end
-				return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..relPath, true)
+				return game:HttpGet(projectRawUrl(relPath), true)
 			end)
 			if suc and res and res ~= '' and res ~= '404: Not Found' and (not path:find('%.lua$') or loadstring(res) ~= nil) then
 				content = res
@@ -186,14 +517,26 @@ local function downloadFile(path, func)
 			end
 		end
 		if not content then
-			error('failed to download '..path..' after 4 attempts')
+			local message = 'failed to download '..path..' after 4 attempts'
+			reportError('source.download', message, nil, false)
+			error(message, 2)
 		end
 		if path:find('%.lua$') then
 			content = Watermark..'\n'..content
 		end
-		writefile(path, content)
+		local wrote, writeError = pcall(writefile, path, content)
+		if not wrote then
+			reportError('source.cache.write', writeError, nil, false)
+			error(writeError, 2)
+		end
 	end
 	return (func or readfile)(path)
+end
+
+if not isDeveloper then
+	shared.PistonwareDevLoadSource = function(path)
+		return downloadFile(path)
+	end
 end
 
 --[[ Every concurrent batch in this file joins through here.
@@ -229,6 +572,7 @@ end
 	commits call existed only to learn the sha this response already carries.
 ]]
 local repoTree, repoTreeTried, repoTreeDone
+local repoTreeError
 local function fetchRepoTree()
 	if repoTreeTried then
 		--[[ Joined, not returned. repoTreeTried is set on ENTRY, so a second caller arriving
@@ -242,9 +586,9 @@ local function fetchRepoTree()
 		return repoTree
 	end
 	repoTreeTried = true
-	pcall(function()
+	local ok, err = pcall(function()
 		local httpService = cloneref(game:GetService('HttpService'))
-		local body = httpService:JSONDecode(game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/git/trees/main?recursive=1', true))
+		local body = httpService:JSONDecode(game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/git/trees/'..release.branch..'?recursive=1', true))
 		if type(body) == 'table' and type(body.tree) == 'table' and type(body.sha) == 'string' then
 			repoTree = body
 			--[[ Handed to main.lua so its asset prefetch reads this instead of spending its own
@@ -252,8 +596,93 @@ local function fetchRepoTree()
 			shared.PistonwareRepoTree = body
 		end
 	end)
+	if not ok then
+		repoTreeError = safeText(err)
+		logger:warn('version.tree', 'could not resolve the selected branch tree', {error = repoTreeError, branch = release.branch})
+		telemetry:report('loader_error', repoTreeError, {stage = 'version.tree', fatal = false})
+	end
 	repoTreeDone = true
 	return repoTree
+end
+
+local function readReleaseMarker()
+	if not isfile(RELEASE_FILE) then return nil end
+	local ok, body = pcall(readfile, RELEASE_FILE)
+	if not ok or type(body) ~= 'string' or body == '' then return nil end
+	local decodedOk, decoded = pcall(function()
+		return cloneref(game:GetService('HttpService')):JSONDecode(body)
+	end)
+	return decodedOk and type(decoded) == 'table' and decoded or nil
+end
+
+local function validCommit(value)
+	return type(value) == 'string' and #value == 40 and value:match('^%x+$') ~= nil
+end
+
+local function markerMatches(marker)
+	return type(marker) == 'table'
+		and marker.schema == VERSION_SCHEMA
+		and marker.channel == release.channel
+		and marker.branch == release.branch
+		and validCommit(marker.commit)
+end
+
+local function resolveRelease()
+	local marker = readReleaseMarker()
+	local tree = fetchRepoTree()
+	if tree and validCommit(tree.sha) then
+		release.commit = tree.sha
+		release.sourceRef = tree.sha
+		release.version = release.channel..'@'..tree.sha:sub(1, 12)
+		release.resolved = true
+		release.cacheReady = markerMatches(marker) and marker.commit == tree.sha
+			or false
+		shared.PistonwareRelease = release
+		logger:info('version.resolved', 'release selected', {
+			channel = release.channel,
+			branch = release.branch,
+			version = release.version,
+			cache = release.cacheReady and 'ready' or 'refresh'
+		})
+		return true
+	end
+	if markerMatches(marker) then
+		release.commit = marker.commit
+		release.sourceRef = marker.commit
+		release.version = release.channel..'@'..marker.commit:sub(1, 12)
+		release.resolved = true
+		release.cacheReady = true
+		shared.PistonwareRelease = release
+		logger:warn('version.cached', 'using the last verified release because the branch tree was unavailable', {
+			channel = release.channel,
+			version = release.version
+		})
+		return true
+	end
+	return false, repoTreeError or ('branch '..release.branch..' has no verified release')
+end
+
+local function persistReleaseMarker()
+	if not release.resolved or type(release.commit) ~= 'string' then return false end
+	local marker = {
+		schema = VERSION_SCHEMA,
+		channel = release.channel,
+		branch = release.branch,
+		commit = release.commit,
+		version = release.version,
+		savedAt = os.time()
+	}
+	local ok, err = pcall(function()
+		writefile(RELEASE_FILE, jsonEncode(marker))
+	end)
+	if not ok then
+		logger:warn('version.marker', 'could not persist the verified release marker', {error = err})
+		telemetry:report('loader_error', err, {stage = 'version.marker', fatal = false})
+		return false
+	end
+	release.cacheReady = true
+	shared.PistonwareRelease = release
+	return true
 end
 
 --[[ Shaped like the old contents/ response ({type = 'file', path = ...}) so the downloader below
@@ -327,7 +756,7 @@ local function downloadProfilesListing(body, commit, onProgress)
 				pcall(function()
 					for attempt = 1, 4 do
 						local suc, res = pcall(function()
-							return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/'..commit..'/'..relPath, true)
+							return game:HttpGet(projectRawUrl(relPath, commit or release.sourceRef), true)
 						end)
 						if suc and res and res ~= '' and res ~= '404: Not Found' then
 							writefile('pistonware/'..relPath, mergeGuiState('pistonware/'..relPath, res))
@@ -444,7 +873,7 @@ local function updateCachedFiles(onProgress)
 			task.spawn(function()
 				for attempt = 1, 4 do
 					local suc, res = pcall(function()
-						return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/'..headSha..'/'..select(1, path:gsub(' ', '%%20')), true)
+							return game:HttpGet(projectRawUrl(select(1, path:gsub(' ', '%%20')), headSha), true)
 					end)
 					--[[ compile check: never overwrite a working cached file with an error page ]]
 					if suc and res and res ~= '' and res ~= '404: Not Found' and loadstring(res) ~= nil then
@@ -1324,7 +1753,19 @@ file), because nothing else clears it and a stale true would hide the console fr
 later manual execution in the session. ]]
 local isReload = shared.vapereload and true or false
 
-local console = isReload and createHeadlessConsole() or createConsole()
+local console
+local consoleOk, consoleResult = xpcall(function()
+	return isReload and createHeadlessConsole() or createConsole()
+end, errorTrace)
+if consoleOk then
+	console = consoleResult
+else
+	console = createHeadlessConsole()
+	stopExecution(console, 'console.create', consoleResult, consoleResult)
+	return
+end
+logger:bindConsole(console)
+logger:info('console.ready', isReload and 'headless console ready' or 'console ready', {reload = isReload})
 --[[ The key gate is the first thing that runs -- every run, reinjects included -- so the console
 opens directly onto it rather than flashing '> INJECTING' for a frame first. ]]
 console:SetStatus('AUTHENTICATING', nil, '<')
@@ -1346,7 +1787,7 @@ do
 			local message = 'Unsupported executor ('..tostring(executorName)..'), please look in the #supported-executors channel for more info.'
 			console:SetStatus('ERROR', '#E15046')
 			console:SetLine(message, Palette.Error)
-			warn('[pistonware] '..message)
+			stopExecution(console, 'executor.unsupported', message)
 			--[[ The window deliberately stays up so the message can be read, but the boot is
 			over -- so the reveal thread stops instead of spinning at ~14Hz for the rest of
 			the session. The GUI and its connections go when [x] is pressed, or when the
@@ -1694,7 +2135,7 @@ do
 				end
 				--[[ warn() as well as the console line: a headless reload has no window to read,
 				and silently doing nothing is the one outcome nobody can debug. ]]
-				warn('[pistonware] '..message)
+				logger:warn('loader.cancelled', message)
 				deleteInstall()
 				return
 			end
@@ -1711,12 +2152,27 @@ end
 --[[ Decided before the folders are created, while 'did this run create the install' is still
 observable. The key gate above yields, but it runs before any folder exists and its own
 cancel path returns without reaching here, so freshInstall still cannot be read stale. ]]
-freshInstall = not isfolder('pistonware')
-for _, folder in {'pistonware', 'pistonware/games', 'pistonware/profiles', 'pistonware/assets', 'pistonware/libraries', 'pistonware/guis'} do
-	if not isfolder(folder) then
-		makefolder(folder)
+local foldersOk, foldersError = xpcall(function()
+	freshInstall = not isfolder('pistonware')
+	for _, folder in {'pistonware', 'pistonware/games', 'pistonware/profiles', 'pistonware/assets', 'pistonware/libraries', 'pistonware/guis'} do
+		if not isfolder(folder) then
+			makefolder(folder)
+		end
 	end
+end, errorTrace)
+if not foldersOk then
+	stopExecution(console, 'filesystem.setup', foldersError, foldersError)
+	return
 end
+logger:addFile('pistonware/loader.log')
+telemetry:addFile('pistonware/loader_telemetry.jsonl')
+
+local releaseOk, releaseError = resolveRelease()
+if not releaseOk then
+	stopExecution(console, 'version.resolve', releaseError, errorTrace(releaseError))
+	return
+end
+console:SetLine(('Loading %s (%s)...'):format(release.channel, release.version))
 
 --[[ Step 1: hold here until ROBLOX itself is ready. Everything after this touches game state
 (or hands off to main.lua, which does), so the shared.Vape* flags the injecting loadstring
@@ -1735,10 +2191,15 @@ this still cannot start until a key has validated. ]]
 local updateDone = isReload or isDeveloper
 if not updateDone then
 	task.spawn(function()
-		pcall(updateCachedFiles, function(completed, total)
-			console:SetLine('Updating files ('..completed..'/'..total..')...')
-			console:SetProgress(0.4 + 0.06 * (completed / math.max(total, 1)))
-		end)
+		local updateOk, updateError = xpcall(function()
+			return updateCachedFiles(function(completed, total)
+				console:SetLine('Updating files ('..completed..'/'..total..')...')
+				console:SetProgress(0.4 + 0.06 * (completed / math.max(total, 1)))
+			end)
+		end, errorTrace)
+		if not updateOk then
+			stopExecution(console, 'cache.update', updateError, updateError)
+		end
 		updateDone = true
 	end)
 else
@@ -1775,7 +2236,7 @@ do
 	console:SetProgress(0.4)
 end
 phase('waiting for ROBLOX')
-if console:IsAborted() then deleteInstall() return end
+if console:IsAborted() or loaderStopped then deleteInstall() return end
 
 --[[ Join the update check before anything reads a cached .lua file. Bounded for the same reason
 every other join in this file is: a stalled update must cost the update, not the boot. ]]
@@ -1783,7 +2244,7 @@ if not updateDone then
 	console:SetLine('Checking for updates...')
 	joinBatch(function() return updateDone end, 60)
 	console:SetLine('')
-	if console:IsAborted() then deleteInstall() return end
+	if console:IsAborted() or loaderStopped then deleteInstall() return end
 end
 phase('update check')
 console:SetProgress(0.46)
@@ -2012,12 +2473,15 @@ task.spawn(function()
 	end
 end)
 
---[[ pcall'd so a failure surfaces on the console line instead of leaving the window stuck on
+--[[ Protected so a failure surfaces on the console line instead of leaving the window stuck on
 'Loading pistonware...'; warn() keeps it in the executor output too. ]]
-local ok, result = pcall(function()
-	local chunk = loadstring(downloadFile('pistonware/main.lua'), 'main')
-	return chunk and chunk()
-end)
+local ok, result = xpcall(function()
+	local chunk, compileError = loadstring(downloadFile('pistonware/main.lua'), 'main')
+	if not chunk then
+		error(compileError or 'main.lua did not compile', 0)
+	end
+	return chunk()
+end, errorTrace)
 injecting = false
 phase('main.lua')
 --[[ Consumed only now: main.lua reads the flag itself while loading (it suppresses the 'Finished
@@ -2039,13 +2503,17 @@ if console:IsAborted() then
 end
 
 if ok then
+	persistReleaseMarker()
+	logger:info('loader.complete', 'injection succeeded', {
+		channel = release.channel,
+		version = release.version
+	})
 	console:Finish('Injected successfully.', 5)
 	return result
 end
-warn('[pistonware] '..tostring(result))
 --[[ Copied as well as printed: the message is long, full of executor paths, and the person
 hitting it is usually being asked to report it. Done here rather than inside console:Fail so
 a headless reload (which has no window to read) still leaves it on the clipboard. ]]
-local failure = 'Injection failed: '..tostring(result)
+local failure = 'Injection failed: '..safeText(result, 3000)
 local copied = pcall(function() setclipboard(failure) end)
-console:Fail(failure..(copied and '\n\n(copied to clipboard)' or ''))
+stopExecution(console, 'main.load', result, result, failure..(copied and '\n\n(copied to clipboard)' or ''))

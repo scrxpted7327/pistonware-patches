@@ -7,9 +7,21 @@ local isfile = isfile or function(file)
 	local suc, res = pcall(function() return readfile(file) end)
 	return suc and res ~= nil and res ~= ''
 end
+local function pistonwareHttpGet(url, nocache, attempt)
+	local adapter = shared.PistonwareDevHttpGet
+	if type(adapter) == 'function' then
+		return adapter(url, nocache, attempt)
+	end
+	return game:HttpGet(url, nocache)
+end
 local function downloadFile(path, func)
+	local devLoader = shared.PistonwareDevLoadSource
+	if type(devLoader) == 'function' then
+		local body = devLoader(path)
+		return func and func(path) or body
+	end
 	if not isfile(path) then
-		local suc, res = pcall(function() return game:HttpGet('https://codeberg.org/pistonware/pistonware/raw/branch/main/'..select(1, path:gsub('pistonware/', '')), true) end)
+		local suc, res = pcall(function() return pistonwareHttpGet('https://codeberg.org/pistonware/pistonware/raw/branch/main/'..select(1, path:gsub('pistonware/', '')), true) end)
 		if not suc or res == '404: Not Found' then error(res) end
 		if path:find('.lua') then res = '--This watermark is used to delete the file if its cached, remove it to make the file persist after vape updates.\n'..res end
 		writefile(path, res)

@@ -9,6 +9,70 @@ if not shared.PistonwareAuthenticated then
 	return
 end
 
+local release = type(shared.PistonwareRelease) == 'table' and shared.PistonwareRelease or {
+	channel = 'main',
+	branch = 'main',
+	sourceRef = 'main',
+	cacheReady = true
+}
+
+local function reportRuntimeError(stage, err)
+	local reporter = shared.PistonwareTelemetry
+	if type(reporter) == 'table' and type(reporter.report) == 'function' then
+		pcall(function()
+			reporter:report('runtime_error', tostring(err), {stage = stage, fatal = false})
+		end)
+	end
+end
+
+local function releaseRef()
+	return release.sourceRef or release.branch or 'main'
+end
+
+local function rewriteReleaseUrl(url)
+	local value = tostring(url or '')
+	local ref = releaseRef()
+	local adapter = shared.PistonwareRewriteUrl
+	if type(adapter) == 'function' and adapter ~= rewriteReleaseUrl then
+		local ok, rewritten = pcall(adapter, value)
+		if ok and type(rewritten) == 'string' then return rewritten end
+	end
+	value = value:gsub('https://raw%.githubusercontent%.com/themagicpiston/pistonware/refs/heads/main/', function()
+		return 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/'
+	end)
+	value = value:gsub('https://raw%.githubusercontent%.com/themagicpiston/pistonware/main/', function()
+		return 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/'
+	end)
+	value = value:gsub('https://codeberg%.org/pistonware/pistonware/raw/branch/main/', function()
+		return 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/'
+	end)
+	value = value:gsub('https://gitlab%.com/pistonware/pistonware/%-/raw/main/', function()
+		return 'https://gitlab.com/pistonware/pistonware/-/raw/'..(release.branch or 'main')..'/'
+	end)
+	value = value:gsub('([?&]sha=)main', '%1'..ref)
+	value = value:gsub('([?&]ref=)main', '%1'..ref)
+	return value
+end
+
+shared.PistonwareRewriteUrl = rewriteReleaseUrl
+
+local function projectRawUrl(path, ref)
+	path = tostring(path or ''):gsub('^/', '')
+	return 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..(ref or releaseRef())..'/'..path
+end
+
+local function protectedRawUrl(ref)
+	return 'https://gitlab.com/pistonware/pistonware/-/raw/'..(ref or release.branch or 'main')..'/bedwars.lua'
+end
+
+shared.PistonwareRawUrl = projectRawUrl
+shared.PistonwareProtectedRawUrl = protectedRawUrl
+shared.PistonwareChannel = release.channel or 'main'
+
+local function cacheAllowed()
+	return release.cacheReady ~= false
+end
+
 --[[ pcall'd: after a teleport shared.vape can still point at the previous server's instance,
 whose GUI and connections no longer exist. An error walking that corpse would abort main.lua
 on line one and leave the queued re-injection doing nothing at all. ]]
@@ -38,6 +102,25 @@ end
 local cloneref = cloneref or function(obj)
 	return obj
 end
+
+local function pistonwareHttpGet(url, nocache, attempt)
+	url = rewriteReleaseUrl(url)
+	local adapter = shared.PistonwareDevHttpGet
+	if type(adapter) == 'function' then
+		return adapter(url, nocache, attempt)
+	end
+	return game:HttpGet(url, nocache)
+end
+
+local function pistonwareProtectedHttpGet(url, nocache, attempt)
+	url = rewriteReleaseUrl(url)
+	local adapter = shared.PistonwareDevProtectedHttpGet
+	if type(adapter) == 'function' then
+		return adapter(url, nocache, attempt)
+	end
+	return game:HttpGet(url, nocache)
+end
+
 local playersService = cloneref(game:GetService('Players'))
 
 --[[ Phones and tablets. Kept for the teleport path and notifications; it no longer paces saves. ]]
@@ -145,7 +228,12 @@ local function hasContent(path)
 end
 
 local function downloadFile(path, func)
-	if not hasContent(path) then
+	local devLoader = shared.PistonwareDevLoadSource
+	if type(devLoader) == 'function' then
+		local body = devLoader(path)
+		return func and func(path) or body
+	end
+	if not (cacheAllowed() and hasContent(path)) then
 		--[[ bedwars.lua only exists in the GitLab repo (kept separate/obfuscated there), at that
 		repo's ROOT even though it caches locally under games/; everything else lives in the
 		GitHub repo. ]]
@@ -157,9 +245,9 @@ local function downloadFile(path, func)
 		for attempt = 1, 4 do
 			local suc, res = pcall(function()
 				if isBedwars then
-					return game:HttpGet('https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua', true)
+					return pistonwareProtectedHttpGet(protectedRawUrl(), true, attempt)
 				end
-				return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..relPath, true)
+				return pistonwareHttpGet(projectRawUrl(relPath), true, attempt)
 			end)
 			--[[ For .lua files, compile-check downloads so an outage page is not cached. ]]
 			if suc and res and res ~= '' and res ~= '404: Not Found' and (not path:find('%.lua$') or loadstring(res) ~= nil) then
@@ -342,17 +430,36 @@ local function finishLoading()
 			prompt -- and any one of those bailing on the new server leaves the script
 			uninjected. main.lua only needs the files the loader already cached, so it
 			comes back reliably; the loader still runs on a manual execute. ]]
-				local teleportScript = [[
-					shared.vapereload = true
-					local cached = isfile and isfile('pistonware/main.lua') and readfile('pistonware/main.lua')
-					if cached and cached ~= '' then
-						local chunk = loadstring(cached, 'main')
-						if chunk then chunk() end
-					else
-						local chunk = loadstring(game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/main.lua', true), 'main')
-						if chunk then chunk() end
-					end
-				]]
+					local teleportScript = [[
+						shared.vapereload = true
+						local release = shared.PistonwareRelease
+						local cacheReady = type(release) == 'table' and release.cacheReady ~= false
+						local cached = cacheReady and isfile and isfile('pistonware/main.lua') and readfile('pistonware/main.lua')
+						if cached and cached ~= '' then
+							local chunk = loadstring(cached, 'main')
+							if chunk then chunk() end
+						else
+							local adapter = shared.PistonwareDevHttpGet
+							local ref = type(release) == 'table' and (release.sourceRef or release.branch) or 'main'
+							local url = 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/main.lua'
+							local source = type(adapter) == 'function' and adapter(url, true) or game:HttpGet(url, true)
+							local chunk = loadstring(source, 'main')
+							if chunk then chunk() end
+						end
+					]]
+			local currentRelease = shared.PistonwareRelease
+			if type(currentRelease) == 'table' then
+				local channel = tostring(currentRelease.channel or 'main')
+				local branch = tostring(currentRelease.branch or channel)
+				local sourceRef = tostring(currentRelease.sourceRef or branch)
+				local version = tostring(currentRelease.version or '')
+				teleportScript = 'shared.PistonwareChannel = '..string.format('%q', channel)..'\n'
+					..'shared.PistonwareRelease = {schema=1, channel='..string.format('%q', channel)
+					..', branch='..string.format('%q', branch)
+					..', sourceRef='..string.format('%q', sourceRef)
+					..', version='..string.format('%q', version)
+					..', cacheReady=true, resolved=true}\n'..teleportScript
+			end
 			--[[ Globals and shared do not survive a teleport, and the new server re-runs main.lua
 			directly rather than the loader -- so the key gate's output has to be re-published
 			by hand here. Without it the guard at the top of this file would reject the
@@ -534,6 +641,7 @@ if not shared.VapeIndependent then
 		local fn, compileError = loadstring(source, chunkname)
 		if not fn then
 			gameScriptFinished = true
+			reportRuntimeError('game.compile', compileError)
 			warn('[pistonware] '..chunkname..' did not compile: '..tostring(compileError))
 			return false
 		end
@@ -577,6 +685,7 @@ if not shared.VapeIndependent then
 				debugWarn(('[pistonware] %s finished in %.1fs -- its modules now have their saved settings'):format(chunkname, elapsed))
 			end
 			if not ok then
+				reportRuntimeError('game.execute', err)
 				warn('[pistonware] '..chunkname..' errored: '..tostring(err))
 			end
 		end)
@@ -588,7 +697,7 @@ if not shared.VapeIndependent then
 	earlier failed download reads back as "present", and loadstring('') silently does
 	nothing -- indistinguishable from the game script never loading at all. ]]
 	local gameScriptStarted = false
-	local cached = hasContent(gamePath) and readfile(gamePath) or nil
+		local cached = cacheAllowed() and hasContent(gamePath) and readfile(gamePath) or nil
 	if cached and cached:gsub('%s', '') ~= '' then
 		gameScriptStarted = runGameScript(cached, tostring(game.PlaceId))
 	end
@@ -597,7 +706,7 @@ if not shared.VapeIndependent then
 		inside downloadFile) and load straight from the response, so a stale/corrupt
 		cache file can't shadow what we just downloaded. ]]
 		local suc, res = pcall(function()
-			return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/games/'..game.PlaceId..'.lua', true)
+			return pistonwareHttpGet(projectRawUrl('games/'..game.PlaceId..'.lua'), true)
 		end)
 		if suc and res and res ~= '' and res ~= '404: Not Found' then
 			pcall(writefile, gamePath, '--This watermark is used to delete the file if its cached, remove it to make the file persist after vape updates.\n'..res)

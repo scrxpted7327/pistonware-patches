@@ -10,6 +10,8 @@ local function runChunk(source, name)
 	local chunk = loadstring(source, name)
 	if chunk then chunk() end
 end
+local release = shared.PistonwareRelease
+local cacheReady = type(release) ~= 'table' or release.cacheReady ~= false
 local isfile = isfile or function(file)
 	local suc, res = pcall(function() 
 		return readfile(file) 
@@ -22,7 +24,7 @@ setup (shared.bedwars, services, vape libs) lives in 6872274481.lua, which
 loads bedwars.lua itself once that's done -- loading bedwars.lua directly
 from here skips that setup and shared.bedwars is nil when it runs. ]]
 local gamePath = 'pistonware/games/6872274481.lua'
-local cached = isfile(gamePath) and readfile(gamePath) or nil
+local cached = cacheReady and isfile(gamePath) and readfile(gamePath) or nil
 if cached and cached:gsub('%s', '') ~= '' then
 	runChunk(cached, '6872274481')
 elseif not shared.PistonwareDeveloper then
@@ -32,7 +34,9 @@ elseif not shared.PistonwareDeveloper then
 	local content
 	for attempt = 1, 4 do
 		local suc, res = pcall(function()
-			return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/games/6872274481.lua', true)
+			local rawUrl = shared.PistonwareRawUrl
+			return type(rawUrl) == 'function' and game:HttpGet(rawUrl('games/6872274481.lua'), true)
+				or game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/games/6872274481.lua', true)
 		end)
 		if suc and res and res ~= '' and res ~= '404: Not Found' then
 			content = res
