@@ -4881,9 +4881,10 @@ local function sortCategoriesNow(self)
 			-- The array can name a module the hash no longer holds if a removal lands
 			-- between the request and this pass.
 			if module then
+				local layoutOrder = index * 2
 				module.Index = index
-				module.Object.LayoutOrder = index
-				module.Children.LayoutOrder = index
+				module.Object.LayoutOrder = layoutOrder
+				module.Children.LayoutOrder = layoutOrder + 1
 			end
 		end
 	end
@@ -8490,6 +8491,9 @@ components = {
 		modulechildren.Size = UDim2.new(1, 0, 0, 0)
 		modulechildren.Visible = false
 		modulechildren.Parent = children
+		local initialLayoutOrder = (component.Index + 1) * 2
+		button.LayoutOrder = initialLayoutOrder
+		modulechildren.LayoutOrder = initialLayoutOrder + 1
 		local windowlist = Instance.new('UIListLayout')
 		windowlist.HorizontalAlignment = Enum.HorizontalAlignment.Center
 		windowlist.SortOrder = Enum.SortOrder.LayoutOrder
