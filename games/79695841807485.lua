@@ -239,8 +239,7 @@ run(function()
 		local CircleColor
 		local CircleTransparency
 		local CircleFilled
-			local CircleObject
-			local mouseClicked = false
+		local CircleObject
 		local Projectile
 		local ProjectileSpeed
 		local ProjectileGravity
@@ -356,12 +355,8 @@ run(function()
 						end
 						task.wait()
 					until not SilentAim.Enabled
-		else
-			if mouseClicked then
-				mouse1release()
-				mouseClicked = false
-			end
-			if old then
+				else
+					if old then
 						hookfunction(ad.FireBullet, old)
 					end
 					old = nil
@@ -492,17 +487,13 @@ run(function()
 	Overlay.FilterType = Enum.RaycastFilterType.Include
 	local Particles, Boxes, AttackDelay = {}, {}, tick()
 	
-		local function getAttackData()
+	local function getAttackData()
 		if Mouse.Enabled then
 			if not inputService:IsMouseButtonPressed(0) then return false end
 		end
 	
 		local tool = ad.Memory.EquippedObject
-		if not tool or tool.ObjectClassName ~= 'Melee' then return false end
-		if Lunge.Enabled and (not tool.Instance or not tostring(tool.Instance.Name):lower():find('sword', 1, true)) then
-			return false
-		end
-		return tool
+		return tool and tool.ObjectClassName == 'Melee' and tool
 	end
 	
 	Killaura = vape.Categories.Blatant:CreateModule({
@@ -774,3 +765,4 @@ run(function()
 	    Tooltip = 'Prevents taking fall damage.'
 	})
 end)
+	

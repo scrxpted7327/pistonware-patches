@@ -11,22 +11,10 @@ local isfile = isfile or function(file)
 	end)
 	return suc and res ~= nil and res ~= ''
 end
-local function pistonwareHttpGet(url, nocache, attempt)
-	local adapter = shared.PistonwareDevHttpGet
-	if type(adapter) == 'function' then
-		return adapter(url, nocache, attempt)
-	end
-	return game:HttpGet(url, nocache)
-end
 local function downloadFile(path, func)
-	local devLoader = shared.PistonwareDevLoadSource
-	if type(devLoader) == 'function' then
-		local body = devLoader(path)
-		return func and func(path) or body
-	end
 	if not isfile(path) then
 		local suc, res = pcall(function()
-			return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..select(1, path:gsub('pistonware/', '')), true)
+			return game:HttpGet('https://codeberg.org/pistonware/pistonware/raw/branch/main/'..select(1, path:gsub('pistonware/', '')), true)
 		end)
 		if not suc or res == '404: Not Found' then
 			error(res)
@@ -61,10 +49,7 @@ local prediction = vape.Libraries.prediction
 local targetinfo = vape.Libraries.targetinfo
 local sessioninfo = vape.Libraries.sessioninfo
 local getcustomasset = vape.Libraries.getcustomasset
-local drawingChunk = loadstring(downloadFile('pistonware/libraries/drawing.lua'), 'drawing')
-if not drawingChunk then return end
-local drawingactor = drawingChunk(...)
-if not drawingactor then return end
+local drawingactor = loadstring(downloadFile('pistonware/libraries/drawing.lua'), 'drawing')(...)
 local function notif(...)
 	return vape:CreateNotification(...)
 end
@@ -150,7 +135,7 @@ local function hookEvent(id, rfunc)
 		frontlines.Functions[func] = hook
 		return function()
 			if not frontlines.Functions[func] then return end
-			--[[ restorefunction(func) ]]
+			--restorefunction(func)
 			hookfunction(func, frontlines.Functions[func])
 			frontlines.Functions[func] = nil
 		end
@@ -558,7 +543,7 @@ run(function()
 	
 	local function getTarget(origin, obj)
 		if rand.NextNumber(rand, 0, 100) > (AutoFire.Enabled and 100 or HitChance.Value) then return end
-		--[[ local targetPart = (Random.new().NextNumber(Random.new(), 0, 100) < (AutoFire.Enabled and 100 or HeadshotChance.Value)) and 'Head' or 'RootPart' ]]
+		--local targetPart = (Random.new().NextNumber(Random.new(), 0, 100) < (AutoFire.Enabled and 100 or HeadshotChance.Value)) and 'Head' or 'RootPart'
 		local targetPart = 'RootPart'
 		local ent = entitylib['Entity'..Mode.Value]({
 			Range = Range.Value,
@@ -751,7 +736,7 @@ run(function()
 		Visible = false
 	})
 end)
-
+	
 run(function()
 	local Sprint
 	
@@ -832,7 +817,6 @@ run(function()
 	local Spread
 	local FireRate
 	local Automatic
-	local GunModifications
 	
 	GunModifications = vape.Categories.Blatant:CreateModule({
 		Name = 'GunModifications',
@@ -1645,3 +1629,4 @@ run(function()
 		end
 	})
 end)
+	

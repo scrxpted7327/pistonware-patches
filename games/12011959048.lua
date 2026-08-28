@@ -6,32 +6,16 @@ local loadstring = function(...)
 	end
 	return res
 end
-local function runChunk(source, name)
-	local chunk = loadstring(source, name)
-	if chunk then chunk() end
-end
 local isfile = isfile or function(file)
 	local suc, res = pcall(function() 
 		return readfile(file) 
 	end)
 	return suc and res ~= nil and res ~= ''
 end
-local function pistonwareHttpGet(url, nocache, attempt)
-	local adapter = shared.PistonwareDevHttpGet
-	if type(adapter) == 'function' then
-		return adapter(url, nocache, attempt)
-	end
-	return game:HttpGet(url, nocache)
-end
 local function downloadFile(path, func)
-	local devLoader = shared.PistonwareDevLoadSource
-	if type(devLoader) == 'function' then
-		local body = devLoader(path)
-		return func and func(path) or body
-	end
 	if not isfile(path) then
 		local suc, res = pcall(function() 
-			return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..select(1, path:gsub('pistonware/', '')), true)
+			return game:HttpGet('https://codeberg.org/pistonware/pistonware/raw/branch/main/'..select(1, path:gsub('pistonware/', '')), true) 
 		end)
 		if not suc or res == '404: Not Found' then 
 			error(res) 
@@ -46,16 +30,14 @@ end
 
 vape.Place = 11630038968
 if isfile('pistonware/games/'..vape.Place..'.lua') then
-	runChunk(readfile('pistonware/games/'..vape.Place..'.lua'), 'bridge duel')
+	loadstring(readfile('pistonware/games/'..vape.Place..'.lua'), 'bridge duel')()
 else
 	if not shared.PistonwareDeveloper then
 		local suc, res = pcall(function()
-			return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/games/'..vape.Place..'.lua', true)
+			return game:HttpGet('https://codeberg.org/pistonware/pistonware/raw/branch/main/games/'..vape.Place..'.lua', true)
 		end)
-		if suc and res and res ~= '' and res ~= '404: Not Found' then
-			runChunk(downloadFile('pistonware/games/'..vape.Place..'.lua'), 'bridge duel')
-		else
-			error('Pistonware game source '..tostring(vape.Place)..' was not found: '..tostring(res))
+		if suc and res ~= '404: Not Found' then
+			loadstring(downloadFile('pistonware/games/'..vape.Place..'.lua'), 'bridge duel')()
 		end
 	end
 end

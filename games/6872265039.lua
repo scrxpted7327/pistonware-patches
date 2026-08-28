@@ -3,44 +3,7 @@ if not shared.PistonwareAuthenticated then
 	return
 end
 
-local function errorTrace(err)
-	local traceback
-	pcall(function()
-		if debug and type(debug.traceback) == 'function' then
-			traceback = debug.traceback(tostring(err), 2)
-		end
-	end)
-	return traceback or tostring(err)
-end
-
-local function callWithThreadFix(func)
-	local setIdentity = setthreadidentity
-	local oldIdentity
-	local switched = false
-	if type(setIdentity) == 'function' then
-		if type(getthreadidentity) == 'function' then
-			local ok, identity = pcall(getthreadidentity)
-			if ok then oldIdentity = identity end
-		end
-		oldIdentity = oldIdentity or 2
-		if oldIdentity ~= 8 then
-			switched = pcall(setIdentity, 8)
-		end
-	end
-
-	local ok, err = xpcall(func, errorTrace)
-	if switched then
-		pcall(setIdentity, oldIdentity)
-	end
-	return ok, err
-end
-
-local run = function(func)
-	local ok, err = callWithThreadFix(func)
-	if not ok then
-		warn('[pistonware] a module block failed to load: '..tostring(err))
-	end
-end
+local run = function(func) func() end
 local cloneref = cloneref or function(obj) return obj end
 
 local playersService = cloneref(game:GetService('Players'))
@@ -54,32 +17,6 @@ local vape = shared.vape
 local entitylib = vape.Libraries.entity
 local sessioninfo = vape.Libraries.sessioninfo
 local bedwars = {}
-
-sessioninfo = sessioninfo or vape.Libraries.sessioninfo
-if type(sessioninfo) ~= 'table' or type(sessioninfo.Objects) ~= 'table' or type(sessioninfo.AddItem) ~= 'function' then
-	local added = 0
-	sessioninfo = {
-		Objects = {},
-		AddItem = function(self, name, startvalue, func, saved)
-			added += 1
-			self.Objects[name] = {
-				Function = func or function(val) return val end,
-				Saved = saved == nil or saved,
-				Value = startvalue or 0,
-				Index = added
-			}
-			return {
-				Increment = function(_, val)
-					self.Objects[name].Value += (val or 1)
-				end,
-				Get = function()
-					return self.Objects[name].Value
-				end
-			}
-		end
-	}
-	vape.Libraries.sessioninfo = sessioninfo
-end
 
 local function notif(...)
 	return vape:CreateNotification(...)
@@ -128,19 +65,19 @@ for _, v in {'AntiRagdoll', 'TriggerBot', 'SilentAim', 'AutoRejoin', 'Rejoin', '
 	vape:Remove(v)
 end
 
---[[ Two bugs in the three lines this replaces, and they hid each other.
-
-It called vape:Remove(i), and `i` is not declared anywhere in this file -- it was an
-undeclared global, so every call was Remove(nil). Remove looks its argument up in
-self.Modules and bails when it finds nothing, so the loop silently did nothing at all and the
-lobby kept showing the combat modules this is meant to strip.
-
-The second bug is why it cannot simply be corrected in place: Remove ends with `tab[obj] =
-nil`, so fixing the argument would have it deleting keys out of vape.Modules while this loop
-is still walking vape.Modules. Removing a key other than the one `next` is currently sitting
-on is undefined in Lua -- in practice it skips entries or errors mid-iteration.
-
-Collect first, remove after: the walk finishes before anything is mutated. ]]
+-- Two bugs in the three lines this replaces, and they hid each other.
+--
+-- It called vape:Remove(i), and `i` is not declared anywhere in this file -- it was an
+-- undeclared global, so every call was Remove(nil). Remove looks its argument up in
+-- self.Modules and bails when it finds nothing, so the loop silently did nothing at all and the
+-- lobby kept showing the combat modules this is meant to strip.
+--
+-- The second bug is why it cannot simply be corrected in place: Remove ends with `tab[obj] =
+-- nil`, so fixing the argument would have it deleting keys out of vape.Modules while this loop
+-- is still walking vape.Modules. Removing a key other than the one `next` is currently sitting
+-- on is undefined in Lua -- in practice it skips entries or errors mid-iteration.
+--
+-- Collect first, remove after: the walk finishes before anything is mutated.
 local toRemove = {}
 for name, module in (vape.EachModule and vape:EachModule() or vape.Modules) do
 	if module.Category == 'Combat' or module.Category == 'Minigames' then
