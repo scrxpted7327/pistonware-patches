@@ -28,8 +28,6 @@ SMOKE_SOURCES = (
     "games/12011959048.lua",
     "games/6872265039.lua",
     "games/6872274481.lua",
-    "games/universal.lua",
-    "games/bedwars.lua",
     "libraries/drawing.lua",
     "libraries/entity.lua",
     "libraries/hash.lua",

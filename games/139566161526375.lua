@@ -357,7 +357,6 @@ run(function()
 									AttackDelay = tick() + (1 / CPS.GetRandomValue())
 									local bdent = bd.Entity.FindByCharacter(v.Character)
 									if bdent then
-									entitylib.Performance:RecordKillauraSwing(v, os.clock())
 										bd.Blink.item_action.attack_entity.fire({
 											target_entity_id = bdent.Id,
 											is_crit = entitylib.character.RootPart.AssemblyLinearVelocity.Y < 0,

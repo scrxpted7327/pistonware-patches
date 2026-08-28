@@ -965,7 +965,6 @@ run(function()
 	
 									if id then
 										hitdelay = tick() + 0.1
-										entitylib.Performance:RecordKillauraSwing(v, os.clock())
 										frontlines.Main.utils.net_msg_util.c_prep_net_msg(frontlines.Main.globals.combat_net_msg_state, frontlines.Main.enums.c_net_msg.MELEE_HIT_SOL, id)
 										if knifecheck then
 											frontlines.Main.globals.ctrl_states.trigger = true

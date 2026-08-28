@@ -539,7 +539,6 @@ run(function()
 	
 								if AttackDelay < tick() then
 									AttackDelay = tick() + 0.05
-									entitylib.Performance:RecordKillauraSwing(v, os.clock())
 									ad.Network:FireServer('MeleeHit', v.Character, v.RootPart, tool.Instance, true, v.RootPart.Position)
 	                                if vape.ThreadFix then
 	                                    setthreadidentity(8)
