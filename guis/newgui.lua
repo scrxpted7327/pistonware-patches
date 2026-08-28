@@ -1142,6 +1142,24 @@ local function addMaid(obj)
 	end
 end
 
+local function cleanupConnection(connection)
+	if connection == nil then return end
+	if type(connection) == 'function' then
+		pcall(connection)
+		return
+	end
+
+	for _, methodName in {'Disconnect', 'disconnect', 'Destroy', 'Remove', 'DoCleaning'} do
+		local ok, method = pcall(function()
+			return connection[methodName]
+		end)
+		if ok and type(method) == 'function' then
+			pcall(method, connection)
+			return
+		end
+	end
+end
+
 local function addTooltip(gui, text, customText, visCheck)
 	if not text then return end
 
@@ -4512,6 +4530,12 @@ function vape:LoadGUI()
 	
 	local cursorConnection
 	vape:Clean(clickgui:GetPropertyChangedSignal('Visible'):Connect(function()
+		if not clickgui.Visible then
+			tooltip.Visible = false
+			tooltip.Text = ''
+			vape.CurrentTooltip = nil
+		end
+
 		vape:UpdateGUI(vape.GUIColor.Hue, vape.GUIColor.Sat, vape.GUIColor.Value, true)
 	
 		if clickgui.Visible and inputService.MouseEnabled then
@@ -4942,9 +4966,7 @@ function vape:Uninject()
 	end
 
 	for _, connection in self.Connections do
-		pcall(function()
-			connection:Disconnect()
-		end)
+		cleanupConnection(connection)
 	end
 
 	if self.ThreadFix then
@@ -8140,7 +8162,7 @@ components = {
 		
 			if not self.Enabled then
 				for _, v in self.Connections do
-					v:Disconnect()
+					cleanupConnection(v)
 				end
 				table.clear(self.Connections)
 			end
@@ -8635,7 +8657,7 @@ components = {
 		
 			if not self.Enabled then
 				for _, v in self.Connections do
-					v:Disconnect()
+					cleanupConnection(v)
 				end
 				table.clear(self.Connections)
 			end
@@ -8824,7 +8846,7 @@ components = {
 		
 					if not callback then
 						for _, v in component.Connections do
-							v:Disconnect()
+							cleanupConnection(v)
 						end
 						table.clear(component.Connections)
 					end

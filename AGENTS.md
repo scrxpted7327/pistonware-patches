@@ -1,5 +1,12 @@
 Run all tests with `python3 tests/check_luau.py` before committing or pushing.
 
+## Change authorization
+
+- Do not modify, refactor, or otherwise change modules unless the user explicitly requests
+  changes to those modules.
+- Always ask for and receive explicit permission before building or applying patches, or before
+  attempting an implementation or other proposed solution. Read-only inspection is allowed.
+
 ## BedWars payload handling
 
 - `games/bedwars.lua` is obfuscated and protected on release and production channels. If it is

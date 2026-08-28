@@ -2595,6 +2595,7 @@ run(function()
 							targetQuery.NPCs = npcsEnabled
 							targetQuery.Limit = maxTargets
 							targetQuery.Output = targetsBuffer
+							targetQuery.Cache = true
 							entitylib.AllPosition(targetQuery)
 						else
 							local rangeSq = swingRange * swingRange
@@ -2641,10 +2642,11 @@ run(function()
 								hit.Check = distance > attackRange and BoxSwingColor or BoxAttackColor
 								targetinfo.Targets[v] = now + 1
 
-								if AttackDelay < now then
-									AttackDelay = now + (1 / CPS.GetRandomValue())
-									tool:Activate()
-								end
+				if AttackDelay < now then
+					AttackDelay = now + (1 / CPS.GetRandomValue())
+					entitylib.Performance:RecordKillauraSwing(v, os.clock())
+					tool:Activate()
+				end
 
 								if Lunge.Enabled and tool.GripUp.X == 0 then break end
 								if distance > attackRange then continue end
@@ -6026,7 +6028,246 @@ run(function()
 	infostroke.Parent = infoholder
 	addBlur(infoholder)
 end)
-	
+
+if shared.PistonwareDeveloper == true then
+	run(function()
+		local KillauraInfo
+		local FontOption
+		local TextSize
+		local BorderColor
+		local Title
+		local TitleOffset
+		local infoholder
+		local infolabel
+		local infostroke
+		local lifecycle = 0
+
+		local function getKillaura()
+			local modules = vape.Modules
+			return modules and modules.Killaura
+		end
+
+		local function formatMilliseconds(value)
+			return type(value) == 'number' and value >= 0 and string.format('%.1f ms', value * 1000) or '--'
+		end
+
+		local function formatPing(value)
+			return type(value) == 'number' and value >= 0 and string.format('%.0f ms', value) or '--'
+		end
+
+		local function formatRate(value)
+			return type(value) == 'number' and string.format('%.2f/s', value) or '--'
+		end
+
+		local function formatCount(value)
+			return type(value) == 'number' and tostring(math.floor(value + 0.5)) or '--'
+		end
+
+		local function formatPercent(value)
+			return type(value) == 'number' and string.format('%.1f%%', value * 100) or '--'
+		end
+
+		local function formatMemory(value)
+			return type(value) == 'number' and string.format('%.0f MB', value) or '--'
+		end
+
+		local function formatAge(now, timestamp)
+			return type(timestamp) == 'number' and string.format('%.1fs ago', math.max(now - timestamp, 0)) or '--'
+		end
+
+		local function getTargetName(target)
+			if not target then return 'none' end
+			local name
+			pcall(function()
+				if type(target) == 'table' and target.Player then
+					name = target.Player.DisplayName or target.Player.Name
+				else
+					name = target.Name
+				end
+			end)
+			return removeTags(tostring(name or 'target'))
+		end
+
+		KillauraInfo = vape:CreateOverlay({
+			-- Keep this category name stable so existing developer profiles continue to load.
+			Name = 'Killaura Info',
+			Icon = getcustomasset('pistonware/assets/new/targetinfo.png'),
+			Size = UDim2.fromOffset(16, 12),
+			Position = UDim2.fromOffset(12, 110),
+			CategorySize = 240,
+			Function = function(callback)
+				lifecycle += 1
+				local currentLifecycle = lifecycle
+				if callback then
+					local performance = entitylib.Performance
+					local wasPerformanceEnabled = performance:IsEnabled()
+					performance:SetEnabled(true)
+					performance:SetKillauraTelemetry(true)
+					performance:StartDiagnostics()
+
+					local previousStats = performance:Snapshot()
+					local previousStatsAt = os.clock()
+
+					KillauraInfo:Clean(function()
+						performance:StopDiagnostics()
+						performance:SetKillauraTelemetry(false)
+						performance:SetEnabled(wasPerformanceEnabled)
+					end)
+
+					repeat
+						local now = os.clock()
+						local currentStats = performance:Snapshot()
+						local statsElapsed = math.max(now - previousStatsAt, 0.001)
+						local function statRate(name)
+							return math.max((currentStats[name] or 0) - (previousStats[name] or 0), 0) / statsElapsed
+						end
+						local cacheHits = statRate('TargetCacheHits')
+						local cacheRefreshes = statRate('TargetCacheRefreshes')
+						local cacheTotal = cacheHits + cacheRefreshes
+						local cacheRatio = cacheTotal > 0 and string.format('%.1f%%', cacheHits / cacheTotal * 100) or '--'
+						local scanRate = statRate('TargetScans')
+						local candidateRate = statRate('TargetCandidates')
+						local raycastRate = statRate('Raycasts')
+						local updateRate = statRate('EntityUpdates')
+						previousStats = currentStats
+						previousStatsAt = now
+
+						local telemetry = performance:KillauraSnapshot(now)
+						local diagnostics = performance:DiagnosticsSnapshot(now)
+						local killaura = getKillaura()
+						local status = killaura and (killaura.Enabled and 'ON' or 'OFF') or 'UNAVAILABLE'
+						local render = diagnostics.Render
+						local heartbeat = diagnostics.Heartbeat
+						local ping = diagnostics.Ping
+						local spikes = diagnostics.Spikes
+						local corrections = diagnostics.Corrections
+						local lines = {}
+						local showTitle = not Title or Title.Enabled
+						if showTitle then
+							lines[#lines + 1] = TitleOffset and TitleOffset.Enabled and '<b>Developer Diagnostics</b>\n<font size="4"> </font>' or '<b>Developer Diagnostics</b>'
+						end
+						lines[#lines + 1] = 'Killaura: '..status..' | Target: '..getTargetName(telemetry.LastTarget)
+						lines[#lines + 1] = 'Attempts: '..formatCount(telemetry.SwingCount)..' | Confirmed: '..formatCount(telemetry.ConfirmedCount)..' | Pending: '..formatCount(telemetry.PendingCount)
+						lines[#lines + 1] = 'Expired: '..formatCount(telemetry.ExpiredCount)..' | Dropped: '..formatCount(telemetry.DroppedCount)
+						lines[#lines + 1] = 'Finalized hit ratio: '..formatPercent(telemetry.Accuracy)..' | provisional '..formatPercent(telemetry.ProvisionalAccuracy)
+						lines[#lines + 1] = 'Hit rate: '..formatRate(telemetry.HitRate)..' rolling 5s | Swing rate: '..formatRate(telemetry.SwingRate)
+						lines[#lines + 1] = 'Hit gap: '..formatMilliseconds(telemetry.AverageHitGap)..' avg | Swing gap: '..formatMilliseconds(telemetry.AverageSwingGap)..' avg'
+						lines[#lines + 1] = 'Confirm source: matched adapter event | Telemetry uptime: '..string.format('%.1fs', telemetry.Elapsed or 0)
+						if diagnostics.Enabled then
+							lines[#lines + 1] = 'Render FPS: '..formatCount(render.Fps)..' | 1% low: '..formatCount(render.Low1PercentFps)
+							lines[#lines + 1] = 'Frame: '..formatMilliseconds(render.FrameAverage)..' avg | '..formatMilliseconds(render.FrameP95)..' p95 | '..formatMilliseconds(render.FrameMax)..' max'
+							lines[#lines + 1] = 'Heartbeat: '..formatMilliseconds(heartbeat.Average)..' avg | '..formatMilliseconds(heartbeat.P95)..' p95 | '..formatMilliseconds(heartbeat.Max)..' max'
+							lines[#lines + 1] = 'Ping: '..formatPing(ping.Current)..' now | '..formatPing(ping.Average)..' avg | '..formatPing(ping.P95)..' p95 | jitter '..formatPing(ping.Jitter)
+							lines[#lines + 1] = 'Spikes/10s: render '..formatCount(spikes.Render)..' | heartbeat '..formatCount(spikes.Heartbeat)..' | ping '..formatCount(spikes.Network)
+							lines[#lines + 1] = 'Last spikes: render '..formatMilliseconds(spikes.LastRender)..' | heartbeat '..formatMilliseconds(spikes.LastHeartbeat)..' | ping '..formatPing(spikes.LastNetwork)
+							lines[#lines + 1] = 'Samples: render '..formatCount(render.Samples)..' | heartbeat '..formatCount(heartbeat.Samples)..' | ping '..formatCount(ping.Samples)
+							lines[#lines + 1] = 'Correction signals: '..formatCount(corrections.Count)..' total | '..formatCount(corrections.Recent)..' recent | '..(corrections.LastReason or 'none')..' ('..formatAge(now, corrections.LastAt)..')'
+							lines[#lines + 1] = 'Memory: '..formatMemory(diagnostics.Memory)
+						else
+							lines[#lines + 1] = 'Diagnostics sampler: unavailable'
+						end
+						lines[#lines + 1] = 'Targeting/s: scan '..formatRate(scanRate)..' | candidates '..formatRate(candidateRate)..' | raycast '..formatRate(raycastRate)
+						lines[#lines + 1] = 'Cache: '..cacheRatio..' hit | entity updates '..formatRate(updateRate)
+
+						infolabel.Text = table.concat(lines, '\n')
+						infolabel.FontFace = FontOption.Value
+						infolabel.TextSize = TextSize.Value
+						local size = getfontsize(removeTags(infolabel.Text), infolabel.TextSize, infolabel.FontFace)
+						infoholder.Size = UDim2.fromOffset(math.max(420, math.min(size.X + 16, 640)), size.Y + (showTitle and TitleOffset and TitleOffset.Enabled and 4 or 16))
+						task.wait(0.25)
+					until lifecycle ~= currentLifecycle or not KillauraInfo.Button or not KillauraInfo.Button.Enabled
+				end
+			end
+		})
+		FontOption = KillauraInfo:CreateFont({
+			Name = 'Font',
+			Blacklist = 'Arial'
+		})
+		KillauraInfo:CreateColorSlider({
+			Name = 'Background Color',
+			DefaultValue = 0,
+			DefaultOpacity = 0.5,
+			Function = function(hue, sat, val, opacity)
+				if infoholder then
+					infoholder.BackgroundColor3 = Color3.fromHSV(hue, sat, val)
+					infoholder.BackgroundTransparency = 1 - opacity
+				end
+			end
+		})
+		BorderColor = KillauraInfo:CreateColorSlider({
+			Name = 'Border Color',
+			Function = function(hue, sat, val, opacity)
+				if infostroke then
+					infostroke.Color = Color3.fromHSV(hue, sat, val)
+					infostroke.Transparency = 1 - opacity
+				end
+			end,
+			Darker = true,
+			Visible = false
+		})
+		TextSize = KillauraInfo:CreateSlider({
+			Name = 'Text Size',
+			Min = 1,
+			Max = 30,
+			Default = 16
+		})
+		Title = KillauraInfo:CreateToggle({
+			Name = 'Title',
+			Function = function(callback)
+				if TitleOffset and TitleOffset.Object then
+					TitleOffset.Object.Visible = callback
+				end
+			end,
+			Default = true
+		})
+		TitleOffset = KillauraInfo:CreateToggle({
+			Name = 'Offset',
+			Default = true,
+			Darker = true
+		})
+		KillauraInfo:CreateToggle({
+			Name = 'Border',
+			Function = function(callback)
+				if infostroke then infostroke.Enabled = callback end
+				if BorderColor and BorderColor.Object then BorderColor.Object.Visible = callback end
+			end
+		})
+		infoholder = Instance.new('Frame')
+		infoholder.BackgroundColor3 = Color3.new()
+		infoholder.BackgroundTransparency = 0.5
+		infoholder.Parent = KillauraInfo.Children
+		vape:Clean(KillauraInfo.Children:GetPropertyChangedSignal('AbsolutePosition'):Connect(function()
+			if vape.ThreadFix then
+				setthreadidentity(8)
+			end
+			local newside = KillauraInfo.Children.AbsolutePosition.X > (vape.gui.AbsoluteSize.X / 2)
+			infoholder.Position = UDim2.fromScale(newside and 1 or 0, 0)
+			infoholder.AnchorPoint = Vector2.new(newside and 1 or 0, 0)
+		end))
+		local infocorner = Instance.new('UICorner')
+		infocorner.CornerRadius = UDim.new(0, 5)
+		infocorner.Parent = infoholder
+		infolabel = Instance.new('TextLabel')
+		infolabel.Size = UDim2.new(1, -16, 1, -16)
+		infolabel.Position = UDim2.fromOffset(8, 8)
+		infolabel.BackgroundTransparency = 1
+		infolabel.TextXAlignment = Enum.TextXAlignment.Left
+		infolabel.TextYAlignment = Enum.TextYAlignment.Top
+		infolabel.TextSize = 16
+		infolabel.TextColor3 = Color3.new(1, 1, 1)
+		infolabel.TextStrokeColor3 = Color3.new()
+		infolabel.TextStrokeTransparency = 0.8
+		infolabel.Font = Enum.Font.Arial
+		infolabel.RichText = true
+		infolabel.Parent = infoholder
+		infostroke = Instance.new('UIStroke')
+		infostroke.Enabled = false
+		infostroke.Color = Color3.fromHSV(0.44, 1, 1)
+		infostroke.Parent = infoholder
+		addBlur(infoholder)
+	end)
+end
+
 run(function()
 	local Tracers
 	local Targets

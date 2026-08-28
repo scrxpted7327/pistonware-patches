@@ -118,10 +118,13 @@ local function priorityRank(entity, mode)
 	return isPlayer and 0 or 1
 end
 
+local priorityTargetOutput = {}
 local function priorityTarget(options, priority)
 	if not priority or priority.Value == 'Closest' then
 		return entitylib.EntityPosition(options)
 	end
+	options.Cache = true
+	options.Output = options.Output or priorityTargetOutput
 	local targets = entitylib.AllPosition(options)
 	local originalOrder = {}
 	for index, entity in targets do originalOrder[entity] = index end
@@ -1176,285 +1179,6 @@ end)
 
 local blankFunction = function(...) return ... end
 
---[[ == runtime diagnostics ==
-This small native service owns only bounded observation, call formatting, and connection
-bookkeeping. When it is stopped, observers and event connections are disconnected. ]]
-local connectionLister = {}
-
-function connectionLister.list(signal)
-    if type(getconnections) ~= 'function' or not signal then return {} end
-    local ok, connections = pcall(getconnections, signal)
-    return ok and type(connections) == 'table' and connections or {}
-end
-
-local function compactExploitValue(value, depth, seen)
-    depth = depth or 0
-    if depth > 2 then return '...' end
-
-    local valueType = typeof(value)
-    if valueType == 'Instance' then
-        local ok, fullName = pcall(function() return value:GetFullName() end)
-        return ok and fullName or tostring(value)
-    elseif valueType == 'Vector3' or valueType == 'Vector2' then
-        return tostring(value)
-    elseif valueType == 'CFrame' or valueType == 'Color3' then
-        return tostring(value)
-    end
-
-    if type(value) == 'string' then
-        return string.format('%q', value)
-    elseif type(value) ~= 'table' then
-        return tostring(value)
-    end
-
-    seen = seen or {}
-    if seen[value] then return '<cycle>' end
-    seen[value] = true
-    local fields, count = {}, 0
-    for key, item in value do
-        count += 1
-        if count > 8 then
-            fields[#fields + 1] = '...'
-            break
-        end
-        fields[#fields + 1] = '['..compactExploitValue(key, depth + 1, seen)..']='..compactExploitValue(item, depth + 1, seen)
-    end
-    seen[value] = nil
-    return '{'..table.concat(fields, ', ')..'}'
-end
-
-local function compactExploitArgs(args)
-    local fields = {}
-    for index = 1, math.min(args.n or #args, 8) do
-        fields[index] = compactExploitValue(args[index])
-    end
-    return table.concat(fields, ', ')
-end
-
-local exploitFinder = {
-    Active = false,
-    RecordRemotes = true,
-    RecordEvents = true,
-    MaxLogs = 400,
-    Logs = {},
-    RemoteNames = {},
-    RemoteRecords = {},
-    Observed = {},
-    EventConnections = {},
-    Listeners = {},
-    NextListener = 0,
-}
-
-function exploitFinder:subscribe(callback)
-    if type(callback) ~= 'function' then return nil end
-    self.NextListener += 1
-    self.Listeners[self.NextListener] = callback
-    return self.NextListener
-end
-
-function exploitFinder:unsubscribe(token)
-    self.Listeners[token] = nil
-end
-
-function exploitFinder:emit(kind, text, data)
-    local entry = {
-        time = os.clock(),
-        kind = kind,
-        text = text,
-        data = data,
-    }
-    self.Logs[#self.Logs + 1] = entry
-    while #self.Logs > self.MaxLogs do
-        table.remove(self.Logs, 1)
-    end
-    for _, callback in self.Listeners do
-        pcall(callback, entry)
-    end
-    return entry
-end
-
-function exploitFinder:clear()
-    table.clear(self.Logs)
-    self:emit('system', 'console cleared')
-end
-
-function exploitFinder:formatClientCall(remoteName, method, args)
-    local suffix = method == 'InvokeServer' and 'CallServer' or method == 'FireServer' and 'SendToServer' or method
-    local name = type(remoteName) == 'string' and remoteName or tostring(remoteName or 'UnknownRemote')
-    local call = 'bedwars.Client:Get('..string.format('%q', name)..'):'..suffix..'('
-    return call..compactExploitArgs(args or {n = 0})..')'
-end
-
-function exploitFinder:remoteName(instance)
-    local name = self.RemoteNames[instance]
-    if name then return name end
-    local ok, result = pcall(function() return instance.Name end)
-    return ok and result or 'UnknownRemote'
-end
-
-function exploitFinder:recordRemote(instance, method, ...)
-    if not self.Active or not self.RecordRemotes then return end
-    local args = table.pack(...)
-    local remoteName = self:remoteName(instance)
-    self:emit('remote', self:formatClientCall(remoteName, method, args), {
-        instance = instance,
-        method = method,
-        remoteName = remoteName,
-        args = args,
-    })
-end
-
-function exploitFinder:recordEvent(instance, ...)
-    if not self.Active or not self.RecordEvents then return end
-    local args = table.pack(...)
-    local remoteName = self:remoteName(instance)
-    self:emit('event', 'bedwars.Client:Get('..string.format('%q', remoteName)..').instance.OnClientEvent('..compactExploitArgs(args)..')', {
-        instance = instance,
-        remoteName = remoteName,
-        args = args,
-    })
-end
-
-function exploitFinder:observeRemote(instance)
-    if not instance or self.Observed[instance] then return end
-    local observed = {}
-    observed.fire = namecallGuard.observe(instance, 'FireServer', function(remote, ...)
-        self:recordRemote(remote, 'FireServer', ...)
-    end)
-    observed.invoke = namecallGuard.observe(instance, 'InvokeServer', function(remote, ...)
-        self:recordRemote(remote, 'InvokeServer', ...)
-    end)
-    self.Observed[instance] = observed
-end
-
-function exploitFinder:registerClient(remoteName, call)
-    if type(remoteName) ~= 'string' or not call then return end
-    local instance
-    pcall(function() instance = call.instance end)
-    if not instance then return end
-    self.RemoteNames[instance] = remoteName
-    self.RemoteRecords[remoteName] = instance
-    if self.Active then
-        self:observeRemote(instance)
-    end
-end
-
-function exploitFinder:listenRemote(instance)
-    if not self.Active or not self.RecordEvents or self.EventConnections[instance] then return end
-    local isRemoteEvent = false
-    pcall(function() isRemoteEvent = instance:IsA('RemoteEvent') end)
-    if not isRemoteEvent then return end
-    local signal
-    pcall(function() signal = instance.OnClientEvent end)
-    if not signal or type(signal.Connect) ~= 'function' then return end
-    local ok, connection = pcall(function()
-        return signal:Connect(function(...)
-            self:recordEvent(instance, ...)
-        end)
-    end)
-    if ok and connection then
-        self.EventConnections[instance] = connection
-    end
-end
-
-function exploitFinder:resolveNetFolder()
-    local folder = replicatedStorage
-    for _, name in {'rbxts_include', 'node_modules', '@rbxts', 'net', 'out', '_NetManaged'} do
-        local nextFolder
-        pcall(function() nextFolder = folder and folder:FindFirstChild(name) end)
-        if not nextFolder then return nil end
-        folder = nextFolder
-    end
-    return folder
-end
-
-function exploitFinder:scanRemotes(root)
-    root = root or self:resolveNetFolder()
-    if not root then
-        self:emit('system', 'remote scan: _NetManaged was not found')
-        return 0
-    end
-    local ok, descendants = pcall(function() return root:GetDescendants() end)
-    if not ok or type(descendants) ~= 'table' then return 0 end
-    local count = 0
-    for _, instance in descendants do
-        local isRemote = false
-        pcall(function()
-            isRemote = instance:IsA('RemoteEvent') or instance:IsA('RemoteFunction')
-        end)
-        if isRemote then
-            count += 1
-            local name
-            pcall(function() name = instance.Name end)
-            if name and not self.RemoteNames[instance] then
-                self.RemoteNames[instance] = name
-                self.RemoteRecords[name] = instance
-            end
-            if self.Active then
-                self:observeRemote(instance)
-                self:listenRemote(instance)
-            end
-        end
-    end
-    self:emit('system', 'remote scan: '..count..' RemoteEvent/RemoteFunction objects')
-    return count
-end
-
-function exploitFinder:scanConnections()
-    local signals = {
-        {'Players.PlayerAdded', playersService.PlayerAdded},
-        {'Players.PlayerRemoving', playersService.PlayerRemoving},
-        {'RunService.Heartbeat', runService.Heartbeat},
-        {'RunService.RenderStepped', runService.RenderStepped},
-    }
-    local total = 0
-    for _, entry in signals do
-        local connections = connectionLister.list(entry[2])
-        total += #connections
-        self:emit('connection', entry[1]..' -> '..#connections..' connections', {signal = entry[2], connections = connections})
-    end
-    self:emit('system', 'connection scan: '..total..' connections across '..#signals..' core signals')
-    return total
-end
-
-function exploitFinder:scan()
-    self:scanRemotes()
-    return self:scanConnections()
-end
-
-function exploitFinder:start(options)
-    if type(options) == 'table' then
-        if options.remotes ~= nil then self.RecordRemotes = options.remotes end
-        if options.events ~= nil then self.RecordEvents = options.events end
-    end
-    if self.Active then return end
-    self.Active = true
-    self:emit('system', 'exploit finder started')
-    self:scanRemotes()
-end
-
-function exploitFinder:stop()
-    if not self.Active then return end
-    self.Active = false
-    for _, connection in self.EventConnections do
-        pcall(function() connection:Disconnect() end)
-    end
-    table.clear(self.EventConnections)
-    for _, observed in self.Observed do
-        if observed.fire then namecallGuard.unobserve(observed.fire) end
-        if observed.invoke then namecallGuard.unobserve(observed.invoke) end
-    end
-    table.clear(self.Observed)
-    self:emit('system', 'exploit finder stopped')
-end
-
-vape:Clean(function()
-    exploitFinder:stop()
-    table.clear(exploitFinder.Listeners)
-    table.clear(exploitFinder.RemoteNames)
-    table.clear(exploitFinder.RemoteRecords)
-end)
-
 local fpsHooks = {}
 do
     local scopes = {}
@@ -1712,13 +1436,14 @@ do
             if not options.renderFidelity then return end
             local isMesh = false
             pcall(function()
-                isMesh = instance:IsA('MeshPart') or instance:IsA('UnionOperation')
+                isMesh = instance:IsA('MeshPart')
             end)
             if not isMesh then return end
             if not renderFidelitySeen[instance] then
                 renderFidelitySeen[instance] = true
                 local ok, original = pcall(function() return instance.RenderFidelity end)
-                if ok then renderFidelityOriginal[instance] = original end
+                if not ok then return end
+                renderFidelityOriginal[instance] = original
             end
             pcall(function()
                 instance.RenderFidelity = Enum.RenderFidelity.Performance
@@ -2411,7 +2136,6 @@ run(function()
 
 	Client.Get = function(self, remoteName)
 		local call = OldGet(self, remoteName)
-		exploitFinder:registerClient(remoteName, call)
 
 		if remoteName == remotes.AttackEntity then
 			return {
@@ -2444,10 +2168,7 @@ run(function()
 		-- remote -- inside the hot path every remote in the game goes through.
 		elseif remoteName == 'StepOnSnapTrap' and TrapDisabler and TrapDisabler.Enabled then
 			return {SendToServer = function() end}
-		elseif remoteName == 'SwordSwingMiss'
-			and vape.Modules
-			and vape.Modules.NoClickDelay
-			and vape.Modules.NoClickDelay.Enabled then
+		elseif remoteName == 'SwordSwingMiss' and vape.Modules and vape.Modules.NoClickDelay and vape.Modules.NoClickDelay.Enabled then
 			return {SendToServer = function() end}
 		end
 
@@ -2999,8 +2720,18 @@ run(function()
 			fromEntity = select(5, ...),
 			knockbackMultiplier = select(6, ...),
 			knockbackId = select(7, ...),
+			attackData = select(8, ...),
 			disableDamageHighlight = select(13, ...)
 		})
+	end))
+
+	-- Keep confirmed Killaura telemetry at the normalized damage-event seam. The
+	-- universal overlay can be enabled before this adapter finishes loading, so it
+	-- must not depend on discovering this event from its own callback.
+	vape:Clean(vapeEvents.EntityDamageEvent.Event:Connect(function(damageTable)
+		if damageTable and damageTable.fromEntity == lplr.Character and damageTable.entityInstance then
+			entitylib.Performance:RecordKillauraHit(damageTable.entityInstance, os.clock())
+		end
 	end))
 
 	--[[ cache projectile names we care about ]]
@@ -3017,6 +2748,19 @@ run(function()
 
 	--[[ optimized ZapNetworking hook ]]
 	vape:Clean(bedwars.ZapNetworking.ProjectileLaunchZap.On(function(origin, projectileType, tool, shooter)
+		local launchedAt = os.clock()
+		local shooterPosition, shooterVelocity
+		pcall(function()
+			local character = shooter
+			if typeof(shooter) == 'Instance' and shooter:IsA('Player') then
+				character = shooter.Character
+			end
+			local root = character and (character.PrimaryPart or character:FindFirstChild('HumanoidRootPart'))
+			if root then
+				shooterPosition = root.Position
+				shooterVelocity = root.AssemblyLinearVelocity
+			end
+		end)
 		task.defer(function()
 			local lowerType = tostring(projectileType):lower()
 			if isTrackedProjectile(lowerType) then
@@ -3029,7 +2773,10 @@ run(function()
 								origin = origin,
 								projectile = obj,
 								tool = tool,
-								shooter = shooter
+								shooter = shooter,
+								launchedAt = launchedAt,
+								shooterPosition = shooterPosition,
+								shooterVelocity = shooterVelocity
 							})
 							break --[[ stop after first match ]]
 						end
@@ -3049,7 +2796,11 @@ run(function()
 						origin = root.Position,
 						projectile = child,
 						tool = nil,
-						shooter = lplr.Character
+						shooter = lplr.Character,
+						launchedAt = os.clock(),
+						shooterPosition = root.Position,
+						shooterVelocity = root.AssemblyLinearVelocity,
+						fallback = true
 					})
 				end
 			end)
@@ -3318,10 +3069,10 @@ run(function()
 							shakeapplied = shakeRotation(dt)
 							gameCamera.CFrame = aimed * shakeapplied
 						end
-					end
-				end))
-			end
-		end,
+						end
+					end))
+				end
+			end,
 		Tooltip = 'Smoothly pulls your aim onto the closest target while you have a sword out'
 	})
 	Targets = AimAssist:CreateTargets({
@@ -3831,7 +3582,7 @@ run(function()
 					AntiFallPart.Transparency = 1 - Color.Opacity
 					AntiFallPart.Material = Enum.Material[Material.Value]
 					AntiFallPart.Color = Color3.fromHSV(Color.Hue, Color.Sat, Color.Value)
-					AntiFallPart.Position = Vector3.new(0, pos - 2, 0)
+					AntiFallPart.Position = Vector3.new(0, ground - 2, 0)
 					AntiFallPart.CanCollide = Mode.Value == 'Collide'
 					AntiFallPart.Anchored = true
 					AntiFallPart.CanQuery = false
@@ -4415,7 +4166,7 @@ run(function()
 						local root, velo = char.RootPart, getSpeed()
 						local moveDirection = AntiFallDirection or hum.MoveDirection
 						local destination = (moveDirection * math.max(Value.Value - velo, 0) * dt)
-	
+
 						if WallCheck.Enabled then
 							rayCheck.FilterDescendantsInstances = {lplr.Character, gameCamera}
 							rayCheck.CollisionGroup = root.CollisionGroup
@@ -4424,7 +4175,7 @@ run(function()
 								destination = ((ray.Position + ray.Normal) - root.Position)
 							end
 						end
-	
+
 						root.CFrame += destination
 						root.AssemblyLinearVelocity = (moveDirection * velo) + Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
 						-- `Attacking` is a bare global on purpose: bedwars.lua's Killaura sets it
@@ -4786,7 +4537,6 @@ run(function()
 	local Health
 	local Distance
 	local Equipment
-	local Inventory
 	local Rank
 	local Enchant
 	local Device
@@ -4943,35 +4693,6 @@ run(function()
 		return name ~= '' and deviceEmojis.keyboard or nil
 	end
 
-	local function getInventorySuffix(plr)
-		if not (Inventory and Inventory.ListEnabled and plr) then return '' end
-		local inventory = store.inventories[plr]
-		if not (inventory and inventory.items) then return '' end
-		local found, seen = {}, {}
-		for _, item in inventory.items do
-			local itemType = item and item.itemType
-			if itemType and not seen[itemType] then
-				local lower = itemType:lower()
-				for _, requested in Inventory.ListEnabled do
-					requested = tostring(requested):lower()
-					if requested ~= '' and lower:find(requested, 1, true) then
-						seen[itemType] = true
-						local amount = item.amount or item.count or item.quantity
-						found[#found + 1] = itemType:gsub('_', ' ')..(amount and amount > 1 and ' x'..tostring(amount) or '')
-						break
-					end
-				end
-			end
-		end
-		return #found > 0 and ' ['..table.concat(found, ', ')..']' or ''
-	end
-
-	local function appendInventory(ent)
-		if ent and ent.Player then
-			Strings[ent] = Strings[ent]..getInventorySuffix(ent.Player)
-		end
-	end
-
 	local Added = {
 		Normal = function(ent)
 			pcall(function()
@@ -4998,8 +4719,6 @@ run(function()
 				if Distance.Enabled then
 					Strings[ent] = '<font color="rgb(85, 255, 85)">[</font><font color="rgb(255, 255, 255)">%s</font><font color="rgb(85, 255, 85)">]</font> '..Strings[ent]
 				end
-
-				appendInventory(ent)
 
 				if Equipment.Enabled then
 					for i, v in {'Hand', 'Helmet', 'Chestplate', 'Boots', 'Kit'} do
@@ -5098,8 +4817,6 @@ run(function()
 					Strings[ent] = '[%s] '..Strings[ent]
 				end
 
-				appendInventory(ent)
-
 				nametag.Text.Text = Strings[ent]
 				nametag.Text.Color = entitylib.getEntityColor(ent) or Color3.fromHSV(Color.Hue, Color.Sat, Color.Value)
 				nametag.BG.Size = Vector2.new(nametag.Text.TextBounds.X + 8, nametag.Text.TextBounds.Y + 7)
@@ -5170,8 +4887,6 @@ run(function()
 					Strings[ent] = '<font color="rgb(85, 255, 85)">[</font><font color="rgb(255, 255, 255)">%s</font><font color="rgb(85, 255, 85)">]</font> '..Strings[ent]
 				end
 
-				appendInventory(ent)
-
 				if Equipment.Enabled and store.inventories[ent.Player] and nametag:FindFirstChild("Hand") then
 					local kit = ent.Player:GetAttribute('PlayingAsKit')
 					local inventory = store.inventories[ent.Player]
@@ -5230,7 +4945,6 @@ run(function()
 				else
 					nametag.Text.Text = Strings[ent]
 				end
-				appendInventory(ent)
 				if Distance.Enabled then
 					nametag.Text.Text = entitylib.isAlive and string.format(Strings[ent], math.floor((entitylib.character.RootPart.Position - ent.RootPart.Position).Magnitude)) or Strings[ent]
 				else
@@ -5508,17 +5222,6 @@ run(function()
 				NameTags:Toggle()
 			end
 		end
-	})
-	Inventory = NameTags:CreateTextList({
-		Name = 'Inventory',
-		Default = {'fireball', 'gloop', 'telepearl', 'tnt'},
-		Function = function()
-			if NameTags.Enabled then
-				NameTags:Toggle()
-				NameTags:Toggle()
-			end
-		end,
-		Tooltip = 'Shows matching item names and counts beside the tag.'
 	})
 	Rank = NameTags:CreateToggle({
 		Name = 'Show Rank',
@@ -6232,7 +5935,7 @@ run(function()
 						local localPosition = entitylib.character.RootPart.Position
 						for _, v in items do
 							if tick() - (v:GetAttribute('ClientDropTime') or 0) < 2 then continue end
-							if isnetworkowner(v) and Network.Enabled and entitylib.character.Humanoid.Health > 0 then 
+							if (Network.Enabled and isnetworkowner(v)) and (entitylib.character.Humanoid.Health > 0) then 
 								v.CFrame = CFrame.new(localPosition - Vector3.new(0, 3, 0)) 
 							end
 							
@@ -6631,6 +6334,7 @@ run(function()
 	local AutoSuffocate
 	local Range
 	local LimitItem
+	local targetResults = {}
 	
 	local function fixPosition(pos)
 		return bedwars.BlockController:getBlockPosition(pos) * 3
@@ -6647,7 +6351,9 @@ run(function()
 						local plrs = entitylib.AllPosition({
 							Part = 'RootPart',
 							Range = Range.Value,
-							Players = true
+							Players = true,
+							Cache = true,
+							Output = targetResults
 						})
 	
 						for _, ent in plrs do
@@ -6817,15 +6523,219 @@ run(function()
 	local Skywars
 	local Delay
 	local Delays = {}
-	
+	local chestItemPriority = {
+		emerald = 1000,
+		diamond = 900,
+		gold = 800,
+		iron = 700,
+		void_crystal = 650,
+		telepearl = 950,
+		fireball = 900,
+		big_apple = 850,
+		apple = 750,
+		balloon = 800,
+		arrow = 500,
+		iron_arrow = 600,
+		firework_arrow = 550
+	}
+
+	local function getChestAmount(item)
+		local amount = tonumber(item:GetAttribute('Amount'))
+		return amount == nil and 1 or math.max(0, amount)
+	end
+
+	local function getInventoryAmount(item)
+		local amount = tonumber(item.amount)
+		return amount == nil and 1 or math.max(0, amount)
+	end
+
+	local function getItemPriority(itemType)
+		local priority = chestItemPriority[itemType]
+		if priority then return priority end
+		if itemType:find('emerald', 1, true) then return 1000 end
+		if itemType:find('diamond', 1, true) then return 900 end
+		if itemType:find('gold', 1, true) then return 800 end
+		if itemType:find('iron', 1, true) then return 700 end
+		if itemType:find('arrow', 1, true) then return 500 end
+		return 100
+	end
+
+	local function getBowValue(meta)
+		local source = meta and meta.projectileSource
+		if not source or not source.ammoItemTypes or not table.find(source.ammoItemTypes, 'arrow') then return end
+
+		local projectileType = source.projectileType
+		if type(projectileType) == 'function' then
+			local success, resolved = pcall(projectileType, 'arrow')
+			projectileType = success and resolved or nil
+		end
+
+		local projectileMeta = projectileType and bedwars.ProjectileMeta and bedwars.ProjectileMeta[projectileType]
+		local damage = projectileMeta and projectileMeta.combat and tonumber(projectileMeta.combat.damage) or 0
+		local fireDelay = tonumber(source.fireDelaySec) or 1
+		return damage + (1 / math.max(fireDelay, 0.05)) * 0.01
+	end
+
+	local function addProfileItem(profile, itemType, amount)
+		if not itemType then return end
+		amount = tonumber(amount) or 1
+		if amount <= 0 then return end
+		profile.amounts[itemType] = (profile.amounts[itemType] or 0) + amount
+
+		local meta = bedwars.ItemMeta[itemType]
+		if not meta then return end
+
+		local sword = meta.sword
+		if sword then
+			profile.sword = math.max(profile.sword, tonumber(sword.damage) or 0)
+		end
+
+		local armor = meta.armor
+		if armor and armor.slot ~= nil then
+			local value = tonumber(armor.damageReductionMultiplier) or 0
+			profile.armor[armor.slot] = math.max(profile.armor[armor.slot] or 0, value)
+		end
+
+		local breakBlock = meta.breakBlock
+		if breakBlock then
+			for breakType, value in breakBlock do
+				if type(value) == 'number' then
+					profile.tools[breakType] = math.max(profile.tools[breakType] or 0, value)
+				end
+			end
+		end
+
+		local bowValue = getBowValue(meta)
+		if bowValue then
+			profile.bow = math.max(profile.bow, bowValue)
+		end
+
+		if meta.backpack then
+			profile.backpack = true
+		end
+	end
+
+	local function createInventoryProfile()
+		local profile = {
+			amounts = {},
+			sword = 0,
+			armor = {},
+			tools = {},
+			bow = 0,
+			backpack = false
+		}
+		local inventory = store.inventory and store.inventory.inventory
+		if not inventory then return profile end
+
+		local seen = {}
+		local function add(item)
+			if type(item) ~= 'table' or not item.itemType then return end
+			local key = item.tool or item
+			if seen[key] then return end
+			seen[key] = true
+			addProfileItem(profile, item.itemType, getInventoryAmount(item))
+		end
+
+		for _, item in inventory.items or {} do
+			add(item)
+		end
+		for _, item in inventory.armor or {} do
+			add(item)
+		end
+		add(inventory.backpack)
+		add(inventory.hand)
+		return profile
+	end
+
+	local function scoreChestItem(item, profile)
+		if not item or not item:IsA('Accessory') then return end
+		local itemType = item.Name
+		local amount = getChestAmount(item)
+		if amount <= 0 then return end
+
+		local meta = bedwars.ItemMeta[itemType]
+		if not meta or (meta.block and meta.block.disableInventoryPickup) then return end
+
+		local currentAmount = profile.amounts[itemType] or 0
+		local maxStackSize = meta.maxStackSize and tonumber(meta.maxStackSize.amount)
+		if maxStackSize and currentAmount >= maxStackSize then return end
+
+		local armor = meta.armor
+		if armor and armor.slot ~= nil then
+			local value = tonumber(armor.damageReductionMultiplier) or 0
+			local current = profile.armor[armor.slot] or 0
+			if value <= current then return end
+			return 100000 + value * 100000 + (value - current) * 1000
+		end
+
+		local sword = meta.sword
+		if sword then
+			local value = tonumber(sword.damage) or 0
+			if value <= profile.sword then return end
+			return 100000 + value * 10000 + (value - profile.sword) * 100
+		end
+
+		local breakBlock = meta.breakBlock
+		if breakBlock then
+			local bestValue, improvement = 0, 0
+			for breakType, value in breakBlock do
+				if type(value) == 'number' then
+					local current = profile.tools[breakType] or 0
+					if value > current then
+						bestValue = math.max(bestValue, value)
+						improvement = math.max(improvement, value - current)
+					end
+				end
+			end
+			if improvement <= 0 then return end
+			return 100000 + bestValue * 10000 + improvement * 100
+		end
+
+		local bowValue = getBowValue(meta)
+		if bowValue then
+			if bowValue <= profile.bow then return end
+			return 100000 + bowValue * 10000 + (bowValue - profile.bow) * 100
+		end
+
+		if meta.backpack then
+			if profile.backpack then return end
+			return 90000 + getItemPriority(itemType) * 10 + math.min(amount, 100)
+		end
+
+		if meta.hotbarFillRight then
+			return 50000 + getItemPriority(itemType) * 10 + math.min(amount, 100)
+		end
+
+		local utility = meta.consumable or meta.balloon or meta.placesBlock or meta.projectileSource
+			or meta.multiProjectileSource or meta.guidedProjectileSource or meta.fortifiesBlock
+			or meta.cooldownId or meta.keepOnDeath or meta.maxStackSize
+		if utility then
+			return 30000 + getItemPriority(itemType) * 10 + math.min(amount, 100)
+		end
+
+		local block = meta.block
+		if block then
+			return 10000 + (tonumber(block.health) or 0) * 10 + math.min(amount, 100)
+		end
+	end
+
+	local function getBestChestItem(items, chest, profile)
+		local bestIndex, bestScore, bestName = nil, -math.huge, nil
+		for index, item in items do
+			if item.Parent == chest then
+				local score = scoreChestItem(item, profile)
+				if score and (score > bestScore or (score == bestScore and (not bestName or item.Name < bestName))) then
+					bestIndex, bestScore, bestName = index, score, item.Name
+				end
+			end
+		end
+		return bestIndex
+	end
+
 	local function lootChest(chest)
 		chest = chest and chest.Value or nil
 		if not chest or (Delays[chest] or 0) >= tick() then return end
 
-		--[[ Counts what can actually be taken rather than what is in there. The gate used to
-		be #GetChildren() > 1, but only Accessories are ever pulled -- so a chest holding
-		anything else, or armour a ChestGetItem keeps failing on, never emptied and this
-		kept firing at it for the rest of the round. ]]
 		local accessories = {}
 		for _, v in chest:GetChildren() do
 			if v:IsA('Accessory') then
@@ -6834,25 +6744,37 @@ run(function()
 		end
 		if #accessories == 0 then return end
 
-		--[[ Two SetObservedChest calls go out per pass, so the old fixed 0.2s was 600 calls a
-		minute off a single chest in range -- against the 299 the server's rate limiter
-		allows, and doubling with every extra chest. AntiBanwave mirrors that budget and
-		swallows the overflow (going over is a rate_limit_exceeded detection, and the
-		server discards the calls either way), which is what looked like chest looting
-		breaking partway through a round. The slider gives a chest-dense skywars map more
-		more room; the accessory gate above is what keeps the steady-state cost at zero. ]]
-		Delays[chest] = tick() + Delay.Value
-		bedwars.Client:GetNamespace('Inventory'):Get('SetObservedChest'):SendToServer(chest)
-
-		for _, v in accessories do
-			task.spawn(function()
-				pcall(function()
-					bedwars.Client:GetNamespace('Inventory'):Get('ChestGetItem'):CallServer(chest, v)
-				end)
-			end)
+		local profile = createInventoryProfile()
+		if not getBestChestItem(accessories, chest, profile) then
+			Delays[chest] = tick() + Delay.Value
+			return
 		end
 
-		bedwars.Client:GetNamespace('Inventory'):Get('SetObservedChest'):SendToServer(nil)
+		Delays[chest] = tick() + Delay.Value
+		local inventory = bedwars.Client:GetNamespace('Inventory')
+		local setObservedChest = inventory:Get('SetObservedChest')
+		local chestGetItem = inventory:Get('ChestGetItem')
+		local observed = pcall(function()
+			setObservedChest:SendToServer(chest)
+		end)
+		if not observed then return end
+
+		while #accessories > 0 do
+			local bestIndex = getBestChestItem(accessories, chest, profile)
+			if not bestIndex then break end
+			local item = table.remove(accessories, bestIndex)
+			local amount = getChestAmount(item)
+			local success, result = pcall(function()
+				return chestGetItem:CallServer(chest, item)
+			end)
+			if success and result ~= false then
+				addProfileItem(profile, item.Name, amount)
+			end
+		end
+
+		pcall(function()
+			setObservedChest:SendToServer(nil)
+		end)
 	end
 	
 	ChestSteal = vape.Categories.World:CreateModule({
@@ -9808,11 +9730,9 @@ shared.bedwars = {
     assetfunction       = assetfunction,
     oldSwing            = oldSwing,
     updateVelocity      = updateVelocity,
-    _baseGetSpeed       = _baseGetSpeed,
-    namecallGuard       = namecallGuard,
-    exploitFinder       = exploitFinder,
-    connectionLister    = connectionLister,
-    fpsHooks            = fpsHooks,
+	_baseGetSpeed       = _baseGetSpeed,
+	namecallGuard       = namecallGuard,
+	fpsHooks            = fpsHooks,
 }
 
 --[[ bedwars.lua is the ONLY file fetched from GitLab -- everything else comes from GitHub -- and
@@ -9855,7 +9775,16 @@ is what sets it; nothing here can substitute for it. ]]
 
     Cheap, too: one small request, and dropping the cache also dropped the commit-check round
     trip that used to precede it.
-]]
+ ]]
+local function compileBedwarsSource(source, chunkName)
+    local func, err = loadstring(source, chunkName)
+    if not func then
+        local size = type(source) == 'string' and #source or 0
+        warn(string.format('[pistonware] %s failed to compile (%d bytes): %s', chunkName, size, tostring(err)))
+    end
+    return func, err
+end
+
 local function downloadBedwars()
     --[[ Developer mode runs the local file instead of fetching. This hatch was removed and is
     now back, and the reason it is safe this time is specific, so it is worth stating:
@@ -9879,9 +9808,13 @@ local function downloadBedwars()
             if not isfile('pistonware/games/bedwars.lua') then return nil end
             return readfile('pistonware/games/bedwars.lua')
         end)
-        if suc and res and res ~= '' and loadstring(res) ~= nil then
-            warn('[pistonware] developer mode: running local games/bedwars.lua (not the published build)')
-            return res
+        local localFunc
+        if suc and type(res) == 'string' and res ~= '' then
+            localFunc = compileBedwarsSource(res, 'bedwars.local')
+            if localFunc then
+                warn('[pistonware] developer mode: running local games/bedwars.lua (not the published build)')
+                return res
+            end
         end
         --[[ Falls through to the network rather than failing: a developer with no local copy, or
         one that does not compile, still wants a working script. ]]
@@ -9896,8 +9829,9 @@ local function downloadBedwars()
         end)
         --[[ compile check: during an outage HttpGet can hand back the 503/error page as the body,
         which the ~=''/'404' tests would accept ]]
-        if suc and res and res ~= '' and res ~= '404: Not Found' and loadstring(res) ~= nil then
-            return res
+        if suc and type(res) == 'string' and res ~= '' and res ~= '404: Not Found' then
+            local networkFunc = compileBedwarsSource(res, string.format('bedwars.network.%d', attempt))
+            if networkFunc then return res end
         end
         if attempt < 4 then
             task.wait(attempt)
@@ -9937,7 +9871,7 @@ end
 
 local bedwarsSource = downloadBedwars()
 if bedwarsSource then
-    local bedwarsFn = loadstring(bedwarsSource)
+    local bedwarsFn = compileBedwarsSource(bedwarsSource, 'bedwars')
     if bedwarsFn then
         --[[ Refuse to run the payload with no key rather than let it discover that itself: a
         LuaArmor auth failure is not a soft error, it puts up a modal and KICKS the player
