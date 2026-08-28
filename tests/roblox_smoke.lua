@@ -35,12 +35,26 @@ local function expectWarnings(name, expected)
 end
 
 local function makeSignal()
-	return {
-		Connect = function()
-			return {Disconnect = function() end}
-		end,
-		Wait = function() end
-	}
+	local records = {}
+	local signal = {}
+	function signal:Connect(callback)
+		local record = {Callback = callback, Connected = true}
+		records[#records + 1] = record
+		return {
+			Disconnect = function()
+				record.Connected = false
+			end
+		}
+	end
+	function signal:Fire(...)
+		for _, record in records do
+			if record.Connected then
+				record.Callback(...)
+			end
+		end
+	end
+	signal.Wait = function() end
+	return signal
 end
 
 local function makeVector3(x, y, z)
@@ -52,6 +66,10 @@ local function makeVector3(x, y, z)
 			elseif key == 'Unit' then
 				local magnitude = self.Magnitude
 				return magnitude == 0 and makeVector3(0, 0, 0) or makeVector3(self.X / magnitude, self.Y / magnitude, self.Z / magnitude)
+			elseif key == 'Dot' then
+				return function(_, other)
+					return self.X * other.X + self.Y * other.Y + self.Z * other.Z
+				end
 			end
 		end,
 		__add = function(left, right)
@@ -145,7 +163,19 @@ local function resetRoblox()
 		TextService = {},
 		Teams = {},
 		CollectionService = {},
-		ContextActionService = {}
+		ContextActionService = {},
+		Stats = {
+			FindFirstChild = function(_, name)
+				if name ~= 'PerformanceStats' then return end
+				return {
+					FindFirstChild = function(_, statName)
+						local value = statName == 'Ping' and 42 or statName == 'Memory' and 768
+						return value and {GetValue = function() return value end} or nil
+					end
+				}
+			end,
+			GetTotalMemoryUsageMb = function() return 768 end
+		}
 	}
 	game = {
 		PlaceId = 6872274481,
@@ -167,10 +197,48 @@ local function expectGuarded(name)
 	expect(result == nil, name..' returned from its unauthenticated guard')
 end
 
+local function expectSourceContains(name, text)
+	expect(sources[name] and sources[name]:find(text, 1, true), name..' is missing expected source: '..text)
+end
+
 expectGuarded('main.lua')
 expectGuarded('NewMainScript.lua')
 expectGuarded('games/6872265039.lua')
 expectGuarded('games/6872274481.lua')
+
+expectSourceContains('games/universal.lua', "local SpeedMethodList = {'Velocity'}")
+expectSourceContains('games/universal.lua', 'List = SpeedMethodList')
+expectSourceContains('games/universal.lua', 'if shared.PistonwareDeveloper == true then')
+expectSourceContains('games/universal.lua', "Name = 'Killaura Info'")
+expectSourceContains('games/universal.lua', "<b>Developer Diagnostics</b>")
+expectSourceContains('games/universal.lua', 'performance:StartDiagnostics()')
+expectSourceContains('games/6872274481.lua', 'Max = 23')
+expectSourceContains('games/bedwars.lua', 'local developerBuild = shared.PistonwareDeveloper == true')
+expectSourceContains('games/bedwars.lua', 'local FLY_SPEED = 22')
+expectSourceContains('games/bedwars.lua', "if unsupportedExecutor then")
+expectSourceContains('games/bedwars.lua', 'if not developerBuild then return end')
+expectSourceContains('games/bedwars.lua', 'predictionSystem.onDamage = function(damageTable)\n            if not developerBuild then return end')
+expectSourceContains('games/bedwars.lua', 'if developerBuild then\n        HitNotifications = Killaura:CreateToggle({')
+expectSourceContains('games/bedwars.lua', 'RayBudgetLimit = 8')
+expectSourceContains('games/bedwars.lua', 'VisibilityCacheHorizon = 0.06')
+expectSourceContains('games/bedwars.lua', 'state.ClosestCandidate = closestCandidate')
+expect(not sources['games/bedwars.lua']:find("instance:IsA('MeshPart') or instance:IsA('UnionOperation')", 1, true), 'bedwars.lua still attempts RenderFidelity on solid geometry')
+expect(not sources['games/6872274481.lua']:find("instance:IsA('MeshPart') or instance:IsA('UnionOperation')", 1, true), '6872274481.lua still attempts RenderFidelity on solid geometry')
+expectSourceContains('games/bedwars.lua', "Name = 'TestFly'")
+expectSourceContains('games/bedwars.lua', 'math.max(1, Max.Value) * 100000')
+expectSourceContains('games/bedwars.lua', "vape.Modules.TestFly and vape.Modules.TestFly.Enabled")
+expectSourceContains('games/bedwars.lua', "vape.Modules.InfiniteFly and vape.Modules.InfiniteFly.Enabled")
+expect(not sources['games/bedwars.lua']:find('disableOtherFlight', 1, true), 'bedwars.lua still contains the removed flight cleanup helper')
+expectSourceContains('games/bedwars.lua', 'genv.KillauraProjectileFollowup = projectileFollowup')
+expectSourceContains('games/bedwars.lua', 'function projectileFollowup:PrepareKillaura(ent, wallChecked)')
+expectSourceContains('games/bedwars.lua', 'function projectileFollowup:CommitKillaura(req, meleeSent)')
+expectSourceContains('games/bedwars.lua', 'function projectileFollowup:RequestStandalone(ent)')
+expectSourceContains('games/bedwars.lua', 'genv.KillauraAutoShootConfig = function()')
+expectSourceContains('games/bedwars.lua', 'local preparedShot = projectileFollowup:PrepareKillaura(v, Targets.Walls.Enabled)')
+expectSourceContains('games/bedwars.lua', 'if not pcall(AttackRemote.FireServer, AttackRemote, attackPayload) then')
+expectSourceContains('games/bedwars.lua', 'projectileFollowup:CommitKillaura(preparedShot, true)')
+expect(not sources['games/bedwars.lua']:find('KillauraFollowup = true', 1, true), 'bedwars.lua still uses the removed KillauraFollowup wrapper marker')
+expectSourceContains('games/bedwars.lua', 'if distance <= swingRange then')
 
 resetRoblox()
 shared.vape = {}
@@ -188,6 +256,126 @@ resetRoblox()
 local entity = execute('libraries/entity.lua')
 expectWarnings('libraries/entity.lua', 0)
 expect(type(entity) == 'table' and entity.Running, 'entity.lua did not start with stubbed Roblox services')
+
+local function mockEntity(player, position, target)
+	return {
+		Player = player,
+		Character = {FindFirstChildWhichIsA = function() return nil end},
+		Connections = {},
+		Health = 100,
+		NPC = false,
+		Targetable = true,
+		Target = target,
+		RootPart = {Position = position}
+	}
+end
+
+local nearPlayer, farPlayer = {}, {}
+local near = mockEntity(nearPlayer, Vector3.new(2, 0, 0), false)
+local farTarget = mockEntity(farPlayer, Vector3.new(9, 0, 0), true)
+entity.List = {near, farTarget}
+entity.EntityByPlayer[nearPlayer] = near
+entity.EntityByPlayer[farPlayer] = farTarget
+entity.EntityByCharacter[near.Character] = near
+entity.EntityByCharacter[farTarget.Character] = farTarget
+entity.EntityIndex[near] = 1
+entity.EntityIndex[farTarget] = 2
+entity.isAlive = true
+entity.character = {HumanoidRootPart = {Position = Vector3.new(0, 0, 0)}, Connections = {}}
+
+local selected = entity.EntityPosition({
+	Players = true,
+	Part = 'RootPart',
+	Range = 10
+})
+expect(selected == farTarget, 'entity target priority was not preserved')
+local output = {}
+local all = entity.AllPosition({
+	Players = true,
+	Part = 'RootPart',
+	Range = 10,
+	Limit = 1,
+	Output = output
+})
+expect(all == output and #all == 1 and all[1] == farTarget, 'entity output buffer was not reused')
+local cachedOutput = {}
+entity.Performance:SetEnabled(true)
+near.Targetable = false
+local cachedFirst = entity.AllPosition({
+	Players = true,
+	Part = 'RootPart',
+	Range = 10,
+	Cache = true,
+	Output = cachedOutput
+})
+expect(#cachedFirst == 1 and cachedFirst[1] == farTarget, 'cached query did not re-filter targetability')
+expect(entity.Performance.Stats.TargetCacheRefreshes == 1, 'cached query did not build its watchlist')
+near.Targetable = true
+local cachedSecond = entity.AllPosition({
+	Players = true,
+	Part = 'RootPart',
+	Range = 10,
+	Cache = true,
+	Output = cachedOutput
+})
+expect(table.find(cachedSecond, near) ~= nil, 'cached query did not reuse its watchlist')
+expect(entity.Performance.Stats.TargetCacheHits == 1, 'cached query did not record a cache hit')
+near.RootPart.Position = Vector3.new(30, 0, 0)
+local cachedThird = entity.AllPosition({
+	Players = true,
+	Part = 'RootPart',
+	Range = 10,
+	Cache = true,
+	Output = cachedOutput
+})
+expect(table.find(cachedThird, near) == nil, 'cached query returned a stale position result')
+expect(entity.Performance.Stats.TargetCacheHits == 2, 'cached query did not re-filter current positions')
+near.RootPart.Position = Vector3.new(2, 0, 0)
+local runService = game:GetService('RunService')
+entity.Performance:StartDiagnostics()
+runService.RenderStepped:Fire(0.016)
+runService.RenderStepped:Fire(0.2)
+runService.RenderStepped:Fire(0.016)
+runService.RenderStepped:Fire(0.2)
+runService.Heartbeat:Fire(0.2)
+runService.Heartbeat:Fire(0.2)
+runService.Heartbeat:Fire(0.2)
+local diagnosticsSnapshot = entity.Performance:DiagnosticsSnapshot()
+expect(diagnosticsSnapshot.Enabled and diagnosticsSnapshot.Render.Samples == 4, 'diagnostics did not sample render frames')
+expect(diagnosticsSnapshot.Spikes.Render == 2, 'diagnostics did not count separated render spikes')
+expect(diagnosticsSnapshot.Heartbeat.Samples == 3, 'diagnostics did not sample heartbeats')
+expect(diagnosticsSnapshot.Ping.Samples == 1 and diagnosticsSnapshot.Ping.Current == 42, 'diagnostics did not sample ping')
+expect(diagnosticsSnapshot.Memory == 768, 'diagnostics did not sample memory')
+entity.Performance:StopDiagnostics()
+expect(not entity.Performance:DiagnosticsSnapshot().Enabled, 'diagnostics did not stop cleanly')
+entity.Performance:SetKillauraTelemetry(true)
+entity.Performance:RecordKillauraSwing(near, 1)
+entity.Performance:RecordKillauraSwing(near, 1.3)
+entity.Performance:RecordKillauraHit(near.Character, 1.4)
+entity.Performance:RecordKillauraHit(near.Character, 1.7)
+local killauraTelemetry = entity.Performance.Killaura
+expect(killauraTelemetry.SwingCount == 2 and killauraTelemetry.ConfirmedCount == 2, 'killaura telemetry did not match confirmed swings')
+expect(math.abs(killauraTelemetry.AverageHitGap - 0.3) < 0.0001, 'killaura telemetry calculated the wrong hit gap')
+expect(math.abs(killauraTelemetry.AverageConfirmationDelay - 0.4) < 0.0001, 'killaura telemetry calculated the wrong confirmation delay')
+local killauraSnapshot = entity.Performance:KillauraSnapshot(1.7)
+expect(killauraSnapshot.FinalizedCount == 2 and killauraSnapshot.Accuracy == 1 and killauraSnapshot.ProvisionalAccuracy == 1, 'killaura snapshot calculated the wrong accuracy')
+entity.Performance:RecordKillauraSwing(near, 2)
+local expiredSnapshot = entity.Performance:KillauraSnapshot(4.1)
+expect(expiredSnapshot.ExpiredCount == 1 and expiredSnapshot.FinalizedCount == 3 and math.abs(expiredSnapshot.Accuracy - (2 / 3)) < 0.0001, 'killaura snapshot did not finalize expired attempts')
+entity.Performance:SetKillauraTelemetry(false)
+local found, foundIndex = entity.getEntity(farPlayer)
+expect(found == farTarget and foundIndex == 2, 'entity O(1) player lookup failed')
+entity.removeEntity(nearPlayer)
+expect(#entity.List == 1 and entity.List[1] == farTarget and entity.EntityIndex[farTarget] == 1, 'entity swap-remove failed')
+local event = entity.Events.Smoke
+local calls = 0
+local connection = event:Connect(function() calls += 1 end)
+connection:Disconnect()
+connection:Disconnect()
+event:Fire()
+expect(calls == 0, 'entity event disconnect was not idempotent')
+event:Destroy()
+connection:Disconnect()
 entity.stop()
 expectWarnings('libraries/entity.lua after stop', 0)
 

@@ -13,6 +13,22 @@ local cloneref = cloneref or function(ref)
 	return ref
 end
 
+local function pistonwareHttpGet(url, nocache, attempt)
+	local adapter = shared.PistonwareDevHttpGet
+	if type(adapter) == 'function' then
+		return adapter(url, nocache, attempt)
+	end
+	return game:HttpGet(url, nocache)
+end
+
+local function pistonwareProtectedHttpGet(url, nocache, attempt)
+	local adapter = shared.PistonwareDevProtectedHttpGet
+	if type(adapter) == 'function' then
+		return adapter(url, nocache, attempt)
+	end
+	return game:HttpGet(url, nocache)
+end
+
 --[[ As in `main.lua`, `isfile` alone is insufficient: every
 executor's real isfile reports a zero-byte file as PRESENT, so a write cut short by a
 cancel, crash or teleport leaves a truncated file that cache-first logic then skips
@@ -31,6 +47,11 @@ local function hasContent(path)
 end
 
 local function downloadFile(path, func)
+	local devLoader = shared.PistonwareDevLoadSource
+	if type(devLoader) == 'function' then
+		local body = devLoader(path)
+		return func and func(path) or body
+	end
 	if not hasContent(path) then
 		--[[ bedwars.lua only exists in the GitLab repo (kept separate/obfuscated there), at that
 		repo's ROOT even though it caches locally under games/; everything else lives in the
@@ -43,9 +64,9 @@ local function downloadFile(path, func)
 		for attempt = 1, 4 do
 			local suc, res = pcall(function()
 				if isBedwars then
-					return game:HttpGet('https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua', true)
+					return pistonwareProtectedHttpGet('https://gitlab.com/pistonware/pistonware/-/raw/main/bedwars.lua', true, attempt)
 				end
-				return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..relPath, true)
+				return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..relPath, true, attempt)
 			end)
 			if suc and res and res ~= '' and res ~= '404: Not Found' then
 				content = res
@@ -76,7 +97,7 @@ end
 pcall(function()
 	if #listfiles('pistonware/profiles') < 3 then
 		local reqSuc, res = pcall(function()
-			return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/contents/profiles', true)
+			return pistonwareHttpGet('https://api.github.com/repos/themagicpiston/pistonware/contents/profiles', true)
 		end)
 		if reqSuc and res and res ~= '404: Not Found' then
 			local bodySuc, body = pcall(function()

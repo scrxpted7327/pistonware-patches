@@ -11,10 +11,34 @@ local isfile = isfile or function(file)
 	end)
 	return suc and res ~= nil and res ~= ''
 end
+
+local function pistonwareHttpGet(url, nocache, attempt)
+	local adapter = shared.PistonwareDevHttpGet
+	if type(adapter) == 'function' then
+		return adapter(url, nocache, attempt)
+	end
+	return game:HttpGet(url, nocache)
+end
+
+local function errorTrace(err)
+	local traceback
+	pcall(function()
+		if debug and type(debug.traceback) == 'function' then
+			traceback = debug.traceback(tostring(err), 2)
+		end
+	end)
+	return traceback or tostring(err)
+end
+
 local function downloadFile(path, func)
+	local devLoader = shared.PistonwareDevLoadSource
+	if type(devLoader) == 'function' then
+		local body = devLoader(path)
+		return func and func(path) or body
+	end
 	if not isfile(path) then
 		local suc, res = pcall(function()
-			return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..select(1, path:gsub('pistonware/', '')), true)
+			return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..select(1, path:gsub('pistonware/', '')), true)
 		end)
 		if not suc or res == '404: Not Found' then
 			error(res)
@@ -26,8 +50,38 @@ local function downloadFile(path, func)
 	end
 	return (func or readfile)(path)
 end
+local function callWithThreadFix(func)
+	local setIdentity = setthreadidentity
+	local oldIdentity
+	local switched = false
+	if type(setIdentity) == 'function' then
+		if type(getthreadidentity) == 'function' then
+			local ok, identity = pcall(getthreadidentity)
+			if ok then oldIdentity = identity end
+		end
+		oldIdentity = oldIdentity or 2
+		if oldIdentity ~= 8 then
+			switched = pcall(setIdentity, 8)
+		end
+	end
+
+	local ok, err = xpcall(func, errorTrace)
+	if switched then
+		pcall(setIdentity, oldIdentity)
+	end
+	return ok, err
+end
+
 local run = function(func)
-	func()
+	--[[ Same containment contract as the place files: a bad block costs its own
+	modules and nothing else. This used to call func() bare, so one thrown error
+	aborted the rest of the chunk -- silently, because main.lua pcalls this file --
+	and every later block, including the sessioninfo library other files capture,
+	simply never registered. ]]
+	local ok, err = callWithThreadFix(func)
+	if not ok then
+		warn('[pistonware] a module block failed to load: '..tostring(err))
+	end
 end
 local queue_on_teleport = queue_on_teleport or function() end
 local cloneref = cloneref or function(obj)
@@ -104,9 +158,37 @@ local function calculateMoveVector(vec)
 	return vec.Unit == vec.Unit and vec.Unit or Vector3.zero
 end
 
+local friendNames, targetNames = {}, {}
+local targetStateCacheDirty = true
+
+local function rebuildTargetStateCaches()
+	table.clear(friendNames)
+	table.clear(targetNames)
+	local friends = vape.Categories.Friends
+	local targets = vape.Categories.Targets
+	if friends and friends.ListEnabled then
+		for _, name in friends.ListEnabled do
+			friendNames[name] = true
+		end
+	end
+	if targets and targets.ListEnabled then
+		for _, name in targets.ListEnabled do
+			targetNames[name] = true
+		end
+	end
+	targetStateCacheDirty = false
+end
+
+local function ensureTargetStateCaches()
+	if targetStateCacheDirty then
+		rebuildTargetStateCaches()
+	end
+end
+
 local function isFriend(plr, recolor)
+	ensureTargetStateCaches()
 	if vape.Categories.Friends.Options['Use friends'].Enabled then
-		local friend = table.find(vape.Categories.Friends.ListEnabled, plr.Name) and true
+		local friend = friendNames[plr.Name] and true
 		if recolor then
 			friend = friend and vape.Categories.Friends.Options['Recolor visuals'].Enabled
 		end
@@ -116,7 +198,8 @@ local function isFriend(plr, recolor)
 end
 
 local function isTarget(plr)
-	return table.find(vape.Categories.Targets.ListEnabled, plr.Name) and true
+	ensureTargetStateCaches()
+	return targetNames[plr.Name] and true
 end
 
 local function canClick()
@@ -142,6 +225,37 @@ local function getTableSize(tab)
 	return ind
 end
 
+local function ensureSessionInfo()
+	local current = vape.Libraries.sessioninfo
+	if type(current) == 'table' and type(current.Objects) == 'table' and type(current.AddItem) == 'function' then
+		return current
+	end
+
+	local session = {Objects = {}}
+	function session:AddItem(name, startvalue, func, saved)
+		func = func or function(val) return val end
+		saved = saved == nil or saved
+		self.Objects[name] = {
+			Function = func,
+			Saved = saved,
+			Value = startvalue or 0,
+			Index = getTableSize(self.Objects) + 2
+		}
+		return {
+			Increment = function(_, val)
+				self.Objects[name].Value += (val or 1)
+			end,
+			Get = function()
+				return self.Objects[name].Value
+			end
+		}
+	end
+	vape.Libraries.sessioninfo = session
+	return session
+end
+
+ensureSessionInfo()
+
 local function getTool()
 	return lplr.Character and lplr.Character:FindFirstChildWhichIsA('Tool', true) or nil
 end
@@ -165,7 +279,67 @@ local function rakNetCheck(module)
 end
 
 local visited, attempted, tpSwitch = {}, {}, false
-local cacheExpire, cache = tick()
+local serverPageCache, serverPageInflight = {}, {}
+
+local function serverPageKey(pointer, filter)
+	return tostring(game.PlaceId)..'|'..tostring(filter or 'Descending')..'|'..tostring(pointer or '')
+end
+
+local function recordServerCache(key, state)
+	local telemetry = shared.PistonwareDevTelemetry
+	if type(telemetry) == 'table' and type(telemetry.cache) == 'function' then
+		telemetry.cache('server-hop/'..key, state)
+	end
+end
+
+local function getServerPage(pointer, filter)
+	local key = serverPageKey(pointer, filter)
+	local now = tick()
+	local cached = serverPageCache[key]
+	if cached and cached.expires > now then
+		recordServerCache(key, 'hit')
+		return cached.data, cached.body
+	end
+
+	local waiting = serverPageInflight[key]
+	if waiting then
+		local deadline = now + 10
+		while not waiting.done and tick() < deadline do
+			task.wait(0.05)
+		end
+		if waiting.done and waiting.data then
+			recordServerCache(key, 'joined')
+			return waiting.data, waiting.body
+		end
+		recordServerCache(key, 'timeout')
+		return nil, nil
+	end
+
+	waiting = {done = false}
+	serverPageInflight[key] = waiting
+	recordServerCache(key, 'miss')
+	local url = 'https://games.roblox.com/v1/games/'..game.PlaceId..'/servers/Public?sortOrder='..(filter == 'Ascending' and 1 or 2)..'&excludeFullGames=true&limit=100'..(pointer and '&cursor='..pointer or '')
+	local requestOk, body = pcall(function()
+		return pistonwareHttpGet(url)
+	end)
+	local parseOk, data = false, nil
+	if requestOk then
+		parseOk, data = pcall(function()
+			return httpService:JSONDecode(body)
+		end)
+	end
+	if parseOk and type(data) == 'table' and type(data.data) == 'table' then
+		waiting.data, waiting.body = data, body
+		serverPageCache[key] = {data = data, body = body, expires = tick() + 60}
+	end
+	waiting.done = true
+	serverPageInflight[key] = nil
+	if waiting.data then
+		return waiting.data, waiting.body
+	end
+	return nil, nil
+end
+
 local function serverHop(pointer, filter)
 	visited = shared.vapeserverhoplist and shared.vapeserverhoplist:split('/') or {}
 	if not table.find(visited, game.JobId) then
@@ -175,14 +349,10 @@ local function serverHop(pointer, filter)
 		notif('Pistonware', 'Searching for an available server.', 2)
 	end
 
-	local suc, httpdata = pcall(function()
-		return cacheExpire < tick() and game:HttpGet('https://games.roblox.com/v1/games/'..game.PlaceId..'/servers/Public?sortOrder='..(filter == 'Ascending' and 1 or 2)..'&excludeFullGames=true&limit=100'..(pointer and '&cursor='..pointer or '')) or cache
-	end)
-	local data = suc and httpService:JSONDecode(httpdata) or nil
+	local data = getServerPage(pointer, filter)
 	if data and data.data then
 		for _, v in data.data do
 			if tonumber(v.playing) < playersService.MaxPlayers and not table.find(visited, v.id) and not table.find(attempted, v.id) then
-				cacheExpire, cache = tick() + 60, httpdata
 				table.insert(attempted, v.id)
 
 				notif('Pistonware', 'Found! Teleporting.', 5)
@@ -207,6 +377,11 @@ vape:Clean(lplr.OnTeleport:Connect(function()
 		queue_on_teleport("shared.vapeserverhoplist = '"..table.concat(visited, '/').."'\nshared.vapeserverhopprevious = '"..game.JobId.."'")
 	end
 end))
+
+vape:Clean(function()
+	table.clear(serverPageCache)
+	table.clear(serverPageInflight)
+end)
 
 local frictionTable, oldfrict, entitylib = {}, {}
 local function updateVelocity()
@@ -262,6 +437,14 @@ local whitelist = {
 	localprio = 0,
 	said = {}
 }
+function whitelist:get(plr)
+	local entry = self.data.WhitelistedUsers[tostring(plr.UserId)]
+	if entry then
+		local level = entry.level or 1
+		return level, entry.attackable or whitelist.localprio >= level, entry.tags
+	end
+	return 0, true
+end
 vape.Libraries.entity = entitylib
 vape.Libraries.whitelist = whitelist
 vape.Libraries.prediction = prediction
@@ -354,17 +537,14 @@ run(function()
 		local hum = ent.Humanoid
 		return {
 			hum:GetPropertyChangedSignal('Health'),
-			hum:GetPropertyChangedSignal('MaxHealth'),
-			{
-				Connect = function()
-					ent.Friend = ent.Player and isFriend(ent.Player) or nil
-					ent.Target = ent.Player and isTarget(ent.Player) or nil
-					return {
-						Disconnect = function() end
-					}
-				end
-			}
+			hum:GetPropertyChangedSignal('MaxHealth')
 		}
+	end
+
+	entitylib.getEntityState = function(ent)
+		local friend = ent.Player and isFriend(ent.Player) or nil
+		local target = ent.Player and isTarget(ent.Player) or nil
+		return entitylib.targetCheck(ent), friend, target
 	end
 
 	entitylib.targetCheck = function(ent)
@@ -382,6 +562,7 @@ run(function()
 		end
 		return true
 	end
+	entitylib.refresh()
 
 	entitylib.getEntityColor = function(ent)
 		ent = ent.Player
@@ -396,8 +577,14 @@ run(function()
 		entitylib.kill()
 		entitylib = nil
 	end)
-	vape:Clean(vape.Categories.Friends.Update.Event:Connect(function() entitylib.refresh() end))
-	vape:Clean(vape.Categories.Targets.Update.Event:Connect(function() entitylib.refresh() end))
+	vape:Clean(vape.Categories.Friends.Update.Event:Connect(function()
+		targetStateCacheDirty = true
+		entitylib.refresh()
+	end))
+	vape:Clean(vape.Categories.Targets.Update.Event:Connect(function()
+		targetStateCacheDirty = true
+		entitylib.refresh()
+	end))
 	vape:Clean(entitylib.Events.LocalAdded:Connect(updateVelocity))
 	vape:Clean(workspace:GetPropertyChangedSignal('CurrentCamera'):Connect(function()
 		gameCamera = workspace.CurrentCamera or workspace:FindFirstChildWhichIsA('Camera')
@@ -405,15 +592,6 @@ run(function()
 end)
 
 run(function()
-	function whitelist:get(plr)
-		local entry = self.data.WhitelistedUsers[tostring(plr.UserId)]
-		if entry then
-			local level = entry.level or 1
-			return level, entry.attackable or whitelist.localprio >= level, entry.tags
-		end
-		return 0, true
-	end
-
 	function whitelist:isingame()
 		for _, v in playersService:GetPlayers() do
 			if self:get(v) ~= 0 then return true end
@@ -568,23 +746,60 @@ run(function()
 		end
 	end
 
+	local whitelistRefresh = {
+		nextAt = 0,
+		interval = 30,
+		inFlight = false
+	}
+	local function recordWhitelist(state)
+		local telemetry = shared.PistonwareDevTelemetry
+		if type(telemetry) == 'table' and type(telemetry.cache) == 'function' then
+			telemetry.cache('whitelist', state)
+		end
+	end
+
 	function whitelist:update(first)
-		local suc = pcall(function()
-			whitelist.textdata = game:HttpGet('https://raw.githubusercontent.com/themagicpiston/whitelists/refs/heads/main/PlayerWhitelist.json', true)
+		local now = tick()
+		local forced = first ~= true
+		if whitelistRefresh.inFlight then
+			return false, whitelistRefresh.interval
+		end
+		if not forced and now < whitelistRefresh.nextAt then
+			recordWhitelist('ttl-skip')
+			return false, whitelistRefresh.nextAt - now
+		end
+
+		whitelistRefresh.inFlight = true
+		local suc, textdata = pcall(function()
+			return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/whitelists/refs/heads/main/PlayerWhitelist.json', true)
 		end)
-		if not suc or not whitelist.get then return true end
-		whitelist.loaded = true
-
-		if not first or whitelist.textdata ~= whitelist.olddata then
-			if not first then
-				whitelist.olddata = isfile('pistonware/profiles/whitelist.json') and readfile('pistonware/profiles/whitelist.json') or nil
-			end
-
-			local suc, res = pcall(function()
-				return httpService:JSONDecode(whitelist.textdata)
+		local parseSuc, res = false, nil
+		if suc and type(textdata) == 'string' and textdata ~= '' then
+			parseSuc, res = pcall(function()
+				return httpService:JSONDecode(textdata)
 			end)
+		end
+		if not suc or not parseSuc or type(res) ~= 'table' or not whitelist.get then
+			whitelistRefresh.interval = math.min(120, math.max(15, whitelistRefresh.interval * 2))
+			whitelistRefresh.nextAt = tick() + whitelistRefresh.interval
+			whitelistRefresh.inFlight = false
+			recordWhitelist('failure')
+			return false, whitelistRefresh.interval
+		end
 
-			whitelist.data = suc and type(res) == 'table' and res or whitelist.data
+		whitelist.textdata = textdata
+		whitelist.loaded = true
+		if forced then
+			whitelist.olddata = isfile('pistonware/profiles/whitelist.json') and readfile('pistonware/profiles/whitelist.json') or nil
+		end
+		local changed = whitelist.textdata ~= whitelist.olddata
+		whitelistRefresh.interval = changed and 30 or math.min(120, math.max(30, whitelistRefresh.interval * 2))
+		whitelistRefresh.nextAt = tick() + whitelistRefresh.interval
+		whitelistRefresh.inFlight = false
+		recordWhitelist(changed and 'changed' or 'unchanged')
+
+		if forced or changed then
+			whitelist.data = res
 			whitelist.data.WhitelistedUsers = whitelist.data.WhitelistedUsers or {}
 			whitelist.data.BlacklistedUsers = whitelist.data.BlacklistedUsers or {}
 			whitelist.localprio = whitelist:get(lplr)
@@ -612,7 +827,7 @@ run(function()
 				entitylib.refresh()
 			end
 
-			if whitelist.textdata ~= whitelist.olddata then
+			if changed then
 				if whitelist.data.Announcement and (whitelist.data.Announcement.expiretime or 0) > os.time() then
 					local targets = whitelist.data.Announcement.targets
 					targets = targets == 'all' and {tostring(lplr.UserId)} or targets:split(',')
@@ -632,14 +847,15 @@ run(function()
 
 			if whitelist.data.KillVape then
 				vape:Uninject()
-				return true
+				return true, 0
 			end
 
 			if whitelist.data.BlacklistedUsers[tostring(lplr.UserId)] then
 				task.spawn(lplr.kick, lplr, whitelist.data.BlacklistedUsers[tostring(lplr.UserId)])
-				return true
+				return true, 0
 			end
 		end
+		return false, whitelistRefresh.interval
 	end
 
 	whitelist.commands = {
@@ -743,9 +959,12 @@ run(function()
 	}
 
 	task.spawn(function()
+		local firstRefresh = nil
 		repeat
-			if whitelist:update(whitelist.loaded) then return end
-			task.wait(10)
+			local stop, waitFor = whitelist:update(firstRefresh)
+			if stop then return end
+			firstRefresh = true
+			task.wait(waitFor or 30)
 		until vape.Loaded == nil
 	end)
 
@@ -2305,7 +2524,17 @@ run(function()
 	local Face
 	local Overlay = OverlapParams.new()
 	Overlay.FilterType = Enum.RaycastFilterType.Include
-	local Particles, Boxes, AttackDelay = {}, {}, tick()
+	local Particles, Boxes, AttackDelay = {}, {}, time()
+	local attacked, targetQuery, targetsBuffer, overlayFilter = {}, {}, {}, {}
+	local proximityQuery = {}
+	local attackedCapacity = 0
+	local targetScanElapsed, elapsed = 0, 0
+	local closeTargetMode = false
+	local forceTargetScan = true
+	local lastPlayers, lastNPCs, lastRange, lastLimit
+	local flatVector = Vector3.new(1, 0, 1)
+	local hitboxSize = Vector3.new(4, 4, 4)
+	local farAway = Vector3.new(9e9, 9e9, 9e9)
 	
 	local function getAttackData()
 		if Mouse.Enabled then
@@ -2320,79 +2549,158 @@ run(function()
 		Name = 'Killaura',
 		Function = function(callback)
 			if callback then
+				Killaura:Clean(entitylib.Events.EntityAdded:Connect(function()
+					forceTargetScan = true
+				end))
+				Killaura:Clean(entitylib.Events.EntityRemoved:Connect(function()
+					forceTargetScan = true
+				end))
 				repeat
 					local interest, tool = getAttackData()
-					local attacked = {}
+					local attackedCount = 0
+					local playersEnabled = Targets.Players.Enabled
+					local npcsEnabled = Targets.NPCs.Enabled
+					local swingRange = SwingRange.Value
+					local maxTargets = Max.Value
+					if playersEnabled ~= lastPlayers or npcsEnabled ~= lastNPCs or swingRange ~= lastRange or maxTargets ~= lastLimit then
+						lastPlayers, lastNPCs, lastRange, lastLimit = playersEnabled, npcsEnabled, swingRange, maxTargets
+						forceTargetScan = true
+					end
+
+					proximityQuery.Players = playersEnabled
+					proximityQuery.NPCs = npcsEnabled
+					proximityQuery.Targetable = true
+					local nearestDistanceSq = entitylib.NearestDistanceSq(proximityQuery)
+					if closeTargetMode then
+						if nearestDistanceSq >= (55 * 55) then
+							closeTargetMode = false
+							forceTargetScan = true
+						end
+					elseif nearestDistanceSq <= (45 * 45) then
+						closeTargetMode = true
+						forceTargetScan = true
+					end
+					targetScanElapsed += elapsed
+					local scanInterval = closeTargetMode and (1 / 60) or (1 / 30)
+					local scanDue = forceTargetScan or targetScanElapsed >= scanInterval or Targets.Walls.Enabled
+
 					if interest then
-						local plrs = entitylib.AllPosition({
-							Range = SwingRange.Value,
-							Wallcheck = Targets.Walls.Enabled or nil,
-							Part = 'RootPart',
-							Players = Targets.Players.Enabled,
-							NPCs = Targets.NPCs.Enabled,
-							Limit = Max.Value
-						})
-	
+						if scanDue then
+							targetScanElapsed %= scanInterval
+							forceTargetScan = false
+							targetQuery.Range = swingRange
+							targetQuery.Wallcheck = Targets.Walls.Enabled or nil
+							targetQuery.Part = 'RootPart'
+							targetQuery.Players = playersEnabled
+							targetQuery.NPCs = npcsEnabled
+							targetQuery.Limit = maxTargets
+							targetQuery.Output = targetsBuffer
+							targetQuery.Cache = true
+							entitylib.AllPosition(targetQuery)
+						else
+							local rangeSq = swingRange * swingRange
+							for index = #targetsBuffer, 1, -1 do
+								local target = targetsBuffer[index]
+								local root = target and target.RootPart
+								local valid = target and target.Targetable and root and entitylib.isVulnerable(target)
+								if valid then
+									local delta = root.Position - entitylib.character.RootPart.Position
+									valid = delta:Dot(delta) <= rangeSq
+								end
+								if not valid then
+									targetsBuffer[index] = targetsBuffer[#targetsBuffer]
+									targetsBuffer[#targetsBuffer] = nil
+									forceTargetScan = true
+								end
+							end
+						end
+
+						local plrs = targetsBuffer
+
 						if #plrs > 0 then
 							local selfpos = entitylib.character.RootPart.Position
-							local localfacing = entitylib.character.RootPart.CFrame.LookVector * Vector3.new(1, 0, 1)
-	
+							local localfacing = entitylib.character.RootPart.CFrame.LookVector * flatVector
+							local angleLimit = math.rad(AngleSlider.Value) / 2
+							local attackRange = AttackRange.Value
+							local now = time()
+
 							for _, v in plrs do
 								local delta = (v.RootPart.Position - selfpos)
-								local angle = math.acos(localfacing:Dot((delta * Vector3.new(1, 0, 1)).Unit))
-								if angle > (math.rad(AngleSlider.Value) / 2) then continue end
-	
-								table.insert(attacked, {
-									Entity = v,
-									Check = delta.Magnitude > AttackRange.Value and BoxSwingColor or BoxAttackColor
-								})
-								targetinfo.Targets[v] = tick() + 1
-	
-								if AttackDelay < tick() then
-									AttackDelay = tick() + (1 / CPS.GetRandomValue())
-									tool:Activate()
+								local angle = math.acos(localfacing:Dot((delta * flatVector).Unit))
+								if angle > angleLimit then continue end
+								local distanceSq = delta:Dot(delta)
+								local distance = math.sqrt(distanceSq)
+
+								attackedCount += 1
+								local hit = attacked[attackedCount]
+								if not hit then
+									hit = {}
+									attacked[attackedCount] = hit
+									attackedCapacity = attackedCount
 								end
-	
+								hit.Entity = v
+								hit.Check = distance > attackRange and BoxSwingColor or BoxAttackColor
+								targetinfo.Targets[v] = now + 1
+
+				if AttackDelay < now then
+					AttackDelay = now + (1 / CPS.GetRandomValue())
+					entitylib.Performance:RecordKillauraSwing(v, os.clock())
+					tool:Activate()
+				end
+
 								if Lunge.Enabled and tool.GripUp.X == 0 then break end
-								if delta.Magnitude > AttackRange.Value then continue end
-	
-								Overlay.FilterDescendantsInstances = {v.Character}
-								for _, part in workspace:GetPartBoundsInBox(v.RootPart.CFrame, Vector3.new(4, 4, 4), Overlay) do
+								if distance > attackRange then continue end
+
+								overlayFilter[1] = v.Character
+								overlayFilter[2] = nil
+								Overlay.FilterDescendantsInstances = overlayFilter
+								for _, part in workspace:GetPartBoundsInBox(v.RootPart.CFrame, hitboxSize, Overlay) do
 									firetouchinterest(interest.Parent, part, 1)
 									firetouchinterest(interest.Parent, part, 0)
 								end
 							end
 						end
 					end
-	
-					for i, v in Boxes do
-						v.Adornee = attacked[i] and attacked[i].Entity.RootPart or nil
-						if v.Adornee then
-							v.Color3 = Color3.fromHSV(attacked[i].Check.Hue, attacked[i].Check.Sat, attacked[i].Check.Value)
-							v.Transparency = 1 - attacked[i].Check.Opacity
-						end
+
+				for i, v in Boxes do
+					local hit = i <= attackedCount and attacked[i] or nil
+					v.Adornee = hit and hit.Entity.RootPart or nil
+					if hit then
+						v.Color3 = Color3.fromHSV(hit.Check.Hue, hit.Check.Sat, hit.Check.Value)
+						v.Transparency = 1 - hit.Check.Opacity
 					end
-	
-					for i, v in Particles do
-						v.Position = attacked[i] and attacked[i].Entity.RootPart.Position or Vector3.new(9e9, 9e9, 9e9)
-						v.Parent = attacked[i] and gameCamera or nil
-					end
-	
-					if Face.Enabled and attacked[1] then
-						local vec = attacked[1].Entity.RootPart.Position * Vector3.new(1, 0, 1)
-						entitylib.character.RootPart.CFrame = CFrame.lookAt(entitylib.character.RootPart.Position, Vector3.new(vec.X, entitylib.character.RootPart.Position.Y + 0.01, vec.Z))
-					end
-	
-					task.wait()
+				end
+
+				for i, v in Particles do
+					local hit = i <= attackedCount and attacked[i] or nil
+					v.Position = hit and hit.Entity.RootPart.Position or farAway
+					v.Parent = hit and gameCamera or nil
+				end
+
+				if Face.Enabled and attackedCount > 0 then
+					local vec = attacked[1].Entity.RootPart.Position * flatVector
+					entitylib.character.RootPart.CFrame = CFrame.lookAt(entitylib.character.RootPart.Position, Vector3.new(vec.X, entitylib.character.RootPart.Position.Y + 0.01, vec.Z))
+				end
+
+				for index = 1, attackedCapacity do
+					local hit = attacked[index]
+					hit.Entity = nil
+					hit.Check = nil
+				end
+
+				elapsed = task.wait()
 				until not Killaura.Enabled
 			else
 				for _, v in Boxes do
 					v.Adornee = nil
 				end
-	
+
 				for _, v in Particles do
 					v.Parent = nil
 				end
+				table.clear(targetsBuffer)
+				forceTargetScan = true
+				targetScanElapsed = 0
 			end
 		end,
 		Tooltip = 'Attack players around you\nwithout aiming at them.'
@@ -5353,10 +5661,13 @@ run(function()
 	local Color
 	local FillTransparency
 	local Reference = {}
+	local Candidates = {}
+	local CandidatesInitialized = false
 	local Folder = Instance.new('Folder')
 	Folder.Parent = vape.gui
-	
+
 	local function Add(v)
+		if Reference[v] then return end
 		if not table.find(List.ListEnabled, v.Name) then return end
 		if v:IsA('BasePart') or v:IsA('Model') then
 			local size = v:IsA('Model') and v:GetExtentsSize() or v.Size
@@ -5369,28 +5680,43 @@ run(function()
 			box.Color3 = Color3.fromHSV(Color.Hue, Color.Sat, Color.Value)
 			box.Parent = Folder
 			Reference[v] = box
+			end
+	end
+
+	local function addCandidate(v)
+		if not (v:IsA('BasePart') or v:IsA('Model')) then return end
+		Candidates[v] = true
+		if Search and Search.Enabled then
+			Add(v)
 		end
 	end
-	
+
+	vape:Clean(workspace.DescendantAdded:Connect(addCandidate))
+	vape:Clean(workspace.DescendantRemoving:Connect(function(v)
+		Candidates[v] = nil
+		if Reference[v] then
+			Reference[v]:Destroy()
+			Reference[v] = nil
+		end
+	end))
+
 	Search = vape.Categories.Render:CreateModule({
 		Name = 'Search',
 		Function = function(callback)
 			if callback then
-				Search:Clean(workspace.DescendantAdded:Connect(Add))
-				Search:Clean(workspace.DescendantRemoving:Connect(function(v)
-					if Reference[v] then
-						Reference[v]:Destroy()
-						Reference[v] = nil
+				if not CandidatesInitialized then
+					for _, v in workspace:GetDescendants() do
+						addCandidate(v)
 					end
-				end))
-	
-				for _, v in workspace:GetDescendants() do
+					CandidatesInitialized = true
+				end
+				for v in Candidates do
 					Add(v)
 				end
 			else
-				Folder:ClearAllChildren()
-				table.clear(Reference)
-			end
+			Folder:ClearAllChildren()
+			table.clear(Reference)
+		end
 		end,
 		Tooltip = 'Draws box around selected parts\nAdd parts in Search frame'
 	})
@@ -5420,10 +5746,91 @@ run(function()
 				v.Transparency = val
 			end
 		end,
-		Decimal = 10
+	Decimal = 10
+})
+end)
+
+--[[ The sessioninfo library is pure data with no GUI dependency, so it registers in its own
+block ahead of the Session Info overlay. It used to be created at the tail of the overlay
+block, meaning any failure in the overlay's instance work (or in anything before it, while
+the runner was still unguarded) left vape.Libraries.sessioninfo unset -- and the place
+files capture it into a file-local exactly once, so they then indexed nil for the rest of
+the session no matter what universal did later. ]]
+run(function()
+	local sessioninfo = ensureSessionInfo()
+	if not sessioninfo.Objects['Time Played'] then
+		sessioninfo:AddItem('Time Played', os.clock(), function(value)
+			return os.date('!%X', math.floor(os.clock() - value))
+		end)
+	end
+end)
+
+run(function()
+	local MotionBlur
+	local Strength
+	local blur
+	local connection
+	local ownedBlur = false
+	local originalSize
+
+	local function updateBlur()
+		if not (blur and blur.Parent and Strength) then return end
+		local character = lplr.Character
+		local root = character and character:FindFirstChild('HumanoidRootPart')
+		local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
+		local horizontal = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+		blur.Size = math.clamp(horizontal / 30 * Strength.Value, 0, Strength.Value)
+	end
+
+	local function removeBlur()
+		if connection then
+			pcall(function() connection:Disconnect() end)
+			connection = nil
+		end
+		if blur then
+			if ownedBlur then
+				pcall(function() blur:Destroy() end)
+			elseif originalSize then
+				pcall(function() blur.Size = originalSize end)
+			end
+		end
+		blur = nil
+		ownedBlur = false
+		originalSize = nil
+	end
+
+	MotionBlur = vape.Categories.Render:CreateModule({
+		Name = 'MotionBlur',
+		Function = function(callback)
+			if not callback then
+				removeBlur()
+				return
+			end
+
+			removeBlur()
+			blur = lightingService:FindFirstChild('PistonwareMotionBlur')
+			if not (blur and blur:IsA('BlurEffect')) then
+				blur = Instance.new('BlurEffect')
+				blur.Name = 'PistonwareMotionBlur'
+				blur.Parent = lightingService
+				ownedBlur = true
+			else
+				originalSize = blur.Size
+			end
+			blur.Size = 0
+			connection = runService.RenderStepped:Connect(updateBlur)
+		end,
+		Tooltip = 'Adds a velocity-based camera blur while moving.'
+	})
+	Strength = MotionBlur:CreateSlider({
+		Name = 'Strength',
+		Min = 0,
+		Max = 24,
+		Default = 8,
+		Function = updateBlur
 	})
 end)
-	
+
 run(function()
 	local SessionInfo
 	local FontOption
@@ -5620,26 +6027,247 @@ run(function()
 	infostroke.Color = Color3.fromHSV(0.44, 1, 1)
 	infostroke.Parent = infoholder
 	addBlur(infoholder)
-	vape.Libraries.sessioninfo = {
-		Objects = {},
-		AddItem = function(self, name, startvalue, func, saved)
-			func, saved = func or function(val) return val end, saved == nil or saved
-			self.Objects[name] = {Function = func, Saved = saved, Value = startvalue or 0, Index = getTableSize(self.Objects) + 2}
-			return {
-				Increment = function(_, val)
-					self.Objects[name].Value += (val or 1)
-				end,
-				Get = function()
-					return self.Objects[name].Value
-				end
-			}
-		end
-	}
-	vape.Libraries.sessioninfo:AddItem('Time Played', os.clock(), function(value)
-		return os.date('!%X', math.floor(os.clock() - value))
-	end)
 end)
-	
+
+if shared.PistonwareDeveloper == true then
+	run(function()
+		local KillauraInfo
+		local FontOption
+		local TextSize
+		local BorderColor
+		local Title
+		local TitleOffset
+		local infoholder
+		local infolabel
+		local infostroke
+		local lifecycle = 0
+
+		local function getKillaura()
+			local modules = vape.Modules
+			return modules and modules.Killaura
+		end
+
+		local function formatMilliseconds(value)
+			return type(value) == 'number' and value >= 0 and string.format('%.1f ms', value * 1000) or '--'
+		end
+
+		local function formatPing(value)
+			return type(value) == 'number' and value >= 0 and string.format('%.0f ms', value) or '--'
+		end
+
+		local function formatRate(value)
+			return type(value) == 'number' and string.format('%.2f/s', value) or '--'
+		end
+
+		local function formatCount(value)
+			return type(value) == 'number' and tostring(math.floor(value + 0.5)) or '--'
+		end
+
+		local function formatPercent(value)
+			return type(value) == 'number' and string.format('%.1f%%', value * 100) or '--'
+		end
+
+		local function formatMemory(value)
+			return type(value) == 'number' and string.format('%.0f MB', value) or '--'
+		end
+
+		local function formatAge(now, timestamp)
+			return type(timestamp) == 'number' and string.format('%.1fs ago', math.max(now - timestamp, 0)) or '--'
+		end
+
+		local function getTargetName(target)
+			if not target then return 'none' end
+			local name
+			pcall(function()
+				if type(target) == 'table' and target.Player then
+					name = target.Player.DisplayName or target.Player.Name
+				else
+					name = target.Name
+				end
+			end)
+			return removeTags(tostring(name or 'target'))
+		end
+
+		KillauraInfo = vape:CreateOverlay({
+			-- Keep this category name stable so existing developer profiles continue to load.
+			Name = 'Killaura Info',
+			Icon = getcustomasset('pistonware/assets/new/targetinfo.png'),
+			Size = UDim2.fromOffset(16, 12),
+			Position = UDim2.fromOffset(12, 110),
+			CategorySize = 240,
+			Function = function(callback)
+				lifecycle += 1
+				local currentLifecycle = lifecycle
+				if callback then
+					local performance = entitylib.Performance
+					local wasPerformanceEnabled = performance:IsEnabled()
+					performance:SetEnabled(true)
+					performance:SetKillauraTelemetry(true)
+					performance:StartDiagnostics()
+
+					local previousStats = performance:Snapshot()
+					local previousStatsAt = os.clock()
+
+					KillauraInfo:Clean(function()
+						performance:StopDiagnostics()
+						performance:SetKillauraTelemetry(false)
+						performance:SetEnabled(wasPerformanceEnabled)
+					end)
+
+					repeat
+						local now = os.clock()
+						local currentStats = performance:Snapshot()
+						local statsElapsed = math.max(now - previousStatsAt, 0.001)
+						local function statRate(name)
+							return math.max((currentStats[name] or 0) - (previousStats[name] or 0), 0) / statsElapsed
+						end
+						local cacheHits = statRate('TargetCacheHits')
+						local cacheRefreshes = statRate('TargetCacheRefreshes')
+						local cacheTotal = cacheHits + cacheRefreshes
+						local cacheRatio = cacheTotal > 0 and string.format('%.1f%%', cacheHits / cacheTotal * 100) or '--'
+						local scanRate = statRate('TargetScans')
+						local candidateRate = statRate('TargetCandidates')
+						local raycastRate = statRate('Raycasts')
+						local updateRate = statRate('EntityUpdates')
+						previousStats = currentStats
+						previousStatsAt = now
+
+						local telemetry = performance:KillauraSnapshot(now)
+						local diagnostics = performance:DiagnosticsSnapshot(now)
+						local killaura = getKillaura()
+						local status = killaura and (killaura.Enabled and 'ON' or 'OFF') or 'UNAVAILABLE'
+						local render = diagnostics.Render
+						local heartbeat = diagnostics.Heartbeat
+						local ping = diagnostics.Ping
+						local spikes = diagnostics.Spikes
+						local corrections = diagnostics.Corrections
+						local lines = {}
+						local showTitle = not Title or Title.Enabled
+						if showTitle then
+							lines[#lines + 1] = TitleOffset and TitleOffset.Enabled and '<b>Developer Diagnostics</b>\n<font size="4"> </font>' or '<b>Developer Diagnostics</b>'
+						end
+						lines[#lines + 1] = 'Killaura: '..status..' | Target: '..getTargetName(telemetry.LastTarget)
+						lines[#lines + 1] = 'Attempts: '..formatCount(telemetry.SwingCount)..' | Confirmed: '..formatCount(telemetry.ConfirmedCount)..' | Pending: '..formatCount(telemetry.PendingCount)
+						lines[#lines + 1] = 'Expired: '..formatCount(telemetry.ExpiredCount)..' | Dropped: '..formatCount(telemetry.DroppedCount)
+						lines[#lines + 1] = 'Finalized hit ratio: '..formatPercent(telemetry.Accuracy)..' | provisional '..formatPercent(telemetry.ProvisionalAccuracy)
+						lines[#lines + 1] = 'Hit rate: '..formatRate(telemetry.HitRate)..' rolling 5s | Swing rate: '..formatRate(telemetry.SwingRate)
+						lines[#lines + 1] = 'Hit gap: '..formatMilliseconds(telemetry.AverageHitGap)..' avg | Swing gap: '..formatMilliseconds(telemetry.AverageSwingGap)..' avg'
+						lines[#lines + 1] = 'Confirm source: matched adapter event | Telemetry uptime: '..string.format('%.1fs', telemetry.Elapsed or 0)
+						if diagnostics.Enabled then
+							lines[#lines + 1] = 'Render FPS: '..formatCount(render.Fps)..' | 1% low: '..formatCount(render.Low1PercentFps)
+							lines[#lines + 1] = 'Frame: '..formatMilliseconds(render.FrameAverage)..' avg | '..formatMilliseconds(render.FrameP95)..' p95 | '..formatMilliseconds(render.FrameMax)..' max'
+							lines[#lines + 1] = 'Heartbeat: '..formatMilliseconds(heartbeat.Average)..' avg | '..formatMilliseconds(heartbeat.P95)..' p95 | '..formatMilliseconds(heartbeat.Max)..' max'
+							lines[#lines + 1] = 'Ping: '..formatPing(ping.Current)..' now | '..formatPing(ping.Average)..' avg | '..formatPing(ping.P95)..' p95 | jitter '..formatPing(ping.Jitter)
+							lines[#lines + 1] = 'Spikes/10s: render '..formatCount(spikes.Render)..' | heartbeat '..formatCount(spikes.Heartbeat)..' | ping '..formatCount(spikes.Network)
+							lines[#lines + 1] = 'Last spikes: render '..formatMilliseconds(spikes.LastRender)..' | heartbeat '..formatMilliseconds(spikes.LastHeartbeat)..' | ping '..formatPing(spikes.LastNetwork)
+							lines[#lines + 1] = 'Samples: render '..formatCount(render.Samples)..' | heartbeat '..formatCount(heartbeat.Samples)..' | ping '..formatCount(ping.Samples)
+							lines[#lines + 1] = 'Correction signals: '..formatCount(corrections.Count)..' total | '..formatCount(corrections.Recent)..' recent | '..(corrections.LastReason or 'none')..' ('..formatAge(now, corrections.LastAt)..')'
+							lines[#lines + 1] = 'Memory: '..formatMemory(diagnostics.Memory)
+						else
+							lines[#lines + 1] = 'Diagnostics sampler: unavailable'
+						end
+						lines[#lines + 1] = 'Targeting/s: scan '..formatRate(scanRate)..' | candidates '..formatRate(candidateRate)..' | raycast '..formatRate(raycastRate)
+						lines[#lines + 1] = 'Cache: '..cacheRatio..' hit | entity updates '..formatRate(updateRate)
+
+						infolabel.Text = table.concat(lines, '\n')
+						infolabel.FontFace = FontOption.Value
+						infolabel.TextSize = TextSize.Value
+						local size = getfontsize(removeTags(infolabel.Text), infolabel.TextSize, infolabel.FontFace)
+						infoholder.Size = UDim2.fromOffset(math.max(420, math.min(size.X + 16, 640)), size.Y + (showTitle and TitleOffset and TitleOffset.Enabled and 4 or 16))
+						task.wait(0.25)
+					until lifecycle ~= currentLifecycle or not KillauraInfo.Button or not KillauraInfo.Button.Enabled
+				end
+			end
+		})
+		FontOption = KillauraInfo:CreateFont({
+			Name = 'Font',
+			Blacklist = 'Arial'
+		})
+		KillauraInfo:CreateColorSlider({
+			Name = 'Background Color',
+			DefaultValue = 0,
+			DefaultOpacity = 0.5,
+			Function = function(hue, sat, val, opacity)
+				if infoholder then
+					infoholder.BackgroundColor3 = Color3.fromHSV(hue, sat, val)
+					infoholder.BackgroundTransparency = 1 - opacity
+				end
+			end
+		})
+		BorderColor = KillauraInfo:CreateColorSlider({
+			Name = 'Border Color',
+			Function = function(hue, sat, val, opacity)
+				if infostroke then
+					infostroke.Color = Color3.fromHSV(hue, sat, val)
+					infostroke.Transparency = 1 - opacity
+				end
+			end,
+			Darker = true,
+			Visible = false
+		})
+		TextSize = KillauraInfo:CreateSlider({
+			Name = 'Text Size',
+			Min = 1,
+			Max = 30,
+			Default = 16
+		})
+		Title = KillauraInfo:CreateToggle({
+			Name = 'Title',
+			Function = function(callback)
+				if TitleOffset and TitleOffset.Object then
+					TitleOffset.Object.Visible = callback
+				end
+			end,
+			Default = true
+		})
+		TitleOffset = KillauraInfo:CreateToggle({
+			Name = 'Offset',
+			Default = true,
+			Darker = true
+		})
+		KillauraInfo:CreateToggle({
+			Name = 'Border',
+			Function = function(callback)
+				if infostroke then infostroke.Enabled = callback end
+				if BorderColor and BorderColor.Object then BorderColor.Object.Visible = callback end
+			end
+		})
+		infoholder = Instance.new('Frame')
+		infoholder.BackgroundColor3 = Color3.new()
+		infoholder.BackgroundTransparency = 0.5
+		infoholder.Parent = KillauraInfo.Children
+		vape:Clean(KillauraInfo.Children:GetPropertyChangedSignal('AbsolutePosition'):Connect(function()
+			if vape.ThreadFix then
+				setthreadidentity(8)
+			end
+			local newside = KillauraInfo.Children.AbsolutePosition.X > (vape.gui.AbsoluteSize.X / 2)
+			infoholder.Position = UDim2.fromScale(newside and 1 or 0, 0)
+			infoholder.AnchorPoint = Vector2.new(newside and 1 or 0, 0)
+		end))
+		local infocorner = Instance.new('UICorner')
+		infocorner.CornerRadius = UDim.new(0, 5)
+		infocorner.Parent = infoholder
+		infolabel = Instance.new('TextLabel')
+		infolabel.Size = UDim2.new(1, -16, 1, -16)
+		infolabel.Position = UDim2.fromOffset(8, 8)
+		infolabel.BackgroundTransparency = 1
+		infolabel.TextXAlignment = Enum.TextXAlignment.Left
+		infolabel.TextYAlignment = Enum.TextYAlignment.Top
+		infolabel.TextSize = 16
+		infolabel.TextColor3 = Color3.new(1, 1, 1)
+		infolabel.TextStrokeColor3 = Color3.new()
+		infolabel.TextStrokeTransparency = 0.8
+		infolabel.Font = Enum.Font.Arial
+		infolabel.RichText = true
+		infolabel.Parent = infoholder
+		infostroke = Instance.new('UIStroke')
+		infostroke.Enabled = false
+		infostroke.Color = Color3.fromHSV(0.44, 1, 1)
+		infostroke.Parent = infoholder
+		addBlur(infoholder)
+	end)
+end
+
 run(function()
 	local Tracers
 	local Targets
@@ -6085,6 +6713,151 @@ run(function()
 		Name = 'Sort',
 		List = {'Descending', 'Ascending'},
 		Tooltip = 'Descending - Prefers full servers\nAscending - Prefers empty servers'
+	})
+end)
+
+run(function()
+	local PromptChanger
+	local Mode
+	local Modifier
+	local Range
+	local originalRanges = {}
+	local modified = {}
+	local thread
+
+	local function updatePrompt(prompt)
+		callWithThreadFix(function()
+			if not prompt or not prompt:IsA('ProximityPrompt') then return end
+			if originalRanges[prompt] == nil then
+				originalRanges[prompt] = prompt.MaxActivationDistance
+			end
+			prompt.MaxActivationDistance = Range.Value
+		end)
+	end
+
+	local function updateAllPrompts()
+		callWithThreadFix(function()
+			for _, prompt in workspace:GetDescendants() do
+				updatePrompt(prompt)
+			end
+		end)
+	end
+
+	local function applyHoldDuration(prompt)
+		if not prompt or not prompt:IsA('ProximityPrompt') then return end
+		if modified[prompt] == nil then
+			modified[prompt] = prompt.HoldDuration
+		end
+		prompt.HoldDuration = modified[prompt] * (Modifier.Value / 100)
+	end
+
+	local function restorePrompts()
+		if thread then
+			task.cancel(thread)
+			thread = nil
+		end
+
+		for prompt, distance in originalRanges do
+			callWithThreadFix(function()
+				if prompt.Parent then
+					prompt.MaxActivationDistance = distance
+				end
+			end)
+		end
+		table.clear(originalRanges)
+
+		for prompt, duration in modified do
+			callWithThreadFix(function()
+				if prompt.Parent then
+					prompt.HoldDuration = duration
+				end
+			end)
+		end
+		table.clear(modified)
+	end
+
+	PromptChanger = vape.Categories.Utility:CreateModule({
+		Name = 'PromptChanger',
+		Function = function(callback)
+			if callback then
+				updateAllPrompts()
+				PromptChanger:Clean(proxService.PromptShown:Connect(function(prompt)
+					updatePrompt(prompt)
+					if Mode.Value == 'Property' then
+						applyHoldDuration(prompt)
+					end
+				end))
+				PromptChanger:Clean(workspace.DescendantAdded:Connect(function(instance)
+					updatePrompt(instance)
+				end))
+
+				if Mode.Value == 'Signal' then
+					PromptChanger:Clean(proxService.PromptButtonHoldBegan:Connect(function(prompt, plr)
+						if plr == lplr then
+							thread = task.delay(prompt.HoldDuration * (Modifier.Value / 100), function()
+								fireproximityprompt(prompt)
+								thread = nil
+							end)
+						end
+					end))
+					PromptChanger:Clean(proxService.PromptButtonHoldEnded:Connect(function(prompt, plr)
+						if plr == lplr and thread then
+							task.cancel(thread)
+							thread = nil
+						end
+					end))
+				else
+					PromptChanger:Clean(proxService.PromptHidden:Connect(function(prompt)
+						if modified[prompt] then
+							prompt.HoldDuration = modified[prompt]
+							modified[prompt] = nil
+						end
+					end))
+				end
+			else
+				restorePrompts()
+			end
+		end,
+		Tooltip = 'Changes ProximityPrompt interaction range and hold time'
+	})
+	Range = PromptChanger:CreateSlider({
+		Name = 'Range',
+		Min = 1,
+		Max = 100,
+		Default = 32,
+		Suffix = function(val)
+			return val == 1 and 'stud' or 'studs'
+		end,
+		Function = function()
+			if PromptChanger.Enabled then
+				for prompt in originalRanges do
+					updatePrompt(prompt)
+				end
+			end
+		end
+	})
+	Mode = PromptChanger:CreateDropdown({
+		Name = 'Mode',
+		List = {'Signal', 'Property'},
+		Tooltip = 'Signal - Fires the prompt after the adjusted delay\nProperty - Sets the HoldDuration property',
+		Function = function()
+			if PromptChanger.Enabled then
+				PromptChanger:Toggle()
+				PromptChanger:Toggle()
+			end
+		end
+	})
+	Modifier = PromptChanger:CreateSlider({
+		Name = 'Modifier',
+		Min = 0,
+		Max = 100,
+		Default = 50,
+		Suffix = '%',
+		Function = function(val)
+			for prompt, duration in modified do
+				prompt.HoldDuration = duration * (val / 100)
+			end
+		end
 	})
 end)
 	
@@ -6719,25 +7492,35 @@ run(function()
 	local Xray
 	local List
 	local modified = {}
-	
+
 	local function modifyPart(v)
 		if v:IsA('BasePart') and not table.find(List.ListEnabled, v.Name) then
-			modified[v] = true
+			if modified[v] == nil then
+				modified[v] = v.LocalTransparencyModifier
+			end
 			v.LocalTransparencyModifier = 0.5
 		end
 	end
-	
+
 	Xray = vape.Categories.World:CreateModule({
 		Name = 'Xray',
 		Function = function(callback)
 			if callback then
 				Xray:Clean(workspace.DescendantAdded:Connect(modifyPart))
+				Xray:Clean(workspace.DescendantRemoving:Connect(function(v)
+					if modified[v] ~= nil then
+						v.LocalTransparencyModifier = modified[v]
+					end
+					modified[v] = nil
+				end))
 				for _, v in workspace:GetDescendants() do
 					modifyPart(v)
 				end
 			else
-				for i in modified do
-					i.LocalTransparencyModifier = 0
+				for i, original in modified do
+					if i.Parent then
+						i.LocalTransparencyModifier = original
+					end
 				end
 				table.clear(modified)
 			end
@@ -7999,89 +8782,6 @@ run(function()
 		Function = function(val)
 			if TimeChanger.Enabled then 
 				lightingService.TimeOfDay = val..':00:00'
-			end
-		end
-	})
-end)
-
-run(function()
-	local FastProxPrompt
-	local Mode
-	local Value
-	local modified = {}
-	local thread
-	
-	FastProxPrompt = vape.Categories.World:CreateModule({
-		Name = 'FastProxPrompt',
-		Function = function(callback)
-			if callback then
-				if Mode.Value == 'Signal' then
-					FastProxPrompt:Clean(proxService.PromptButtonHoldBegan:Connect(function(prompt, plr)
-						if plr == lplr then
-							thread = task.delay(prompt.HoldDuration * (Value.Value / 100), function()
-								fireproximityprompt(prompt)
-								thread = nil
-							end)
-						end
-					end))
-	
-					FastProxPrompt:Clean(proxService.PromptButtonHoldEnded:Connect(function(prompt, plr)
-						if plr == lplr and thread then
-							task.cancel(thread)
-							thread = nil
-						end
-					end))
-				else
-					FastProxPrompt:Clean(proxService.PromptShown:Connect(function(prompt)
-						if not modified[prompt] then
-							modified[prompt] = prompt.HoldDuration
-						end
-	
-						prompt.HoldDuration = modified[prompt] * (Value.Value / 100)
-					end))
-	
-					FastProxPrompt:Clean(proxService.PromptHidden:Connect(function(prompt)
-						if modified[prompt] then
-							prompt.HoldDuration = modified[prompt]
-							modified[prompt] = nil
-						end
-					end))
-				end
-			else
-				if thread then
-					task.cancel(thread)
-					thread = nil
-				end
-	
-				for i, v in modified do
-					i.HoldDuration = v
-				end
-	
-				table.clear(modified)
-			end
-		end,
-		Tooltip = 'Allow you to adjust the HoldDuration time of a ProximityPrompt'
-	})
-	Mode = FastProxPrompt:CreateDropdown({
-		Name = 'Mode',
-		List = {'Signal', 'Property'},
-		Tooltip = 'Signal - Uses fireproximityprompt after the calculated delay\nProperty - Sets the HoldDuration property',
-		Function = function()
-			if FastProxPrompt.Enabled then
-				FastProxPrompt:Toggle()
-				FastProxPrompt:Toggle()
-			end
-		end
-	})
-	Value = FastProxPrompt:CreateSlider({
-		Name = 'Modifier',
-		Min = 0,
-		Max = 100,
-		Default = 50,
-		Suffix = '%',
-		Function = function(val)
-			for i, v in modified do
-				i.HoldDuration = v * (val / 100)
 			end
 		end
 	})

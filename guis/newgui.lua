@@ -32,6 +32,7 @@ local vape = {
 	Place = game.PlaceId,
 	Profile = 'default',
 	RainbowSliders = {},
+	RainbowSliderIndices = {},
 	--[[ Bumped by every vape:Load. Load yields now, so a second load can stop the older one
 	while it is still walking instead of interleaving writes into the same modules. ]]
 	LoadGeneration = 0,
@@ -48,6 +49,27 @@ local vape = {
 local run = function(func)
 	func()
 end
+
+local function addRainbowSlider(component)
+	if vape.RainbowSliderIndices[component] then return end
+	local index = #vape.RainbowSliders + 1
+	vape.RainbowSliders[index] = component
+	vape.RainbowSliderIndices[component] = index
+end
+
+local function removeRainbowSlider(component)
+	local index = vape.RainbowSliderIndices[component]
+	if not index then return end
+	local lastIndex = #vape.RainbowSliders
+	local moved = vape.RainbowSliders[lastIndex]
+	vape.RainbowSliders[index] = moved
+	vape.RainbowSliders[lastIndex] = nil
+	vape.RainbowSliderIndices[component] = nil
+	if moved and moved ~= component then
+		vape.RainbowSliderIndices[moved] = index
+	end
+end
+
 local function runChunk(source, name)
 	local chunk = loadstring(source, name)
 	return chunk and chunk()
@@ -61,6 +83,22 @@ local textService = cloneref(game:GetService('TextService'))
 local guiService = cloneref(game:GetService('GuiService'))
 local runService = cloneref(game:GetService('RunService'))
 local httpService = cloneref(game:GetService('HttpService'))
+
+local function pistonwareHttpGet(url, nocache, attempt)
+	local adapter = shared.PistonwareDevHttpGet
+	if type(adapter) == 'function' then
+		return adapter(url, nocache, attempt)
+	end
+	return game:HttpGet(url, nocache)
+end
+
+local function pistonwareRequest(options)
+	local adapter = shared.PistonwareDevRequest
+	if type(adapter) == 'function' then
+		return adapter(options)
+	end
+	return request(options)
+end
 
 --[[
 	What this Roblox client can actually do.
@@ -278,27 +316,38 @@ end
 	One drain thread at a time, and it exits when the queue empties, so nothing is left running
 	between applies.
 ]]
-local startQueue = {}
+local startQueue, recycledStartJobs = {}, {}
+local startHead, startTail = 1, 0
 local startThread
 local function queueStart(name, callback)
-	table.insert(startQueue, {Name = name, Start = callback})
+	local job = table.remove(recycledStartJobs)
+	job = job or {}
+	job.Name, job.Start = name, callback
+	startTail += 1
+	startQueue[startTail] = job
 
 	if startThread then
 		return
 	end
 
 	startThread = task.spawn(function()
-		while #startQueue > 0 do
+		while startHead <= startTail do
 			-- Yield BEFORE the first job, not after it. task.spawn resumes this thread inline on
 			-- the caller, so taking a job first would run one module synchronously inside the
 			-- apply loop -- the exact thing being fixed, just once instead of sixty times.
 			task.wait()
-			local job = table.remove(startQueue, 1)
+			local nextJob = startQueue[startHead]
+			startQueue[startHead] = nil
+			startHead += 1
 			-- spawn, not a direct call: a module that errors on startup must not take the drain
 			-- thread down with it and strand every module still queued behind it.
-			task.spawn(job.Start, true)
+			local start = nextJob.Start
+			nextJob.Start, nextJob.Name = nil, nil
+			table.insert(recycledStartJobs, nextJob)
+			task.spawn(start, true)
 		end
 
+		startHead, startTail = 1, 0
 		startThread = nil
 	end)
 end
@@ -555,12 +604,17 @@ do
 	install never writes. Retried, because a raw host under load returns an error page as the
 	body and caching that poisons the install silently. ]]
 	local function downloadFile(path)
+		local devLoader = shared.PistonwareDevLoadSource
+		if type(devLoader) == 'function' then
+			devLoader(path)
+			return getcustomasset(path)
+		end
 		if not hasContent(path) then
 			local relPath = select(1, path:gsub('pistonware/', ''))
 			local data
 			for attempt = 1, 4 do
 				local success, res = pcall(function()
-					return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..relPath, true)
+					return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..relPath, true, attempt)
 				end)
 				if success and res and res ~= '' and res ~= '404: Not Found' then
 					data = res
@@ -1088,6 +1142,24 @@ local function addMaid(obj)
 	end
 end
 
+local function cleanupConnection(connection)
+	if connection == nil then return end
+	if type(connection) == 'function' then
+		pcall(connection)
+		return
+	end
+
+	for _, methodName in {'Disconnect', 'disconnect', 'Destroy', 'Remove', 'DoCleaning'} do
+		local ok, method = pcall(function()
+			return connection[methodName]
+		end)
+		if ok and type(method) == 'function' then
+			pcall(method, connection)
+			return
+		end
+	end
+end
+
 local function addTooltip(gui, text, customText, visCheck)
 	if not text then return end
 
@@ -1480,6 +1552,29 @@ function vape:Load(skipgui, profile)
 			for _, data in mainData.Modules do
 				data.Bind = {Keys = data.Bind}
 				data.Visible = true
+			end
+		end
+
+		-- PromptChanger combines the two older proximity-prompt modules. Merge their
+		-- saved options before the normal module pass so existing profiles keep working.
+		do
+			local modules = mainData.Modules
+			local promptData = modules.PromptChanger or modules.FastProxPrompt or modules.InteractExtender
+			if promptData then
+				promptData.Options = promptData.Options or {}
+				local fastOptions = modules.FastProxPrompt and modules.FastProxPrompt.Options or {}
+				local extenderOptions = modules.InteractExtender and modules.InteractExtender.Options or {}
+				for _, option in {'Mode', 'Modifier'} do
+					if fastOptions[option] and not promptData.Options[option] then
+						promptData.Options[option] = fastOptions[option]
+					end
+				end
+				if extenderOptions.Range and not promptData.Options.Range then
+					promptData.Options.Range = extenderOptions.Range
+				end
+				modules.PromptChanger = promptData
+				modules.FastProxPrompt = nil
+				modules.InteractExtender = nil
 			end
 		end
 
@@ -1887,7 +1982,7 @@ function vape:LoadGUI()
 		if shared.PistonwareDeveloper and isfile('pistonware/loaderdev.lua') then
 			loadstring(readfile('pistonware/loaderdev.lua'), 'loader')()
 		else
-			loadstring(game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/loader.lua', true), 'loader')()
+			loadstring(pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/loader.lua', true), 'loader')()
 		end
 	end
 
@@ -1910,7 +2005,7 @@ function vape:LoadGUI()
 
 	local function latestProfileCommit()
 		local suc, res = pcall(function()
-			return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/commits?path=profiles&sha=main&per_page=1', true)
+			return pistonwareHttpGet('https://api.github.com/repos/themagicpiston/pistonware/commits?path=profiles&sha=main&per_page=1', true)
 		end)
 		if not (suc and res and res ~= '' and res ~= '404: Not Found') then return nil end
 		local ok, body = pcall(function()
@@ -1974,7 +2069,7 @@ function vape:LoadGUI()
 		local content
 		for attempt = 1, 4 do
 			local suc, res = pcall(function()
-				return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/'..(commit or 'main')..'/'..relPath, true)
+				return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/'..(commit or 'main')..'/'..relPath, true, attempt)
 			end)
 			if suc and res and res ~= '' and res ~= '404: Not Found' then
 				content = res
@@ -1996,7 +2091,7 @@ function vape:LoadGUI()
 	local function downloadProfiles(commit)
 		local reqSuc, res = pcall(function()
 			-- listing pinned too, so it can never describe a different commit than the files below
-			return game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/contents/profiles'..(commit and ('?ref='..commit) or ''), true)
+			return pistonwareHttpGet('https://api.github.com/repos/themagicpiston/pistonware/contents/profiles'..(commit and ('?ref='..commit) or ''), true)
 		end)
 		if not (reqSuc and res and res ~= '' and res ~= '404: Not Found') then
 			return nil, 'Profile sync failed (could not reach GitHub).'
@@ -3288,12 +3383,12 @@ function vape:LoadGUI()
 			shared.vapereload = true
 			--[[ Back through the pistonware loader, which re-runs the key gate. That is deliberate:
 			shared.PistonwareAuthenticated is cleared and re-derived on every run, so a reinject
-			revalidates rather than inheriting a flag. The developer build lives on disk under a
-			different name and must never be fetched from GitHub -- it has the gate disabled. ]]
+			revalidates rather than inheriting a flag. The developer loader lives on disk under a
+			different name and must never be fetched from GitHub -- it uses the same key gate. ]]
 			if shared.PistonwareDeveloper and isfile('pistonware/loaderdev.lua') then
 				runChunk(readfile('pistonware/loaderdev.lua'), 'loader')
 			else
-				runChunk(game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/loader.lua', true), 'loader')
+				runChunk(pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/loader.lua', true), 'loader')
 			end
 		end,
 		Tooltip = 'This will set your profile to the default settings of Vape'
@@ -3313,12 +3408,12 @@ function vape:LoadGUI()
 			shared.vapereload = true
 			--[[ Back through the pistonware loader, which re-runs the key gate. That is deliberate:
 			shared.PistonwareAuthenticated is cleared and re-derived on every run, so a reinject
-			revalidates rather than inheriting a flag. The developer build lives on disk under a
-			different name and must never be fetched from GitHub -- it has the gate disabled. ]]
+			revalidates rather than inheriting a flag. The developer loader lives on disk under a
+			different name and must never be fetched from GitHub -- it uses the same key gate. ]]
 			if shared.PistonwareDeveloper and isfile('pistonware/loaderdev.lua') then
 				runChunk(readfile('pistonware/loaderdev.lua'), 'loader')
 			else
-				runChunk(game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/loader.lua', true), 'loader')
+				runChunk(pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/loader.lua', true), 'loader')
 			end
 		end,
 		Tooltip = 'Reloads vape for debugging purposes'
@@ -3327,7 +3422,7 @@ function vape:LoadGUI()
 	general:CreateButton({
 		Name = 'Reinstall',
 		Function = function()
-			runChunk(game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/refs/heads/main/reinstall.lua', true), 'reinstall')
+			runChunk(pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/refs/heads/main/reinstall.lua', true), 'reinstall')
 		end,
 		Tooltip = 'Uninjects, deletes the pistonware folder and downloads everything again'
 	})
@@ -4435,6 +4530,12 @@ function vape:LoadGUI()
 	
 	local cursorConnection
 	vape:Clean(clickgui:GetPropertyChangedSignal('Visible'):Connect(function()
+		if not clickgui.Visible then
+			tooltip.Visible = false
+			tooltip.Text = ''
+			vape.CurrentTooltip = nil
+		end
+
 		vape:UpdateGUI(vape.GUIColor.Hue, vape.GUIColor.Sat, vape.GUIColor.Value, true)
 	
 		if clickgui.Visible and inputService.MouseEnabled then
@@ -4804,9 +4905,10 @@ local function sortCategoriesNow(self)
 			-- The array can name a module the hash no longer holds if a removal lands
 			-- between the request and this pass.
 			if module then
+				local layoutOrder = index * 2
 				module.Index = index
-				module.Object.LayoutOrder = index
-				module.Children.LayoutOrder = index
+				module.Object.LayoutOrder = layoutOrder
+				module.Children.LayoutOrder = layoutOrder + 1
 			end
 		end
 	end
@@ -4864,9 +4966,7 @@ function vape:Uninject()
 	end
 
 	for _, connection in self.Connections do
-		pcall(function()
-			connection:Disconnect()
-		end)
+		cleanupConnection(connection)
 	end
 
 	if self.ThreadFix then
@@ -6631,10 +6731,10 @@ components = {
 		
 		function component:Toggle()
 			self.Rainbow = not self.Rainbow
-		
+
 			if self.Rainbow then
-				table.insert(vape.RainbowSliders, self)
-		
+				addRainbowSlider(self)
+
 				ring1.ImageColor3 = Color3.fromRGB(5, 127, 100)
 				task.delay(0.1, function()
 					if not self.Rainbow then return end
@@ -6645,11 +6745,8 @@ components = {
 					end)
 				end)
 			else
-				local index = table.find(vape.RainbowSliders, self)
-				if index then
-					table.remove(vape.RainbowSliders, index)
-				end
-		
+				removeRainbowSlider(self)
+
 				ring3.ImageColor3 = color.Light(uipallet.Main, 0.37)
 				task.delay(0.1, function()
 					if self.Rainbow then return end
@@ -7122,24 +7219,30 @@ components = {
 					},
 					cmd = 'INVITE_BROWSER'
 				})
-		
-				for i = 1, 14 do
-					task.spawn(function()
-						pcall(function()
-							request({
-								Method = 'POST',
-								Url = 'http://127.0.0.1:64'..(53 + i)..'/rpc?v=1',
-								Headers = {
-									['Content-Type'] = 'application/json',
-									Origin = 'https://discord.com'
-								},
-								Body = body
-							})
-						end)
+				local opened = false
+				for port = 6454, 6467 do
+					local success = pcall(function()
+						return pistonwareRequest({
+							Method = 'POST',
+							Url = 'http://127.0.0.1:'..port..'/rpc?v=1',
+							Headers = {
+								['Content-Type'] = 'application/json',
+								Origin = 'https://discord.com'
+							},
+							Body = body,
+							Timeout = 2
+						})
 					end)
+					if success then
+						opened = true
+						break
+					end
+				end
+				if not opened then
+					vape:CreateNotification('Pistonware', 'Discord is not running locally. Use the copied invite link.', 5, 'warning')
 				end
 			end)
-		
+
 			task.spawn(function()
 				tooltip.Text = 'Copied!'
 				setclipboard('https://discord.gg/pistonware')
@@ -7670,11 +7773,11 @@ components = {
 			if rainbowthread then
 				task.cancel(rainbowthread)
 			end
-		
+
 			if self.Rainbow then
 				knob.Image = rainbowknob
-				table.insert(vape.RainbowSliders, self)
-		
+				addRainbowSlider(self)
+
 				ring1.ImageColor3 = Color3.fromRGB(5, 127, 100)
 				rainbowthread = task.delay(0.1, function()
 					ring2.ImageColor3 = Color3.fromRGB(228, 125, 43)
@@ -7686,11 +7789,8 @@ components = {
 			else
 				self:SetValue(nil, nil, nil, 4)
 				knob.Image = normalknob
-				local index = table.find(vape.RainbowSliders, self)
-				if index then
-					table.remove(vape.RainbowSliders, index)
-				end
-		
+				removeRainbowSlider(self)
+
 				ring3.ImageColor3 = color.Light(uipallet.Main, 0.37)
 				rainbowthread = task.delay(0.1, function()
 					ring2.ImageColor3 = color.Light(uipallet.Main, 0.37)
@@ -8062,7 +8162,7 @@ components = {
 		
 			if not self.Enabled then
 				for _, v in self.Connections do
-					v:Disconnect()
+					cleanupConnection(v)
 				end
 				table.clear(self.Connections)
 			end
@@ -8413,6 +8513,9 @@ components = {
 		modulechildren.Size = UDim2.new(1, 0, 0, 0)
 		modulechildren.Visible = false
 		modulechildren.Parent = children
+		local initialLayoutOrder = (component.Index + 1) * 2
+		button.LayoutOrder = initialLayoutOrder
+		modulechildren.LayoutOrder = initialLayoutOrder + 1
 		local windowlist = Instance.new('UIListLayout')
 		windowlist.HorizontalAlignment = Enum.HorizontalAlignment.Center
 		windowlist.SortOrder = Enum.SortOrder.LayoutOrder
@@ -8554,7 +8657,7 @@ components = {
 		
 			if not self.Enabled then
 				for _, v in self.Connections do
-					v:Disconnect()
+					cleanupConnection(v)
 				end
 				table.clear(self.Connections)
 			end
@@ -8743,7 +8846,7 @@ components = {
 		
 					if not callback then
 						for _, v in component.Connections do
-							v:Disconnect()
+							cleanupConnection(v)
 						end
 						table.clear(component.Connections)
 					end
