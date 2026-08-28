@@ -223,7 +223,6 @@ run(function()
 								targetinfo.Targets[v] = tick() + 1
 								Attacking = true
 
-								entitylib.Performance:RecordKillauraSwing(v, os.clock())
 								if v.NPC then
 									AIHit:FireServer(tool, aiController:GetServerModelFromClientModel(v.Character))
 								else

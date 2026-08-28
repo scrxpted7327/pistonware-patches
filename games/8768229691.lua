@@ -796,7 +796,6 @@ run(function()
 									skywars.Remotes[remotes.updateActiveItem]:fire(tool.Name)
 								end
 	
-								entitylib.Performance:RecordKillauraSwing(v, os.clock())
 								skywars.Remotes[remotes.strikeDesktop]:fire(v.Player)
 							end
 						end
