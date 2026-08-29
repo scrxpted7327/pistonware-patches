@@ -3990,66 +3990,6 @@ run(function()
 	})
 end)
 	
-run(function()
-	local ProjectileHitbox
-	local Expand
-	local objects = {}
-
-	local function createHitbox(ent)
-		if not (ent and ent.Targetable and ent.Player and ent.Character and ent.RootPart) then return end
-		if objects[ent] then return end
-		local hitbox = Instance.new('Part')
-		hitbox.Name = 'PistonwareProjectileHitbox'
-		hitbox.Size = Vector3.new(3, 6, 3) + Vector3.one * Expand.Value
-		hitbox.CFrame = ent.RootPart.CFrame
-		hitbox.CanCollide = false
-		hitbox.CanTouch = false
-		hitbox.Massless = true
-		hitbox.Transparency = 1
-		hitbox.Parent = ent.Character
-		local weld = Instance.new('WeldConstraint')
-		weld.Part0 = hitbox
-		weld.Part1 = ent.RootPart
-		weld.Parent = hitbox
-		objects[ent] = hitbox
-	end
-
-	local function clearHitboxes()
-		for ent, object in objects do
-			pcall(function() object:Destroy() end)
-			objects[ent] = nil
-		end
-	end
-
-	ProjectileHitbox = vape.Categories.Blatant:CreateModule({
-		Name = 'ProjectileHitbox',
-		Function = function(callback)
-			clearHitboxes()
-			if callback then
-				ProjectileHitbox:Clean(entitylib.Events.EntityAdded:Connect(createHitbox))
-				ProjectileHitbox:Clean(entitylib.Events.EntityRemoving:Connect(function(ent)
-					local object = objects[ent]
-					if object then object:Destroy(); objects[ent] = nil end
-				end))
-				for _, ent in entitylib.List do createHitbox(ent) end
-			end
-		end,
-		Tooltip = 'Expands player query parts so projectile hit checks have a larger target.'
-	})
-	Expand = ProjectileHitbox:CreateSlider({
-		Name = 'Expand amount',
-		Min = 0,
-		Max = 14.4,
-		Default = 5,
-		Decimal = 10,
-		Function = function(value)
-			for _, object in objects do
-				object.Size = Vector3.new(3, 6, 3) + Vector3.one * value
-			end
-		end,
-		Suffix = function(value) return value == 1 and 'stud' or 'studs' end
-	})
-end)
 	
 run(function()
 	vape.Categories.Blatant:CreateModule({
