@@ -6835,6 +6835,17 @@ run(function()
 		end,
 		Tooltip = 'Changes ProximityPrompt interaction range and hold time'
 	})
+	Mode = PromptChanger:CreateDropdown({
+		Name = 'Mode',
+		List = {'Signal', 'Property'},
+		Tooltip = 'Signal - Fires the prompt after the adjusted delay\nProperty - Sets the HoldDuration property',
+		Function = function()
+			if PromptChanger.Enabled then
+				PromptChanger:Toggle()
+				PromptChanger:Toggle()
+			end
+		end
+	})
 	Range = PromptChanger:CreateSlider({
 		Name = 'Range',
 		Min = 1,
@@ -6848,17 +6859,6 @@ run(function()
 				for prompt in originalRanges do
 					updatePrompt(prompt)
 				end
-			end
-		end
-	})
-	Mode = PromptChanger:CreateDropdown({
-		Name = 'Mode',
-		List = {'Signal', 'Property'},
-		Tooltip = 'Signal - Fires the prompt after the adjusted delay\nProperty - Sets the HoldDuration property',
-		Function = function()
-			if PromptChanger.Enabled then
-				PromptChanger:Toggle()
-				PromptChanger:Toggle()
 			end
 		end
 	})
