@@ -47,6 +47,7 @@ local playersService = cloneref(game:GetService('Players'))
 local replicatedStorage = cloneref(game:GetService('ReplicatedStorage'))
 local inputService = cloneref(game:GetService('UserInputService'))
 local runService = cloneref(game:GetService('RunService'))
+local tweenService = cloneref(game:GetService('TweenService'))
 local coreGui = cloneref(game:GetService('CoreGui'))
 
 local lplr = playersService.LocalPlayer
@@ -405,4 +406,138 @@ run(function()
 		Default = true,
 		Tooltip = 'Claims level milestone rewards as soon as they become available.'
 	})
+end)
+
+run(function()
+	local NightmareEmote
+	local effect
+	local track
+	local connections = {}
+	local playing = false
+
+	local function clearConnections()
+		for _, connection in connections do
+			pcall(function() connection:Disconnect() end)
+		end
+		table.clear(connections)
+	end
+
+	local function stopEmote()
+		playing = false
+		clearConnections()
+		if track then
+			pcall(function() track:Stop(0.25) end)
+			track = nil
+		end
+		if effect then
+			pcall(function() effect:Destroy() end)
+			effect = nil
+		end
+	end
+
+	--[[ Mirrors the controller: every part anchored, non-collidable and out of the query
+	set, because the effect is parented to workspace and would otherwise be something the
+	game can stand on, walk into and raycast against. ]]
+	local function neutralise(model)
+		for _, descendant in model:GetDescendants() do
+			if descendant:IsA('BasePart') then
+				descendant.CanCollide = false
+				descendant.CanQuery = false
+				descendant.CanTouch = false
+				descendant.Anchored = true
+				pcall(function() bedwars.QueryUtil:setQueryIgnored(descendant, true) end)
+			end
+		end
+	end
+
+	local function spin(model, name, degrees, seconds)
+		local part = model:FindFirstChild(name)
+		if not part then return end
+		tweenService:Create(part, TweenInfo.new(seconds, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1), {
+			Orientation = part.Orientation + Vector3.new(0, degrees, 0)
+		}):Play()
+	end
+
+	local function playEmote()
+		stopEmote()
+
+		if not entitylib.isAlive then
+			notif('Pistonware', 'You have to be alive to play an emote.', 3)
+			return
+		end
+
+		local character = entitylib.character.Character
+		local humanoid = character and character:FindFirstChildOfClass('Humanoid')
+		local pivot = character and (character:FindFirstChild('LowerTorso') or entitylib.character.RootPart)
+		if not (character and humanoid and pivot) then return end
+
+		local template = replicatedStorage:FindFirstChild('Assets')
+		template = template and template:FindFirstChild('Effects')
+		template = template and template:FindFirstChild('NightmareEmote')
+		if not template then
+			notif('Pistonware', 'This place has no NightmareEmote effect to play.', 5)
+			return
+		end
+
+		playing = true
+
+		effect = template:Clone()
+		neutralise(effect)
+		effect.Parent = workspace
+		--[[ The controller drops it two studs so the ring sits at your feet rather than
+		through your waist. ]]
+		pcall(function() effect:PivotTo(pivot.CFrame + Vector3.new(0, -2, 0)) end)
+		spin(effect, 'Outer', 360, 1.5)
+		spin(effect, 'Middle', -360, 12.5)
+
+		local animator = humanoid:FindFirstChildOfClass('Animator')
+		if animator then
+			pcall(function()
+				local animation = Instance.new('Animation')
+				animation.AnimationId = 'rbxassetid://9191822700'
+				track = animator:LoadAnimation(animation)
+				track.Looped = true
+				track.Priority = Enum.AnimationPriority.Action
+				track:Play(0.2)
+			end)
+		end
+
+		--[[ Ends the way a real emote ends: the first step you take, or dying. Both are
+		checked rather than only one, because a respawn destroys the character out from
+		under the animation but leaves the effect parented to workspace forever. ]]
+		connections[#connections + 1] = humanoid:GetPropertyChangedSignal('MoveDirection'):Connect(function()
+			if playing and humanoid.MoveDirection.Magnitude > 0 then
+				stopEmote()
+			end
+		end)
+		connections[#connections + 1] = humanoid.Died:Connect(stopEmote)
+		connections[#connections + 1] = humanoid.Jumping:Connect(function(active)
+			if active then stopEmote() end
+		end)
+		connections[#connections + 1] = character.AncestryChanged:Connect(function(_, parent)
+			if not parent then stopEmote() end
+		end)
+	end
+
+	NightmareEmote = vape.Categories.Utility:CreateModule({
+		Name = 'NightmareEmote',
+		Function = function(callback)
+			if not callback then return end
+
+			playEmote()
+
+			--[[ Deferred rather than called straight from here: this IS the enable callback,
+			and toggling from inside it would re-enter the module's own state machine
+			mid-transition. One step later the enable has settled and the off is a normal
+			toggle. ]]
+			task.defer(function()
+				if NightmareEmote.Enabled then
+					NightmareEmote:Toggle()
+				end
+			end)
+		end,
+		Tooltip = 'Plays the Nightmare emote on your own client. Move to stop it.'
+	})
+
+	vape:Clean(function() stopEmote() end)
 end)
