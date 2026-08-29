@@ -412,6 +412,7 @@ run(function()
 	local NightmareEmote
 	local effect
 	local track
+	local sound
 	local connections = {}
 	local playing = false
 
@@ -428,6 +429,10 @@ run(function()
 		if track then
 			pcall(function() track:Stop(0.25) end)
 			track = nil
+		end
+		if sound then
+			pcall(function() sound:Destroy() end)
+			sound = nil
 		end
 		if effect then
 			pcall(function() effect:Destroy() end)
@@ -489,6 +494,21 @@ run(function()
 		pcall(function() effect:PivotTo(pivot.CFrame + Vector3.new(0, -2, 0)) end)
 		spin(effect, 'Outer', 360, 1.5)
 		spin(effect, 'Middle', -360, 12.5)
+
+		--[[ The emote's own soundsOnBegin entry: locker.emotes.nightmare_1_sounds_on_begin_sound,
+		which the meta marks looped -- it is a drone that runs under the whole emote, not a
+		one-shot sting, so it has to be stopped with everything else rather than left to
+		finish. Parented to the torso so it is positional and dies with the character even if
+		stopEmote never gets to run. ]]
+		pcall(function()
+			sound = Instance.new('Sound')
+			sound.Name = 'PistonwareNightmareEmote'
+			sound.SoundId = 'rbxassetid://9188182911'
+			sound.Looped = true
+			sound.Volume = 0.5
+			sound.Parent = pivot
+			sound:Play()
+		end)
 
 		local animator = humanoid:FindFirstChildOfClass('Animator')
 		if animator then
