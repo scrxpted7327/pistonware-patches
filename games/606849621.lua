@@ -7,9 +7,21 @@ local isfile = isfile or function(file)
 	local suc, res = pcall(function() return readfile(file) end)
 	return suc and res ~= nil and res ~= ''
 end
+local function pistonwareHttpGet(url, nocache, attempt)
+	local adapter = shared.PistonwareDevHttpGet
+	if type(adapter) == 'function' then
+		return adapter(url, nocache, attempt)
+	end
+	return game:HttpGet(url, nocache)
+end
 local function downloadFile(path, func)
+	local devLoader = shared.PistonwareDevLoadSource
+	if type(devLoader) == 'function' then
+		local body = devLoader(path)
+		return func and func(path) or body
+	end
 	if not isfile(path) then
-		local suc, res = pcall(function() return game:HttpGet('https://codeberg.org/pistonware/pistonware/raw/branch/main/'..select(1, path:gsub('pistonware/', '')), true) end)
+		local suc, res = pcall(function() return pistonwareHttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/'..select(1, path:gsub('pistonware/', '')), true) end)
 		if not suc or res == '404: Not Found' then error(res) end
 		if path:find('.lua') then res = '--This watermark is used to delete the file if its cached, remove it to make the file persist after vape updates.\n'..res end
 		writefile(path, res)
@@ -38,9 +50,12 @@ local whitelist = vape.Libraries.whitelist
 local prediction = vape.Libraries.prediction
 local targetinfo = vape.Libraries.targetinfo
 local sessioninfo = vape.Libraries.sessioninfo
-local vm = loadstring(downloadFile('pistonware/libraries/vm.lua'), 'vm')()
+local vmChunk = loadstring(downloadFile('pistonware/libraries/vm.lua'), 'vm')
+if not vmChunk then return end
+local vm = vmChunk()
 
 local jb = {}
+local remotes
 local InfNitro = {Enabled = false}
 local LazerGodmode = {Enabled = false}
 
@@ -154,13 +169,13 @@ run(function()
 			for _, proto in deserializedcode.protoList do
 				local stack, top, code = {}, -1, proto.code
 				for i, inst in code do
-					if inst.opcode == 4 then -- LOADN
+					if inst.opcode == 4 then --[[ LOADN ]]
 						stack[inst.A] = inst.D
-					elseif inst.opcode == 5 then -- LOADK
+					elseif inst.opcode == 5 then --[[ LOADK ]]
 						stack[inst.A] = inst.K
-					elseif inst.opcode == 6 then -- MOVE
+					elseif inst.opcode == 6 then --[[ MOVE ]]
 						stack[inst.A] = stack[inst.B]
-					elseif inst.opcode == 12 then -- GETIMPORT
+					elseif inst.opcode == 12 then --[[ GETIMPORT ]]
 						local count, import = inst.KC, getrenv()[inst.K0]
 
 						if count == 1 then
@@ -170,7 +185,7 @@ run(function()
 						elseif count == 3 then
 							stack[inst.A] = import[inst.K1][inst.K2]
 						end
-					elseif inst.opcode == 20 then -- NAMECALL
+					elseif inst.opcode == 20 then --[[ NAMECALL ]]
 						local A, B, kv = inst.A, inst.B, inst.K
 						stack[A + 1] = stack[B]
 
@@ -201,7 +216,7 @@ run(function()
 
 							returned[name] = val
 						end
-					elseif inst.opcode == 49 then -- CONCAT
+					elseif inst.opcode == 49 then --[[ CONCAT ]]
 						local s = ""
 						for i = inst.B, inst.C do
 							if type(stack[i]) ~= 'string' then continue end
@@ -358,9 +373,11 @@ run(function()
 		table.clear(remotes)
 		table.clear(jb)
 		hookfunction(fireserver, hook)
-		hookfunction(cashfunc, cashhook)
-		--restorefunction(fireserver)
-		--restorefunction(cashfunc)
+		if cashfunc and cashhook then
+			hookfunction(cashfunc, cashhook)
+		end
+		--[[ restorefunction(fireserver)
+		restorefunction(cashfunc) ]]
 	end)
 end)
 
@@ -550,7 +567,7 @@ run(function()
 		Tooltip = 'Modifies bullets to always do headshot damage & shooting through most walls.'
 	})
 end)
-	
+
 run(function()
 	local AutoArrest = {Enabled = false}
 	
@@ -789,4 +806,3 @@ run(function()
 		Tooltip = 'Enables most doors to be walked through'
 	})
 end)
-	

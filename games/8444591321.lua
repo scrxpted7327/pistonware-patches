@@ -6,6 +6,12 @@ local loadstring = function(...)
 	end
 	return res
 end
+local function runChunk(source, name)
+	local chunk = loadstring(source, name)
+	if chunk then chunk() end
+end
+local release = shared.PistonwareRelease
+local cacheReady = type(release) ~= 'table' or release.cacheReady ~= false
 local isfile = isfile or function(file)
 	local suc, res = pcall(function() 
 		return readfile(file) 
@@ -13,22 +19,24 @@ local isfile = isfile or function(file)
 	return suc and res ~= nil and res ~= ''
 end
 vape.Place = 6872274481
--- 8444591321 is the same BedWars game under a different PlaceId. The real
--- setup (shared.bedwars, services, vape libs) lives in 6872274481.lua, which
--- loads bedwars.lua itself once that's done -- loading bedwars.lua directly
--- from here skips that setup and shared.bedwars is nil when it runs.
+--[[ 8444591321 is the same BedWars game under a different PlaceId. The real
+setup (shared.bedwars, services, vape libs) lives in 6872274481.lua, which
+loads bedwars.lua itself once that's done -- loading bedwars.lua directly
+from here skips that setup and shared.bedwars is nil when it runs. ]]
 local gamePath = 'pistonware/games/6872274481.lua'
-local cached = isfile(gamePath) and readfile(gamePath) or nil
+local cached = cacheReady and isfile(gamePath) and readfile(gamePath) or nil
 if cached and cached:gsub('%s', '') ~= '' then
-	loadstring(cached, '6872274481')()
+	runChunk(cached, '6872274481')
 elseif not shared.PistonwareDeveloper then
-	-- Fetched from GitHub: only bedwars.lua lives off-repo (on GitLab), and the old host's
-	-- stale copy of this file was being downloaded twice (once to probe for existence, then
-	-- again to save it).
+	--[[ Fetched from GitHub: only bedwars.lua lives off-repo (on GitLab), and the old host's
+	stale copy of this file was being downloaded twice (once to probe for existence, then
+	again to save it). ]]
 	local content
 	for attempt = 1, 4 do
 		local suc, res = pcall(function()
-			return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/games/6872274481.lua', true)
+			local rawUrl = shared.PistonwareRawUrl
+			return type(rawUrl) == 'function' and game:HttpGet(rawUrl('games/6872274481.lua'), true)
+				or game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/main/games/6872274481.lua', true)
 		end)
 		if suc and res and res ~= '' and res ~= '404: Not Found' then
 			content = res
@@ -40,6 +48,6 @@ elseif not shared.PistonwareDeveloper then
 	end
 	if content then
 		pcall(writefile, gamePath, '--This watermark is used to delete the file if its cached, remove it to make the file persist after vape updates.\n'..content)
-		loadstring(content, '6872274481')()
+		runChunk(content, '6872274481')
 	end
 end
