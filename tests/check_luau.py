@@ -23,11 +23,17 @@ CACHE = ROOT / ".cache" / "luau"
 RELEASE_API = "https://api.github.com/repos/luau-lang/luau/releases/latest"
 SMOKE_TEMPLATE = ROOT / "tests" / "roblox_smoke.lua"
 SMOKE_SOURCES = (
+    "loader.lua",
     "main.lua",
     "NewMainScript.lua",
     "games/12011959048.lua",
     "games/6872265039.lua",
     "games/6872274481.lua",
+    "games/8444591321.lua",
+    "games/8560631822.lua",
+    "games/universal.lua",
+    "games/bedwars.lua",
+    "guis/newgui.lua",
     "libraries/drawing.lua",
     "libraries/entity.lua",
     "libraries/hash.lua",
@@ -36,6 +42,10 @@ SMOKE_SOURCES = (
 )
 REQUIRED_BINARIES = ("luau", "luau-compile")
 WARNING_DIAGNOSTIC = re.compile(r"(?:\(W\d+\)|\bwarning\b)", re.IGNORECASE)
+LOCAL_REGISTER_DIAGNOSTIC = re.compile(
+    r"(?:out of local registers|local registers.*(?:exceed|limit))",
+    re.IGNORECASE,
+)
 
 
 def binary_name(stem: str) -> str:
@@ -189,6 +199,23 @@ def run_parser(compiler: Path, files: list[Path]) -> None:
     print(f"Parsed {len(files)} Lua sources with {compiler.parent.name}.")
 
 
+def run_compiler(compiler: Path, files: list[Path]) -> None:
+    command = [str(compiler), *(str(path.relative_to(ROOT)) for path in files)]
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    output = result.stderr.strip()
+    if result.returncode:
+        if LOCAL_REGISTER_DIAGNOSTIC.search(output):
+            raise RuntimeError("Luau local-register check failed:\n" + output)
+        raise RuntimeError("Luau compile check failed:\n" + output)
+    print(f"Compiled {len(files)} Lua sources with {compiler.parent.name}.")
+
+
 def lua_quote(value: str) -> str:
     return json.dumps(value)
 
@@ -234,6 +261,11 @@ def run_smoke(runtime: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compile-only", action="store_true", help="skip the runtime smoke test")
+    parser.add_argument(
+        "--executor-compiler",
+        type=Path,
+        help="also compile all sources with an executor-compatible Luau compiler",
+    )
     args = parser.parse_args()
 
     try:
@@ -241,6 +273,12 @@ def main() -> int:
         tools = install_archive(tag, asset)
         files = source_files()
         run_parser(tools / binary_name("luau-compile"), files)
+        run_compiler(tools / binary_name("luau-compile"), files)
+        if args.executor_compiler:
+            executor_compiler = args.executor_compiler.expanduser().resolve()
+            if not executable(executor_compiler):
+                raise RuntimeError(f"executor compiler is not executable: {executor_compiler}")
+            run_compiler(executor_compiler, files)
         if not args.compile_only:
             run_smoke(tools / binary_name("luau"))
         print(f"Luau {tag} checks passed.")

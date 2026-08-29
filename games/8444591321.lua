@@ -8,7 +8,7 @@ local loadstring = function(...)
 end
 local function runChunk(source, name)
 	local chunk = loadstring(source, name)
-	if chunk then chunk() end
+	if chunk then return chunk() end
 end
 local release = shared.PistonwareRelease
 local cacheReady = type(release) ~= 'table' or release.cacheReady ~= false
@@ -26,7 +26,7 @@ from here skips that setup and shared.bedwars is nil when it runs. ]]
 local gamePath = 'pistonware/games/6872274481.lua'
 local cached = cacheReady and isfile(gamePath) and readfile(gamePath) or nil
 if cached and cached:gsub('%s', '') ~= '' then
-	runChunk(cached, '6872274481')
+	return runChunk(cached, '6872274481')
 elseif not shared.PistonwareDeveloper then
 	--[[ Fetched from GitHub: only bedwars.lua lives off-repo (on GitLab), and the old host's
 	stale copy of this file was being downloaded twice (once to probe for existence, then
@@ -48,6 +48,6 @@ elseif not shared.PistonwareDeveloper then
 	end
 	if content then
 		pcall(writefile, gamePath, '--This watermark is used to delete the file if its cached, remove it to make the file persist after vape updates.\n'..content)
-		runChunk(content, '6872274481')
+		return runChunk(content, '6872274481')
 	end
 end

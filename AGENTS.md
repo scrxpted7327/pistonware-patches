@@ -7,13 +7,6 @@ Run all tests with `python3 tests/check_luau.py` before committing or pushing.
 - Always ask for and receive explicit permission before building or applying patches, or before
   attempting an implementation or other proposed solution. Read-only inspection is allowed.
 
-## Public release boundary
-
-- Never mention any antitamper system or its implementation in public-release code,
-  documentation, changelogs, or other user-facing release artifacts.
-- Never update `AGENTS.md` on the public branch. Changes to this file are restricted to
-  private or development branches.
-
 ## BedWars payload handling
 
 - `games/bedwars.lua` is obfuscated and protected on release and production channels. If it is

@@ -235,15 +235,13 @@ function module.SolveTrajectory(origin, projectileSpeed, gravity, targetPos, tar
 		j*j + h*h + k*k
 	)
 	if solutions then
-		local posRoots = table.create(2)
-		for _, v in solutions do --[[filter out the negative roots ]]
-			if v > 0 then
-				table.insert(posRoots, v)
+		local t
+		for _, root in solutions do
+			if root > 0 and (not t or root < t) then
+				t = root
 			end
 		end
-		posRoots[1] = posRoots[1]
-		if posRoots[1] then
-			local t = posRoots[1]
+		if t then
 			local d = (h + p*t)/t
 			local e = (j + q*t - l*t*t)/t
 			local f = (k + r*t)/t

@@ -38,6 +38,10 @@ local vape = {
 	LoadGeneration = 0,
 	--[[ Modules past this index in ModuleOrder arrived after the last profile application. ]]
 	LoadedCount = 0,
+	-- Saving starts blocked and is opened by main.lua only after the complete module set and
+	-- profile have both loaded successfully. A failed boot never reaches that transition.
+	SaveBlocked = true,
+	SaveEpoch = 0,
 	Settings = {},
 	SettingToggleNotifications = {},
 	ThreadFix = setthreadidentity and true or false,
@@ -1142,6 +1146,24 @@ local function addMaid(obj)
 	end
 end
 
+local function cleanupConnection(connection)
+	if connection == nil then return end
+	if type(connection) == 'function' then
+		pcall(connection)
+		return
+	end
+
+	for _, methodName in {'Disconnect', 'disconnect', 'Destroy', 'Remove', 'DoCleaning'} do
+		local ok, method = pcall(function()
+			return connection[methodName]
+		end)
+		if ok and type(method) == 'function' then
+			pcall(method, connection)
+			return
+		end
+	end
+end
+
 local function addTooltip(gui, text, customText, visCheck)
 	if not text then return end
 
@@ -1508,20 +1530,6 @@ function vape:Load(skipgui, profile)
 		self.Categories.Profiles:ChangeValue('default', true)
 	end
 
-	--[[ The FFlags list gets the same guarantee the profile list gets above: one entry that is
-	always there. Every part of that tab -- import, export, apply -- is written against a set
-	existing to put flags in, so an install that has imported nothing would otherwise open on an
-	empty list with no obvious first move.
-
-	ChangeValue on a name the list does not hold is its ADD half, so this creates the row and,
-	through the list's own Function, pistonware/fflags and default.txt inside it. It is also
-	what the FFlags selection falls back to, which is why the list refuses to delete it.
-	Guarded on the category existing at all: Load runs against whatever LoadGUI built, and a
-	game file could be driving an older one. ]]
-	if self.Categories.FFlags and not self.Categories.FFlags:GetValue('default') then
-		self.Categories.FFlags:ChangeValue('default', true)
-	end
-
 	if isfile('pistonware/profiles/'..self.Profile..self.Place..'.txt') then
 		local mainData = loadJson('pistonware/profiles/'..self.Profile..self.Place..'.txt')
 		if not mainData then
@@ -1590,19 +1598,9 @@ function vape:Load(skipgui, profile)
 
 		self:UpdateTextGUI(true)
 	else
-		--[[
-			No file for this profile yet, so write one from the current state.
-
-			Save() opens with `if not self.Loaded then return end`, and Loaded is not assigned
-			until further down this function -- so this branch has always been a silent no-op.
-			A profile selected for the first time got no file at all, and stayed unwritten until
-			something else happened to save later.
-
-			Loaded is set to exactly the same value a few lines below; this just brings it forward
-			to the point where the branch actually needs it.
-		]]
-		self.Loaded = canSave
-		self:Save()
+		-- Creation is deferred until main.lua confirms a complete boot. Writing here would
+		-- serialize only the modules registered so far when a game payload failed or yielded.
+		self.PendingProfileCreate = canSave and true or nil
 	end
 
 	if self.Profile ~= oldProfile and skipgui then
@@ -1635,6 +1633,10 @@ function vape:Load(skipgui, profile)
 		a one-second window is not worth what flushing it costs.
 	]]
 	self.SaveNeeded = nil
+	if self.PendingProfileCreate and self:CanSave() then
+		self.PendingProfileCreate = nil
+		self:RequestSave()
+	end
 
 	--[[ isMobile, not TouchEnabled: this is the on-screen button that exists because a phone has
 	no keyboard to press the GUI bind with, and a Mac reporting touch does have one. ]]
@@ -1672,7 +1674,7 @@ function vape:Load(skipgui, profile)
 	end
 
 	--[[ `toggleData` was undeclared; return the module toggle count used by the notification. ]]
-	return toggleCount
+	return toggleCount, canSave
 end
 
 --[[
@@ -1689,7 +1691,7 @@ end
 	re-apply that used to be rejected here reverted those changes because it walked all of them.
 ]]
 function vape:LoadLate()
-	if not self.Profile then return 0 end
+	if shared.PistonwareBootFailed or not self.Profile then return 0 end
 
 	local path = 'pistonware/profiles/'..self.Profile..self.Place..'.txt'
 	if not isfile(path) then return 0 end
@@ -2854,12 +2856,6 @@ function vape:LoadGUI()
 	]]
 	local FFLAG_FOLDER = 'pistonware/fflags'
 	local fflags
-	--[[ Made once, here, rather than on the first write. The folder is where the user is told to
-	go and edit their sets by hand, and an install that has imported nothing yet would otherwise
-	send them looking for a folder that does not exist. Both calls inside are pcall'd, so an
-	executor without makefolder gets nothing rather than a failed inject. ]]
-	ensureFolder(FFLAG_FOLDER)
-
 	local function fflagPath(name)
 		return FFLAG_FOLDER..'/'..name..'.txt'
 	end
@@ -2905,14 +2901,30 @@ function vape:LoadGUI()
 		Restore = function(name)
 			selectedFFlag = name
 		end,
-		Function = function()
+		OnExpand = function()
+			-- The list is a UI affordance, not boot-critical state. Create its default row and
+			-- backing files only when the user opens the pane (or when they add/import a set).
+			if fflags and not fflags:GetValue('default') then
+				fflags:ChangeValue('default')
+				return
+			end
+			pcall(function()
+				ensureFolder(FFLAG_FOLDER)
+				for _, entry in fflags.List do
+					if type(entry) == 'table' and type(entry.Name) == 'string' and not isfile(fflagPath(entry.Name)) then
+						writeJson(fflagPath(entry.Name), {})
+					end
+				end
+			end)
+		end,
+		Function = function(_, skipGUI)
+			if skipGUI then return end
 			--[[ Every name in the list gets a file, so a set added by typing is something the user
 			can actually go and edit rather than a row that silently refers to nothing.
 
-			Wrapped, because this is no longer only a click handler: vape:Load seeds the default
-			entry through ChangeValue, which calls this, and an executor whose filesystem calls
-			are missing or restricted would take the whole load down from here. Losing the file
-			for a row costs an empty set the user can still import into. ]]
+			Wrapped because an executor whose filesystem calls are missing or restricted would take
+			the whole load down from here. Losing the file for a row costs an empty set the user can
+			still import into. ]]
 			pcall(function()
 				ensureFolder(FFLAG_FOLDER)
 				for _, entry in fflags.List do
@@ -4512,6 +4524,12 @@ function vape:LoadGUI()
 	
 	local cursorConnection
 	vape:Clean(clickgui:GetPropertyChangedSignal('Visible'):Connect(function()
+		if not clickgui.Visible then
+			tooltip.Visible = false
+			tooltip.Text = ''
+			vape.CurrentTooltip = nil
+		end
+
 		vape:UpdateGUI(vape.GUIColor.Hue, vape.GUIColor.Sat, vape.GUIColor.Value, true)
 	
 		if clickgui.Visible and inputService.MouseEnabled then
@@ -4715,10 +4733,33 @@ function vape:Remove(obj)
 	end
 end
 
-function vape:Save(newProfile)
-	if not self.Loaded then
-		return
+function vape:CanSave()
+	return self.Loaded
+		and not self.Applying
+		and not self.SaveBlocked
+		and not shared.PistonwareBootFailed
+end
+
+function vape:BlockSaving()
+	self.SaveBlocked = true
+	self.SaveNeeded = nil
+	self.SaveQueued = nil
+	self.SaveEpoch = (self.SaveEpoch or 0) + 1
+	return false
+end
+
+function vape:AllowSaving()
+	if shared.PistonwareBootFailed then return self:BlockSaving() end
+	self.SaveBlocked = nil
+	if self.PendingProfileCreate and self:CanSave() then
+		self.PendingProfileCreate = nil
+		self:RequestSave()
 	end
+	return true
+end
+
+function vape:Save(newProfile)
+	if not self:CanSave() then return false end
 
 	if self.ThreadFix then
 		setthreadidentity(8)
@@ -4767,7 +4808,7 @@ function vape:Save(newProfile)
 			self:CreateNotification('Pistonware', 'Failed to save your config, '..tostring(err), 10, 'alert')
 		end
 
-		return
+		return false
 	end
 
 	local guiSuccess, guiError = writeJson('pistonware/profiles/'..game.GameId..'.gui.txt', guiData)
@@ -4775,27 +4816,36 @@ function vape:Save(newProfile)
 
 	if guiSuccess and mainSuccess then
 		self.SaveFailed = nil
+		return true
 	elseif not self.SaveFailed then
 		self.SaveFailed = true
 		self:CreateNotification('Pistonware', 'Failed to save your config, '..tostring(guiError or mainError), 10, 'alert')
 	end
+	return false
 end
 
 function vape:RequestSave()
-	if not self.Loaded then
-		self.SaveNeeded = true
-		return
+	if not self:CanSave() then
+		--[[ A toggle made while a normal boot is still loading must survive: queue it so
+		FlushSave writes it the moment main.lua opens saving. A failed boot never writes,
+		so its intent is dropped instead of queued. ]]
+		if not shared.PistonwareBootFailed then
+			self.SaveNeeded = true
+		end
+		return false
 	end
 
 	self.SaveTime = os.clock() + 0.4
 
 	if self.SaveQueued then
-		return
+		return true
 	end
 
-	self.SaveQueued = true
+	local epoch = self.SaveEpoch or 0
+	self.SaveQueued = epoch
 
 	local function flush()
+		if self.SaveQueued ~= epoch or self.SaveEpoch ~= epoch then return end
 		if vape.ThreadFix then
 			setthreadidentity(8)
 		end
@@ -4809,23 +4859,23 @@ function vape:RequestSave()
 		self.SaveQueued = nil
 		self.SaveNeeded = nil
 
-		if self.Loaded then
+		if self:CanSave() then
 			self:Save()
 		end
 	end
 
 	task.delay(0.4, flush)
+	return true
 end
 
 -- Called by main.lua the instant saving becomes safe, so a toggle made while the payload was
 -- still loading is written then rather than waiting for a backstop tick.
 function vape:FlushSave()
-	if not self.SaveNeeded then
-		return
-	end
+	if not self:CanSave() then return false end
+	if not self.SaveNeeded then return false end
 
 	self.SaveNeeded = nil
-	self:RequestSave()
+	return self:RequestSave()
 end
 
 function vape:SaveOptions(obj)
@@ -4920,7 +4970,8 @@ function vape:SortCategories()
 end
 
 function vape:Uninject()
-	self:Save()
+	if self:CanSave() then self:Save() end
+	self:BlockSaving()
 	self.Loaded = nil
 
 	for _, module in orderedModules(self.ModuleOrder) do
@@ -4942,9 +4993,7 @@ function vape:Uninject()
 	end
 
 	for _, connection in self.Connections do
-		pcall(function()
-			connection:Disconnect()
-		end)
+		cleanupConnection(connection)
 	end
 
 	if self.ThreadFix then
@@ -5953,7 +6002,7 @@ components = {
 				end
 			end
 		
-			props.Function()
+			props.Function(value, skipGUI)
 			for _, obj in self.Objects do
 				obj:Destroy()
 			end
@@ -6170,13 +6219,16 @@ components = {
 			end
 		end
 		
-		function component:Expand()
-			self.Expanded = not self.Expanded
-			children.Visible = self.Expanded
-			arrow.Rotation = self.Expanded and 0 or 180
-			window.Size = UDim2.fromOffset(220, self.Expanded and math.min(51 + windowlist.AbsoluteContentSize.Y / scale.Scale, 611) or 45)
-			divider.Visible = children.CanvasPosition.Y > 10 and children.Visible
-		end
+			function component:Expand()
+				self.Expanded = not self.Expanded
+				children.Visible = self.Expanded
+				arrow.Rotation = self.Expanded and 0 or 180
+				window.Size = UDim2.fromOffset(220, self.Expanded and math.min(51 + windowlist.AbsoluteContentSize.Y / scale.Scale, 611) or 45)
+				divider.Visible = children.CanvasPosition.Y > 10 and children.Visible
+				if self.Expanded and props.OnExpand then
+					pcall(props.OnExpand)
+				end
+			end
 		
 		function component:GetValue(name)
 			for index, profile in self.List do
@@ -7346,7 +7398,7 @@ components = {
 				button.BackgroundColor3 = color.Light(uipallet.Main, 0.02)
 				props.Window.Visible = self.Enabled
 			else
-				props.Function()
+			props.Function()
 			end
 		end
 		
@@ -8140,7 +8192,7 @@ components = {
 		
 			if not self.Enabled then
 				for _, v in self.Connections do
-					v:Disconnect()
+					cleanupConnection(v)
 				end
 				table.clear(self.Connections)
 			end
@@ -8635,7 +8687,7 @@ components = {
 		
 			if not self.Enabled then
 				for _, v in self.Connections do
-					v:Disconnect()
+					cleanupConnection(v)
 				end
 				table.clear(self.Connections)
 			end
@@ -8824,7 +8876,7 @@ components = {
 		
 					if not callback then
 						for _, v in component.Connections do
-							v:Disconnect()
+							cleanupConnection(v)
 						end
 						table.clear(component.Connections)
 					end

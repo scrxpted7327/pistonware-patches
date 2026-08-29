@@ -1,9 +1,10 @@
 --[[ The loader is the only supported entry point: it runs the LuaArmor key gate and publishes
 script_key (which the protected bedwars.lua reads) before any of this downloads or executes.
-main.lua is re-run directly by the public queued teleport script and the GUI's reinject buttons;
-the developer queued path restores loaderdev.lua before it reaches here. All paths re-establish
-that state first, so reaching here without it means the gate was skipped. Checked before the
-uninject below, so a failed check cannot tear down a working instance on its way out. ]]
+The GUI's reinject buttons go back through the loader, and a queued teleport does the same on
+the next server; the developer queued path restores loaderdev.lua first. All paths re-establish
+that state before main.lua is reached, so reaching here without it means the gate was skipped.
+Checked before the uninject below, so a failed check cannot tear down a working instance on its
+way out. ]]
 if not shared.PistonwareAuthenticated then
 	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
 	return
@@ -293,6 +294,31 @@ local gameScriptFinished = true
 --[[ Set after the profile is applied; teleport saves are allowed only then. ]]
 local profileApplied = false
 
+-- shared survives reinjection on several executors, so every new boot owns a fresh state.
+shared.PistonwareBootFailed = nil
+shared.PistonwareBootFailure = nil
+-- vape is only assigned further down, once the GUI library chunk has run; until then there is
+-- nothing to block, and failBoot below re-applies the block once it exists.
+if vape and vape.BlockSaving then vape:BlockSaving() elseif vape then vape.SaveBlocked = true end
+
+local function failBoot(stageName, err)
+	if not shared.PistonwareBootFailed then
+		shared.PistonwareBootFailed = true
+		shared.PistonwareBootFailure = {
+			stage = tostring(stageName or 'unknown'),
+			error = tostring(err or 'unknown failure')
+		}
+	end
+	profileApplied = false
+	if vape and vape.BlockSaving then
+		vape:BlockSaving()
+	elseif vape then
+		vape.SaveBlocked = true
+		vape.SaveNeeded = nil
+	end
+	return false
+end
+
 local function finishLoading()
 	vape.Init = nil
 	--[[ shared.VapeCustomProfile is a ONE-SHOT hint for the load that immediately follows
@@ -332,12 +358,26 @@ local function finishLoading()
 		back -- deleting the user's real config. Withholding the modules is the intended
 		consequence of a refusal; deleting configs is not, so do neither here. ]]
 		if shared.PistonwareSessionRejected then
+			failBoot('bedwars.session', 'session was not authorised')
 			warn('[pistonware] session was not authorised -- leaving profiles untouched')
+			return
+		end
+		if shared.PistonwareBootFailed then return end
+		if not moduleSetComplete then
+			failBoot('modules.timeout', 'the game payload did not signal completion within 120 seconds')
+			warn('[pistonware] payload completion timed out -- profile loading and saving are blocked for this session')
 			return
 		end
 		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
 			tostring(customProfile or '<saved>'), tostring(shared.vapereload and true or false)))
-		vape:Load(nil, customProfile)
+		local loadOk, _, canSave = xpcall(function()
+			return vape:Load(nil, customProfile)
+		end, errorTrace)
+		if not loadOk or canSave == false then
+			failBoot('profile.apply', loadOk and 'profile data could not be loaded safely' or _)
+			warn('[pistonware] profile application failed -- profile saving is blocked for this session')
+			return
+		end
 		debugWarn('[pistonware] profile load returned')
 
 		--[[
@@ -355,33 +395,7 @@ local function finishLoading()
 			the only thing gating it, and vape:Load owns that flag.
 		]]
 		profileApplied = true
-
-		if not moduleSetComplete then
-			warn('[pistonware] the payload never signalled completion -- re-upload games/bedwars.lua to LuaArmor.')
-			--[[
-				The modules that were not registered in time still have their settings on disk, and
-				vape:LoadLate is what puts them on. It only touches modules that appeared AFTER the
-				profile was applied, so anything toggled by hand in the meantime is left alone.
-
-				No deadline on this watcher: it is waiting for the game script to finish, and if it
-				never does there is nothing to apply and nothing lost by still waiting.
-			]]
-			task.spawn(function()
-				repeat task.wait(1) until gameScriptFinished
-					or shared.PistonwareBedwarsLoaded
-					or not vape.Loaded
-					or shared.PistonwareSessionRejected
-
-				if vape.Loaded and not shared.PistonwareSessionRejected then
-					local applied = 0
-					pcall(function() applied = vape:LoadLate() or 0 end)
-					debugWarn(('[pistonware] payload finished late -- applied saved settings to %d further modules'):format(applied))
-					if applied > 0 then
-						pcall(function() vape:RequestSave() end)
-					end
-				end
-			end)
-		end
+		if vape.AllowSaving then vape:AllowSaving() else vape.SaveBlocked = nil end
 	end
 
 	--[[ Waits until the game script has finished registering its modules, because the profile can
@@ -439,11 +453,10 @@ local function finishLoading()
 		if teleportState == Enum.TeleportState.Failed then return end
 		if (not teleportedServers) and (not shared.VapeIndependent) then
 			teleportedServers = true
-			--[[ The public path re-runs main.lua, not the loader. The loader is a full boot --
-			duplicate-run guard, GitHub API calls for the update check, the console window, the
-			config prompt -- and any one of those bailing on the new server leaves the script
-			uninjected. A developer path restores loaderdev.lua first so its local auth seam is
-			available before main.lua loads the local BedWars payload. ]]
+			--[[ Re-enter the appropriate loader on the new server so authentication is derived
+			again. The developer path restores loaderdev.lua first so its local hookfunction seam
+			is available; the public path loads the published loader and performs the official
+			Luarmor check again. ]]
 					local teleportScript = [[
 						shared.vapereload = true
 						-- A developer teleport must restore the developer loader first. loaderdev.lua
@@ -465,24 +478,27 @@ local function finishLoading()
 									return developerChunk()
 								end
 								warn('[pistonware] queued developer loader did not compile: '..tostring(developerError))
+								return
 							else
-								warn('[pistonware] queued developer loader is unavailable; using main.lua directly')
+								warn('[pistonware] queued developer loader is unavailable; refusing to continue without its hookfunction auth seam')
+								return
 							end
 						end
 						local release = shared.PistonwareRelease
-						local cacheReady = type(release) == 'table' and release.cacheReady ~= false
-						local cached = cacheReady and isfile and isfile('pistonware/main.lua') and readfile('pistonware/main.lua')
-						if cached and cached ~= '' then
-							local chunk = loadstring(cached, 'main')
-							if chunk then chunk() end
-						else
-							local adapter = shared.PistonwareDevHttpGet
 							local ref = type(release) == 'table' and (release.sourceRef or release.branch) or 'main'
-							local url = 'https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/main.lua'
-							local source = type(adapter) == 'function' and adapter(url, true) or game:HttpGet(url, true)
-							local chunk = loadstring(source, 'main')
-							if chunk then chunk() end
-						end
+							local ok, source = pcall(function()
+								return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/loader.lua', true)
+							end)
+							if not ok or type(source) ~= 'string' or source == '' or source == '404: Not Found' then
+								warn('[pistonware] queued public loader could not be downloaded: '..tostring(source))
+								return
+							end
+							local chunk, compileError = loadstring(source, 'loader')
+							if not chunk then
+								warn('[pistonware] queued public loader did not compile: '..tostring(compileError))
+								return
+							end
+							return chunk()
 					]]
 			local currentRelease = shared.PistonwareRelease
 			if type(currentRelease) == 'table' then
@@ -497,16 +513,14 @@ local function finishLoading()
 					..', version='..string.format('%q', version)
 					..', cacheReady=true, resolved=true}\n'..teleportScript
 			end
-			--[[ Globals and shared do not survive a teleport, and the public new-server path
-			re-runs main.lua directly rather than the loader -- so the key gate's output has to
-			be re-published by hand here. The developer path carries the same state before it
-			re-enters loaderdev.lua. Without it the guard at the top of this file would reject
-			the re-injection, and bedwars.lua would be handed to loadstring with no script_key.
-			%q so a key containing a quote or backslash still produces a valid chunk. ]]
+			--[[ Globals and shared do not survive a teleport. Carry only the key candidate; the
+			appropriate loader above must validate it again before main.lua can run. Do not carry
+			PistonwareAuthenticated: that boolean is the one-line gate bypass this path used to
+			publish. %q keeps keys containing a quote or backslash valid Lua. ]]
 			local teleportKey = rawget(shared, 'PistonwareKey')
 			if type(teleportKey) == 'string' and teleportKey ~= '' then
 				local quoted = string.format('%q', teleportKey)
-				teleportScript = 'script_key = '..quoted..'\nrawset(shared, "PistonwareKey", '..quoted..')\nrawset(shared, "PistonwareAuthenticated", true)\n'..teleportScript
+				teleportScript = 'script_key = '..quoted..'\nrawset(shared, "PistonwareKey", '..quoted..')\n'..teleportScript
 			end
 			if rawget(shared, 'PistonwareDeveloper') == true then
 				teleportScript = 'rawset(shared, "PistonwareDeveloper", true)\n'..teleportScript
@@ -660,6 +674,7 @@ if not shared.VapeIndependent then
 			runChunk(downloadFile('pistonware/games/universal.lua'), 'universal')
 		end, errorTrace)
 		if not okUniversal then
+			failBoot('universal.load', universalError)
 			reportRuntimeError('universal.load', universalError, universalError)
 			warn('[pistonware] universal.lua errored while loading: '..tostring(universalError))
 		end
@@ -687,8 +702,9 @@ if not shared.VapeIndependent then
 	local function runGameScript(source, chunkname)
 		local fn, compileError = loadstring(source, chunkname)
 		if not fn then
-			gameScriptFinished = true
 			local trace = errorTrace(compileError)
+			failBoot('game.compile', trace)
+			gameScriptFinished = true
 			reportRuntimeError('game.compile', compileError, trace)
 			warn('[pistonware] '..chunkname..' did not compile: '..trace)
 			return false
@@ -723,9 +739,14 @@ if not shared.VapeIndependent then
 
 		local started = os.clock()
 		task.spawn(function()
-			local ok, err = xpcall(function()
+			local ok, result = xpcall(function()
 				return fn(table.unpack(gameArgs, 1, gameArgs.n))
 			end, errorTrace)
+			if not ok then
+				failBoot('game.execute', result)
+			elseif type(result) == 'table' and result.PistonwareBootFailure then
+				failBoot(result.stage or 'game.execute', result.error or 'game script reported an incomplete boot')
+			end
 			gameScriptFinished = true
 			--[[ Only for a payload slow enough that the split-load path actually engaged; a normal
 			game script never trips it. Keeps the real cost of protecting bedwars.lua visible
@@ -735,8 +756,8 @@ if not shared.VapeIndependent then
 				debugWarn(('[pistonware] %s finished in %.1fs -- its modules now have their saved settings'):format(chunkname, elapsed))
 			end
 			if not ok then
-				reportRuntimeError('game.execute', err, err)
-				warn('[pistonware] '..chunkname..' errored: '..tostring(err))
+				reportRuntimeError('game.execute', result, result)
+				warn('[pistonware] '..chunkname..' errored: '..tostring(result))
 			end
 		end)
 		return true
@@ -762,6 +783,10 @@ if not shared.VapeIndependent then
 			pcall(writefile, gamePath, '--This watermark is used to delete the file if its cached, remove it to make the file persist after vape updates.\n'..res)
 			gameScriptStarted = runGameScript(res, tostring(game.PlaceId))
 		end
+	end
+	if not gameScriptStarted then
+		failBoot('game.download', 'no usable game adapter could be loaded for '..tostring(game.PlaceId))
+		gameScriptFinished = true
 	end
 	finishLoading()
 else

@@ -1,3 +1,17 @@
+-- A local developer loader can temporarily hook loadstring to provide its synthetic SDK seam.
+-- Public builds must clear that cross-run hook before they ask Luarmor for the real library;
+-- otherwise the public loader would receive a fabricated KEY_VALID table from old shared state.
+do
+	local restore = type(shared) == 'table' and rawget(shared, 'PistonwareRestoreDeveloperHook') or nil
+	if type(restore) == 'function' then
+		local ok = pcall(restore)
+		if not ok or rawget(shared, 'PistonwareRestoreDeveloperHook') ~= nil then
+			warn('[pistonware] refusing public boot while a developer loadstring hook is still active')
+			return
+		end
+	end
+end
+
 local PUBLIC_BUILD = true
 
 local VERSION_SCHEMA = 1
@@ -558,18 +572,15 @@ local function joinBatch(isDone, seconds)
 end
 
 --[[
-	ONE GitHub API request per boot, shared by everything that used to make its own.
+	Resolve the branch through the small GitHub branch endpoint first. The recursive tree is an
+	optional cache/update index, not the release-verification gate: GitHub can serve valid branch
+	metadata while a recursive tree request is rate-limited or temporarily unavailable.
 
-	The loader used to spend up to four unauthenticated API calls before downloading a byte --
-	HEAD commit, recursive tree, profiles commit, profiles contents -- and main.lua spent one or
-	two more on the asset folders. Unauthenticated GitHub allows 60 requests per hour PER IP, and
-	mobile carriers put thousands of users behind a single address, so on a phone that budget is
-	routinely already gone. The symptom is not an error, because every one of these is pcall'd:
-	it is a boot that silently skips its update check and stalls on slow 403 responses first.
-
-	A recursive tree fetched by BRANCH NAME returns its own sha, so a single request answers all
-	of it -- the .lua manifest, the profiles listing, and the profiles fingerprint. The separate
-	commits call existed only to learn the sha this response already carries.
+	The loader used to treat that tree failure as proof that the branch had no release. That made
+	"branch main has no verified release" a false negative and prevented an otherwise valid boot.
+	Once the branch endpoint returns a 40-character commit, every later raw-file request is pinned
+	to that commit. A matching local marker remains the offline fallback when both metadata calls
+	are unavailable.
 ]]
 local repoTree, repoTreeTried, repoTreeDone
 local repoTreeError
@@ -588,7 +599,7 @@ local function fetchRepoTree()
 	repoTreeTried = true
 	local ok, err = pcall(function()
 		local httpService = cloneref(game:GetService('HttpService'))
-		local body = httpService:JSONDecode(game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/git/trees/'..release.branch..'?recursive=1', true))
+		local body = httpService:JSONDecode(game:HttpGet('https://api.github.com/repos/themagicpiston/pistonware/git/trees/'..(release.sourceRef or release.branch)..'?recursive=1', true))
 		if type(body) == 'table' and type(body.tree) == 'table' and type(body.sha) == 'string' then
 			repoTree = body
 			--[[ Handed to main.lua so its asset prefetch reads this instead of spending its own
@@ -619,6 +630,36 @@ local function validCommit(value)
 	return type(value) == 'string' and #value == 40 and value:match('^%x+$') ~= nil
 end
 
+local branchCommit, branchCommitTried, branchCommitDone
+local branchCommitError
+local function fetchBranchCommit()
+	if branchCommitTried then
+		if not branchCommitDone then
+			joinBatch(function() return branchCommitDone end, 30)
+		end
+		return branchCommit
+	end
+	branchCommitTried = true
+	local ok, err = pcall(function()
+		local httpService = cloneref(game:GetService('HttpService'))
+		local body = httpService:JSONDecode(game:HttpGet(
+			'https://api.github.com/repos/themagicpiston/pistonware/branches/'..release.branch, true))
+		local commit = type(body) == 'table' and type(body.commit) == 'table' and body.commit.sha
+		if validCommit(commit) then
+			branchCommit = commit
+		else
+			branchCommitError = 'branch metadata did not contain a verified commit'
+		end
+	end)
+	if not ok then
+		branchCommitError = safeText(err)
+		logger:warn('version.branch', 'could not resolve the selected branch', {error = branchCommitError, branch = release.branch})
+		telemetry:report('loader_error', branchCommitError, {stage = 'version.branch', fatal = false})
+	end
+	branchCommitDone = true
+	return branchCommit
+end
+
 local function markerMatches(marker)
 	return type(marker) == 'table'
 		and marker.schema == VERSION_SCHEMA
@@ -629,16 +670,34 @@ end
 
 local function resolveRelease()
 	local marker = readReleaseMarker()
+	local commit = fetchBranchCommit()
+	if validCommit(commit) then
+		release.commit = commit
+		release.sourceRef = commit
+		release.version = release.channel..'@'..commit:sub(1, 12)
+		release.resolved = true
+		release.cacheReady = markerMatches(marker) and marker.commit == commit
+			or false
+		shared.PistonwareRelease = release
+		logger:info('version.resolved', 'release selected', {
+			channel = release.channel,
+			branch = release.branch,
+			version = release.version,
+			cache = release.cacheReady and 'ready' or 'refresh'
+		})
+		return true
+	end
+	-- Keep the recursive tree as a compatibility fallback for hosts or API proxies that do not
+	-- expose /branches/:name but do still expose git/trees/:name.
 	local tree = fetchRepoTree()
 	if tree and validCommit(tree.sha) then
 		release.commit = tree.sha
 		release.sourceRef = tree.sha
 		release.version = release.channel..'@'..tree.sha:sub(1, 12)
 		release.resolved = true
-		release.cacheReady = markerMatches(marker) and marker.commit == tree.sha
-			or false
+		release.cacheReady = markerMatches(marker) and marker.commit == tree.sha or false
 		shared.PistonwareRelease = release
-		logger:info('version.resolved', 'release selected', {
+		logger:info('version.resolved', 'release selected from the repository tree', {
 			channel = release.channel,
 			branch = release.branch,
 			version = release.version,
@@ -659,7 +718,7 @@ local function resolveRelease()
 		})
 		return true
 	end
-	return false, repoTreeError or ('branch '..release.branch..' has no verified release')
+	return false, branchCommitError or repoTreeError or ('branch '..release.branch..' has no verified release')
 end
 
 local function persistReleaseMarker()
@@ -1901,7 +1960,7 @@ do
 	assignments cost nothing and remove the whole failure class.
 
 	shared.PistonwareKey is the copy main.lua re-embeds into its queued teleport script:
-	globals do not survive a teleport, and the new server re-runs main.lua directly. ]]
+	globals do not survive a teleport, and the new server re-runs the appropriate loader. ]]
 	local function authenticate(key)
 		script_key = key
 		pcall(function() getgenv().script_key = key end)

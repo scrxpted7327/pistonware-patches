@@ -1204,6 +1204,8 @@ run(function()
 	local Chance
 	local Overlay = OverlapParams.new()
 	Overlay.FilterType = Enum.RaycastFilterType.Include
+	local entityFilter = {}
+	local reachRandom = Random.new()
 	local modified = {}
 	
 	Reach = vape.Categories.Combat:CreateModule({
@@ -1215,20 +1217,20 @@ run(function()
 					tool = tool and tool:FindFirstChildWhichIsA('TouchTransmitter', true)
 					if tool then
 						if Mode.Value == 'TouchInterest' then
-							local entities = {}
+							table.clear(entityFilter)
 							for _, v in entitylib.List do
 								if v.Targetable then
 									if not Targets.Players.Enabled and v.Player then continue end
 									if not Targets.NPCs.Enabled and v.NPC then continue end
-									table.insert(entities, v.Character)
+								entityFilter[#entityFilter + 1] = v.Character
 								end
 							end
-	
-							Overlay.FilterDescendantsInstances = entities
+			
+							Overlay.FilterDescendantsInstances = entityFilter
 							local parts = workspace:GetPartBoundsInBox(tool.Parent.CFrame * CFrame.new(0, 0, Value.Value / 2), tool.Parent.Size + Vector3.new(0, 0, Value.Value), Overlay)
-	
+			
 							for _, v in parts do
-								if Random.new().NextNumber(Random.new(), 0, 100) > Chance.Value then
+								if reachRandom:NextNumber(0, 100) > Chance.Value then
 									task.wait(0.2)
 									break
 								end
@@ -1249,6 +1251,7 @@ run(function()
 					task.wait()
 				until not Reach.Enabled
 			else
+				table.clear(entityFilter)
 				for i, v in modified do
 					i.Size = v
 					i.Massless = false
@@ -1312,25 +1315,30 @@ run(function()
 	RaycastWhitelist.FilterType = Enum.RaycastFilterType.Include
 	local ProjectileRaycast = RaycastParams.new()
 	ProjectileRaycast.RespectCanCollide = true
+	local targetQuery = {}
+	local ignoreRay = {}
+	local projectileFilter = {}
+	local whitelistFilter = {}
+	local defaultIgnoredScripts = {'ControlScript', 'ControlModule'}
 	local fireoffset, rand, delayCheck = CFrame.identity, Random.new(), tick()
 	local oldnamecall, oldray
 
 	local function getTarget(origin, obj)
 		if rand.NextNumber(rand, 0, 100) > (AutoFire.Enabled and 100 or HitChance.Value) then return end
 		local targetPart = (rand.NextNumber(rand, 0, 100) < (AutoFire.Enabled and 100 or HeadshotChance.Value)) and 'Head' or 'RootPart'
-		local ent = entitylib['Entity'..Mode.Value]({
-			Range = Range.Value,
-			Wallcheck = Target.Walls.Enabled and (obj or true) or nil,
-			Part = targetPart,
-			Origin = origin,
-			Players = Target.Players.Enabled,
-			NPCs = Target.NPCs.Enabled
-		})
+		targetQuery.Range = Range.Value
+		targetQuery.Wallcheck = Target.Walls.Enabled and (obj or true) or nil
+		targetQuery.Part = targetPart
+		targetQuery.Origin = origin
+		targetQuery.Players = Target.Players.Enabled
+		targetQuery.NPCs = Target.NPCs.Enabled
+		local ent = entitylib['Entity'..Mode.Value](targetQuery)
 
 		if ent then
 			targetinfo.Targets[ent] = tick() + 1
 			if Projectile.Enabled then
-				ProjectileRaycast.FilterDescendantsInstances = {gameCamera, ent.Character}
+				projectileFilter[1], projectileFilter[2], projectileFilter[3] = gameCamera, ent.Character, nil
+				ProjectileRaycast.FilterDescendantsInstances = projectileFilter
 				ProjectileRaycast.CollisionGroup = ent[targetPart].CollisionGroup
 			end
 		end
@@ -1340,7 +1348,8 @@ run(function()
 
 	local Hooks = {
 		FindPartOnRayWithIgnoreList = function(args)
-			local ent, targetPart, origin = getTarget(args[1].Origin, {args[2]})
+			ignoreRay[1], ignoreRay[2] = args[2], nil
+			local ent, targetPart, origin = getTarget(args[1].Origin, ignoreRay)
 			if not ent then return end
 			if Wallbang.Enabled then
 				return {targetPart, targetPart.Position, targetPart.GetClosestPointOnSurface(targetPart, origin), targetPart.Material}
@@ -1353,7 +1362,8 @@ run(function()
 			if not ent then return end
 			args[2] = CFrame.lookAt(origin, targetPart.Position).LookVector * args[2].Magnitude
 			if Wallbang.Enabled then
-				RaycastWhitelist.FilterDescendantsInstances = {targetPart}
+				whitelistFilter[1], whitelistFilter[2] = targetPart, nil
+				RaycastWhitelist.FilterDescendantsInstances = whitelistFilter
 				args[3] = RaycastWhitelist
 			end
 		end,
@@ -1399,7 +1409,7 @@ run(function()
 						local calling = getcallingscript()
 
 						if calling then
-							local list = #IgnoredScripts.ListEnabled > 0 and IgnoredScripts.ListEnabled or {'ControlScript', 'ControlModule'}
+							local list = #IgnoredScripts.ListEnabled > 0 and IgnoredScripts.ListEnabled or defaultIgnoredScripts
 							if table.find(list, tostring(calling)) then
 								return oldray(origin, direction)
 							end
@@ -1420,7 +1430,7 @@ run(function()
 
 						local calling = getcallingscript()
 						if calling then
-							local list = #IgnoredScripts.ListEnabled > 0 and IgnoredScripts.ListEnabled or {'ControlScript', 'ControlModule'}
+							local list = #IgnoredScripts.ListEnabled > 0 and IgnoredScripts.ListEnabled or defaultIgnoredScripts
 							if table.find(list, tostring(calling)) then
 								return oldnamecall(...)
 							end
@@ -1442,14 +1452,13 @@ run(function()
 
 					if AutoFire.Enabled then
 						local origin = AutoFireMode.Value == 'Camera' and gameCamera.CFrame or entitylib.isAlive and entitylib.character.RootPart.CFrame or CFrame.identity
-						local ent = entitylib['Entity'..Mode.Value]({
-							Range = Range.Value,
-							Wallcheck = Target.Walls.Enabled or nil,
-							Part = 'Head',
-							Origin = (origin * fireoffset).Position,
-							Players = Target.Players.Enabled,
-							NPCs = Target.NPCs.Enabled
-						})
+						targetQuery.Range = Range.Value
+						targetQuery.Wallcheck = Target.Walls.Enabled or nil
+						targetQuery.Part = 'Head'
+						targetQuery.Origin = (origin * fireoffset).Position
+						targetQuery.Players = Target.Players.Enabled
+						targetQuery.NPCs = Target.NPCs.Enabled
+						local ent = entitylib['Entity'..Mode.Value](targetQuery)
 
 						if mouse1click and (isrbxactive or iswindowactive)() then
 							if ent and canClick() then
@@ -2595,6 +2604,7 @@ run(function()
 							targetQuery.NPCs = npcsEnabled
 							targetQuery.Limit = maxTargets
 							targetQuery.Output = targetsBuffer
+							targetQuery.Cache = true
 							entitylib.AllPosition(targetQuery)
 						else
 							local rangeSq = swingRange * swingRange
@@ -2641,10 +2651,11 @@ run(function()
 								hit.Check = distance > attackRange and BoxSwingColor or BoxAttackColor
 								targetinfo.Targets[v] = now + 1
 
-								if AttackDelay < now then
-									AttackDelay = now + (1 / CPS.GetRandomValue())
-									tool:Activate()
-								end
+				if AttackDelay < now then
+					AttackDelay = now + (1 / CPS.GetRandomValue())
+					entitylib.Performance:RecordKillauraSwing(v, os.clock())
+					tool:Activate()
+				end
 
 								if Lunge.Enabled and tool.GripUp.X == 0 then break end
 								if distance > attackRange then continue end
@@ -5366,12 +5377,21 @@ run(function()
 	local Texture
 	local Rots = {}
 	local models = {}
+	local modelGeneration = 0
 	
-	local function addMesh(ent)
+	local function addMesh(ent, generation)
+		if generation and generation ~= modelGeneration then return end
+		if not (PlayerModel and PlayerModel.Enabled) then return end
 		if vape.ThreadFix then 
 			setthreadidentity(8)
 		end
 		local root = ent.RootPart
+		if not (root and root.Parent) then return end
+		local previous = models[root]
+		if previous then
+			pcall(function() previous:Destroy() end)
+			models[root] = nil
+		end
 		local part = Instance.new('Part')
 		part.Size = Vector3.new(3, 3, 3)
 		part.CFrame = root.CFrame * CFrame.Angles(math.rad(Rots[1].Value), math.rad(Rots[2].Value), math.rad(Rots[3].Value))
@@ -5402,19 +5422,34 @@ run(function()
 		Name = 'PlayerModel',
 		Function = function(callback)
 			if callback then 
+				modelGeneration += 1
+				local generation = modelGeneration
 				if Local.Enabled then 
-					PlayerModel:Clean(entitylib.Events.LocalAdded:Connect(addMesh))
+					PlayerModel:Clean(entitylib.Events.LocalAdded:Connect(function(ent)
+						addMesh(ent, generation)
+					end))
 					PlayerModel:Clean(entitylib.Events.LocalRemoved:Connect(removeMesh))
 					if entitylib.isAlive then 
-						task.spawn(addMesh, entitylib.character)
+						task.spawn(function()
+							if generation == modelGeneration and PlayerModel.Enabled then
+								addMesh(entitylib.character, generation)
+							end
+						end)
 					end
 				end
-				PlayerModel:Clean(entitylib.Events.EntityAdded:Connect(addMesh))
+				PlayerModel:Clean(entitylib.Events.EntityAdded:Connect(function(ent)
+					addMesh(ent, generation)
+				end))
 				PlayerModel:Clean(entitylib.Events.EntityRemoved:Connect(removeMesh))
 				for _, ent in entitylib.List do 
-					task.spawn(addMesh, ent)
+					task.spawn(function()
+						if generation == modelGeneration and PlayerModel.Enabled then
+							addMesh(ent, generation)
+						end
+					end)
 				end
 			else
+				modelGeneration += 1
 				for _, part in models do 
 					part:Destroy()
 				end
@@ -5764,72 +5799,6 @@ run(function()
 end)
 
 run(function()
-	local MotionBlur
-	local Strength
-	local blur
-	local connection
-	local ownedBlur = false
-	local originalSize
-
-	local function updateBlur()
-		if not (blur and blur.Parent and Strength) then return end
-		local character = lplr.Character
-		local root = character and character:FindFirstChild('HumanoidRootPart')
-		local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
-		local horizontal = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-		blur.Size = math.clamp(horizontal / 30 * Strength.Value, 0, Strength.Value)
-	end
-
-	local function removeBlur()
-		if connection then
-			pcall(function() connection:Disconnect() end)
-			connection = nil
-		end
-		if blur then
-			if ownedBlur then
-				pcall(function() blur:Destroy() end)
-			elseif originalSize then
-				pcall(function() blur.Size = originalSize end)
-			end
-		end
-		blur = nil
-		ownedBlur = false
-		originalSize = nil
-	end
-
-	MotionBlur = vape.Categories.Render:CreateModule({
-		Name = 'MotionBlur',
-		Function = function(callback)
-			if not callback then
-				removeBlur()
-				return
-			end
-
-			removeBlur()
-			blur = lightingService:FindFirstChild('PistonwareMotionBlur')
-			if not (blur and blur:IsA('BlurEffect')) then
-				blur = Instance.new('BlurEffect')
-				blur.Name = 'PistonwareMotionBlur'
-				blur.Parent = lightingService
-				ownedBlur = true
-			else
-				originalSize = blur.Size
-			end
-			blur.Size = 0
-			connection = runService.RenderStepped:Connect(updateBlur)
-		end,
-		Tooltip = 'Adds a velocity-based camera blur while moving.'
-	})
-	Strength = MotionBlur:CreateSlider({
-		Name = 'Strength',
-		Min = 0,
-		Max = 24,
-		Default = 8,
-		Function = updateBlur
-	})
-end)
-
-run(function()
 	local SessionInfo
 	local FontOption
 	local Hide
@@ -6026,7 +5995,294 @@ run(function()
 	infostroke.Parent = infoholder
 	addBlur(infoholder)
 end)
-	
+
+if shared.PistonwareDeveloper == true then
+	run(function()
+		local KillauraInfo
+		local FontOption
+		local TextSize
+		local BorderColor
+		local Title
+		local TitleOffset
+		local infoholder
+		local infolabel
+		local infostroke
+		local lifecycle = 0
+		local activeRun
+
+		local function stopRun(run)
+			if not run or run.Cleaned then return end
+			run.Cleaned = true
+			if activeRun == run then
+				activeRun = nil
+			end
+			lifecycle += 1
+
+			local thread = run.Thread
+			if thread and thread ~= coroutine.running() and coroutine.status(thread) ~= 'dead' then
+				pcall(task.cancel, thread)
+			end
+
+			local performance = run.Performance
+			if performance then
+				pcall(function()
+					performance:StopDiagnostics()
+				end)
+				pcall(function()
+					performance:SetKillauraTelemetry(false)
+				end)
+				if run.WasPerformanceEnabled ~= nil then
+					pcall(function()
+						performance:SetEnabled(run.WasPerformanceEnabled)
+					end)
+				end
+			end
+			run.Thread = nil
+			run.Performance = nil
+			run.WasPerformanceEnabled = nil
+
+			if infolabel then infolabel.Text = '' end
+			if infoholder then infoholder.Visible = false end
+		end
+
+		local function getKillaura()
+			local modules = vape.Modules
+			return modules and modules.Killaura
+		end
+
+		local function formatMilliseconds(value)
+			return type(value) == 'number' and value >= 0 and string.format('%.1f ms', value * 1000) or '--'
+		end
+
+		local function formatPing(value)
+			return type(value) == 'number' and value >= 0 and string.format('%.0f ms', value) or '--'
+		end
+
+		local function formatRate(value)
+			return type(value) == 'number' and string.format('%.2f/s', value) or '--'
+		end
+
+		local function formatCount(value)
+			return type(value) == 'number' and tostring(math.floor(value + 0.5)) or '--'
+		end
+
+		local function formatPercent(value)
+			return type(value) == 'number' and string.format('%.1f%%', value * 100) or '--'
+		end
+
+		local function formatMemory(value)
+			return type(value) == 'number' and string.format('%.0f MB', value) or '--'
+		end
+
+		local function formatAge(now, timestamp)
+			return type(timestamp) == 'number' and string.format('%.1fs ago', math.max(now - timestamp, 0)) or '--'
+		end
+
+		local function getTargetName(target)
+			if not target then return 'none' end
+			local name
+			pcall(function()
+				if type(target) == 'table' and target.Player then
+					name = target.Player.DisplayName or target.Player.Name
+				else
+					name = target.Name
+				end
+			end)
+			return removeTags(tostring(name or 'target'))
+		end
+
+		KillauraInfo = vape:CreateOverlay({
+			-- Keep this category name stable so existing developer profiles continue to load.
+			Name = 'Killaura Info',
+			Icon = getcustomasset('pistonware/assets/new/targetinfo.png'),
+			Size = UDim2.fromOffset(16, 12),
+			Position = UDim2.fromOffset(12, 110),
+			CategorySize = 240,
+			Function = function(callback)
+				if not callback then
+					stopRun(activeRun)
+					return
+				end
+
+				stopRun(activeRun)
+				lifecycle += 1
+				local currentLifecycle = lifecycle
+				local performance = entitylib.Performance
+				local run = {
+					Performance = performance,
+					WasPerformanceEnabled = performance:IsEnabled(),
+					Thread = coroutine.running()
+				}
+				activeRun = run
+				KillauraInfo:Clean(function()
+					stopRun(run)
+				end)
+
+					performance:SetEnabled(true)
+					performance:SetKillauraTelemetry(true)
+					performance:StartDiagnostics()
+
+					local previousStats = performance:Snapshot()
+					local previousStatsAt = os.clock()
+					if infoholder then infoholder.Visible = true end
+
+					repeat
+						local now = os.clock()
+						local currentStats = performance:Snapshot()
+						local statsElapsed = math.max(now - previousStatsAt, 0.001)
+						local function statRate(name)
+							return math.max((currentStats[name] or 0) - (previousStats[name] or 0), 0) / statsElapsed
+						end
+						local cacheHits = statRate('TargetCacheHits')
+						local cacheRefreshes = statRate('TargetCacheRefreshes')
+						local cacheTotal = cacheHits + cacheRefreshes
+						local cacheRatio = cacheTotal > 0 and string.format('%.1f%%', cacheHits / cacheTotal * 100) or '--'
+						local scanRate = statRate('TargetScans')
+						local candidateRate = statRate('TargetCandidates')
+						local raycastRate = statRate('Raycasts')
+						local updateRate = statRate('EntityUpdates')
+						previousStats = currentStats
+						previousStatsAt = now
+
+						local telemetry = performance:KillauraSnapshot(now)
+						local diagnostics = performance:DiagnosticsSnapshot(now)
+						local killaura = getKillaura()
+						local status = killaura and (killaura.Enabled and 'ON' or 'OFF') or 'UNAVAILABLE'
+						local render = diagnostics.Render
+						local heartbeat = diagnostics.Heartbeat
+						local ping = diagnostics.Ping
+						local spikes = diagnostics.Spikes
+						local corrections = diagnostics.Corrections
+						local lines = {}
+						local showTitle = not Title or Title.Enabled
+						if showTitle then
+							lines[#lines + 1] = TitleOffset and TitleOffset.Enabled and '<b>Developer Diagnostics</b>\n<font size="4"> </font>' or '<b>Developer Diagnostics</b>'
+						end
+						lines[#lines + 1] = 'Killaura: '..status..' | Target: '..getTargetName(telemetry.LastTarget)
+						lines[#lines + 1] = 'Attempts: '..formatCount(telemetry.SwingCount)..' | Confirmed: '..formatCount(telemetry.ConfirmedCount)..' | Pending: '..formatCount(telemetry.PendingCount)
+						lines[#lines + 1] = 'Expired: '..formatCount(telemetry.ExpiredCount)..' | Dropped: '..formatCount(telemetry.DroppedCount)
+						lines[#lines + 1] = 'Finalized hit ratio: '..formatPercent(telemetry.Accuracy)..' | provisional '..formatPercent(telemetry.ProvisionalAccuracy)
+						lines[#lines + 1] = 'Hit rate: '..formatRate(telemetry.HitRate)..' rolling 5s | Swing rate: '..formatRate(telemetry.SwingRate)
+						lines[#lines + 1] = 'Hit gap: '..formatMilliseconds(telemetry.AverageHitGap)..' avg | Swing gap: '..formatMilliseconds(telemetry.AverageSwingGap)..' avg'
+						lines[#lines + 1] = 'Confirm source: matched adapter event | Telemetry uptime: '..string.format('%.1fs', telemetry.Elapsed or 0)
+						if diagnostics.Enabled then
+							lines[#lines + 1] = 'Render FPS: '..formatCount(render.Fps)..' | 1% low: '..formatCount(render.Low1PercentFps)
+							lines[#lines + 1] = 'Frame: '..formatMilliseconds(render.FrameAverage)..' avg | '..formatMilliseconds(render.FrameP95)..' p95 | '..formatMilliseconds(render.FrameMax)..' max'
+							lines[#lines + 1] = 'Heartbeat: '..formatMilliseconds(heartbeat.Average)..' avg | '..formatMilliseconds(heartbeat.P95)..' p95 | '..formatMilliseconds(heartbeat.Max)..' max'
+							lines[#lines + 1] = 'Ping: '..formatPing(ping.Current)..' now | '..formatPing(ping.Average)..' avg | '..formatPing(ping.P95)..' p95 | jitter '..formatPing(ping.Jitter)
+							lines[#lines + 1] = 'Spikes/10s: render '..formatCount(spikes.Render)..' | heartbeat '..formatCount(spikes.Heartbeat)..' | ping '..formatCount(spikes.Network)
+							lines[#lines + 1] = 'Last spikes: render '..formatMilliseconds(spikes.LastRender)..' | heartbeat '..formatMilliseconds(spikes.LastHeartbeat)..' | ping '..formatPing(spikes.LastNetwork)
+							lines[#lines + 1] = 'Samples: render '..formatCount(render.Samples)..' | heartbeat '..formatCount(heartbeat.Samples)..' | ping '..formatCount(ping.Samples)
+							lines[#lines + 1] = 'Correction signals: '..formatCount(corrections.Count)..' total | '..formatCount(corrections.Recent)..' recent | '..(corrections.LastReason or 'none')..' ('..formatAge(now, corrections.LastAt)..')'
+							lines[#lines + 1] = 'Memory: '..formatMemory(diagnostics.Memory)
+						else
+							lines[#lines + 1] = 'Diagnostics sampler: unavailable'
+						end
+						lines[#lines + 1] = 'Targeting/s: scan '..formatRate(scanRate)..' | candidates '..formatRate(candidateRate)..' | raycast '..formatRate(raycastRate)
+						lines[#lines + 1] = 'Cache: '..cacheRatio..' hit | entity updates '..formatRate(updateRate)
+
+						infolabel.Text = table.concat(lines, '\n')
+						infolabel.FontFace = FontOption.Value
+						infolabel.TextSize = TextSize.Value
+						local size = getfontsize(removeTags(infolabel.Text), infolabel.TextSize, infolabel.FontFace)
+						infoholder.Size = UDim2.fromOffset(math.max(420, math.min(size.X + 16, 640)), size.Y + (showTitle and TitleOffset and TitleOffset.Enabled and 4 or 16))
+						task.wait(0.25)
+					until lifecycle ~= currentLifecycle or not KillauraInfo.Button or not KillauraInfo.Button.Enabled
+
+				if activeRun == run then
+					stopRun(run)
+				end
+			end
+		})
+		FontOption = KillauraInfo:CreateFont({
+			Name = 'Font',
+			Blacklist = 'Arial'
+		})
+		KillauraInfo:CreateColorSlider({
+			Name = 'Background Color',
+			DefaultValue = 0,
+			DefaultOpacity = 0.5,
+			Function = function(hue, sat, val, opacity)
+				if infoholder then
+					infoholder.BackgroundColor3 = Color3.fromHSV(hue, sat, val)
+					infoholder.BackgroundTransparency = 1 - opacity
+				end
+			end
+		})
+		BorderColor = KillauraInfo:CreateColorSlider({
+			Name = 'Border Color',
+			Function = function(hue, sat, val, opacity)
+				if infostroke then
+					infostroke.Color = Color3.fromHSV(hue, sat, val)
+					infostroke.Transparency = 1 - opacity
+				end
+			end,
+			Darker = true,
+			Visible = false
+		})
+		TextSize = KillauraInfo:CreateSlider({
+			Name = 'Text Size',
+			Min = 1,
+			Max = 30,
+			Default = 16
+		})
+		Title = KillauraInfo:CreateToggle({
+			Name = 'Title',
+			Function = function(callback)
+				if TitleOffset and TitleOffset.Object then
+					TitleOffset.Object.Visible = callback
+				end
+			end,
+			Default = true
+		})
+		TitleOffset = KillauraInfo:CreateToggle({
+			Name = 'Offset',
+			Default = true,
+			Darker = true
+		})
+		KillauraInfo:CreateToggle({
+			Name = 'Border',
+			Function = function(callback)
+				if infostroke then infostroke.Enabled = callback end
+				if BorderColor and BorderColor.Object then BorderColor.Object.Visible = callback end
+			end
+		})
+		infoholder = Instance.new('Frame')
+		infoholder.BackgroundColor3 = Color3.new()
+		infoholder.BackgroundTransparency = 0.5
+		infoholder.Parent = KillauraInfo.Children
+		vape:Clean(KillauraInfo.Children:GetPropertyChangedSignal('AbsolutePosition'):Connect(function()
+			if vape.ThreadFix then
+				setthreadidentity(8)
+			end
+			local newside = KillauraInfo.Children.AbsolutePosition.X > (vape.gui.AbsoluteSize.X / 2)
+			infoholder.Position = UDim2.fromScale(newside and 1 or 0, 0)
+			infoholder.AnchorPoint = Vector2.new(newside and 1 or 0, 0)
+		end))
+		local infocorner = Instance.new('UICorner')
+		infocorner.CornerRadius = UDim.new(0, 5)
+		infocorner.Parent = infoholder
+		infolabel = Instance.new('TextLabel')
+		infolabel.Size = UDim2.new(1, -16, 1, -16)
+		infolabel.Position = UDim2.fromOffset(8, 8)
+		infolabel.BackgroundTransparency = 1
+		infolabel.TextXAlignment = Enum.TextXAlignment.Left
+		infolabel.TextYAlignment = Enum.TextYAlignment.Top
+		infolabel.TextSize = 16
+		infolabel.TextColor3 = Color3.new(1, 1, 1)
+		infolabel.TextStrokeColor3 = Color3.new()
+		infolabel.TextStrokeTransparency = 0.8
+		infolabel.Font = Enum.Font.Arial
+		infolabel.RichText = true
+		infolabel.Parent = infoholder
+		infostroke = Instance.new('UIStroke')
+		infostroke.Enabled = false
+		infostroke.Color = Color3.fromHSV(0.44, 1, 1)
+		infostroke.Parent = infoholder
+		addBlur(infoholder)
+	end)
+end
+
 run(function()
 	local Tracers
 	local Targets
