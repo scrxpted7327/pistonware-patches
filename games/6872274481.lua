@@ -468,6 +468,13 @@ local function getSpeed()
     return _baseGetSpeed()
 end
 
+--[[ The same reading with nothing layered on top -- straight past whatever DamageBoost wrapped
+around it. Speed's Legit mode uses this so the top-up is measured against the speed the server
+believes you have rather than one the boost inflated. ]]
+local function rawGetSpeed()
+    return _baseGetSpeed()
+end
+
 local function getTableSize(tab)
 	local ind = 0
 	for _ in tab do
@@ -517,6 +524,44 @@ local function hotbarSwitch(slot)
 		return true
 	end
 	return false
+end
+
+--[[ The kit to SHOW for a player, and the icon for it.
+
+Two separate problems lived in the one line this replaces:
+
+  * PlayingAsKit (singular) is the older attribute. The live one is PlayingAsKits, a comma
+    separated LIST -- kit-util's getKitArrayFromCommaSeparatedString is a plain string.split
+    on ',' because a player can be on more than one kit at once. Reading only the singular
+    meant the nametag icon was blank for anyone the game describes the modern way.
+  * BedwarsKitMeta[kit].renderImage was indexed with no nil guard, so any value without a
+    meta entry -- an unknown kit, a combined string, a renamed id after an update -- was a
+    hard error raised inside the nametag loop rather than a missing icon.
+
+The first non-empty entry is the one to show: KitController:getPrimaryActiveKit is exactly
+getActiveKits()[1]. ]]
+local function getKitRenderImage(plr)
+	if not plr then return '' end
+
+	local kit = plr:GetAttribute('PlayingAsKits')
+	if type(kit) == 'string' and kit ~= '' then
+		local primary
+		for _, name in string.split(kit, ',') do
+			if name ~= '' then
+				primary = name
+				break
+			end
+		end
+		kit = primary
+	else
+		kit = nil
+	end
+
+	kit = kit or plr:GetAttribute('PlayingAsKit')
+	if not kit or kit == '' or kit == 'none' then return '' end
+
+	local meta = bedwars.BedwarsKitMeta and bedwars.BedwarsKitMeta[kit]
+	return (meta and meta.renderImage) or ''
 end
 
 local function isFriend(plr, recolor)
@@ -2046,6 +2091,12 @@ run(function()
 		end,
 		HudAliveCount = require(lplr.PlayerScripts.TS.controllers.global['top-bar'].ui.game['hud-alive-player-counts']).HudAlivePlayerCounts,
 		ItemMeta = debug.getupvalue(require(replicatedStorage.TS.item['item-meta']).getItemMeta, 1),
+		-- Wanted by SkinChanger. Paths taken from where the game's own controllers import
+		-- them (armor-item-skin-util for the meta, battle-pass-rewards for the id table).
+		ItemSkinType = require(replicatedStorage.TS.games.bedwars['item-skin']['item-skin-types']).ItemSkinType,
+		BedwarsKitSkin = require(replicatedStorage.TS.games.bedwars['kit-skin']['bedwars-kit-skin']).BedwarsKitSkin,
+		BedwarsKitSkinMeta = require(replicatedStorage.TS.games.bedwars['kit-skin']['bedwars-kit-skin-meta']).BedwarsKitSkinMeta,
+		getItemSkinMeta = require(replicatedStorage.TS.games.bedwars['item-skin']['item-skin-meta']).getItemSkinMeta,
 		KillEffectMeta = require(replicatedStorage.TS.locker['kill-effect']['kill-effect-meta']).KillEffectMeta,
 		KillFeedController = Flamework.resolveDependency('client/controllers/game/kill-feed/kill-feed-controller@KillFeedController'),
 		Knit = Knit,
@@ -4279,6 +4330,7 @@ end)
 	
 run(function()
 	local Speed
+	local Mode
 	local Value
 	local WallCheck
 	local AutoJump
@@ -4304,7 +4356,13 @@ run(function()
 						local state = hum:GetState()
 						if state == Enum.HumanoidStateType.Climbing then return end
 
-						local root, velo = char.RootPart, getSpeed()
+						--[[ getSpeed() is the wrapped one -- DamageBoost adds its boost on top of
+						the real walk speed, and this module spends whatever it reports. So on
+						Blatant a hit that boosts you also makes Speed carry you further, on top
+						of the boost itself. Legit reads the unwrapped figure instead, which is
+						the speed the server thinks you have. ]]
+						local root = char.RootPart
+						local velo = (Mode.Value == 'Legit' and rawGetSpeed or getSpeed)()
 						local moveDirection = AntiFallDirection or hum.MoveDirection
 						local destination = (moveDirection * math.max(Value.Value - velo, 0) * dt)
 
@@ -4334,6 +4392,13 @@ run(function()
 			return 'Heatseeker'
 		end,
 		Tooltip = 'Speeds you up. Pick whichever method works best for you.'
+	})
+	--[[ First in the list because it changes what the slider below is measured against. ]]
+	Mode = Speed:CreateDropdown({
+		Name = 'Mode',
+		List = {'Blatant', 'Legit'},
+		Default = 'Blatant',
+		Tooltip = 'Legit ignores the DamageBoost speed boost when working out how\nmuch to top you up. Blatant spends it.'
 	})
 	Value = Speed:CreateSlider({
 		Name = 'Speed',
@@ -4669,6 +4734,61 @@ run(function()
     })
 end)
 
+--[[ The game's own nametags, and who wants them gone.
+
+They are drawn by NametagController.addGameNametag -- the only thing that builds one, since
+the game turns Roblox's own Humanoid display off (NameDisplayDistance = 0) and calls this for
+every entity, players and mobs alike.
+
+Two modules want them out of the way now. FPS Boost has always had a toggle for it, and
+NameTags needs it as well: ours draws the same name and the same health in the same place, so
+with the game's still up you get both, one on top of the other. That is what the doubled text
+and the stray coloured icon beside each name were -- the icon is the game's, not ours (ours
+cannot be drawn at the left of the text: positionIcons is the only thing that ever makes one
+visible, and it sets the position in the same breath).
+
+Ref-counted rather than a plain flag, because two owners would otherwise fight: turning FPS
+Boost off would hand the game's tags back while NameTags was still drawing its own, and the
+doubling would return with no obvious cause. ]]
+local gameNametagHiders = {}
+local oldAddGameNametag
+
+local function hideGameNametags(owner)
+    gameNametagHiders[owner] = true
+
+    local controller = bedwars.NametagController
+    if not (controller and bedwars.AppController) then return end
+    if oldAddGameNametag then return end
+
+    oldAddGameNametag = controller.addGameNametag
+    controller.addGameNametag = function() end
+    for _, v in bedwars.AppController:getOpenApps() do
+        if tostring(v):find('Nametag') then
+            bedwars.AppController:closeApp(tostring(v))
+        end
+    end
+end
+
+--[[ Puts the builder back and re-runs it over everything currently tagged as an entity, since
+the tags closed above will not come back on their own until that character is re-tagged (i.e.
+respawns). addGameNametag bails on its own for anyone whose tag is already open, so this fills
+the gaps without doubling anybody up, and it still honours NoNametag / shouldShowNametag. ]]
+local function showGameNametags(owner)
+    gameNametagHiders[owner] = nil
+    if next(gameNametagHiders) ~= nil then return end
+
+    local controller = bedwars.NametagController
+    if not (controller and oldAddGameNametag) then return end
+
+    controller.addGameNametag = oldAddGameNametag
+    oldAddGameNametag = nil
+    for _, char in collectionService:GetTagged('entity') do
+        pcall(function()
+            controller:addGameNametag(char)
+        end)
+    end
+end
+
 run(function()
 	local NameTags
 	local Targets
@@ -4678,6 +4798,7 @@ run(function()
 	local Health
 	local Distance
 	local Equipment
+	local ShowKit
 	local Rank
 	local Enchant
 	local Device
@@ -4730,8 +4851,17 @@ run(function()
 	unaffected, and with both showing they sit flush against each other -- the same
 	30px step the equipment row above uses, so the two rows line up. ]]
 	local ICON_SIZE = 30
-	local rightIcons = {'RankIcon', 'EnchantIcon'}
-	local function positionIcons(nametag, width)
+	--[[ Kit leads the row: it is the thing you read first about a player, and it used to be
+	stranded up in the equipment strip a whole row above the name. These sit INLINE with the
+	text instead, which is what the rest of this row has always done. ]]
+	local rightIcons = {'Kit', 'RankIcon', 'EnchantIcon'}
+
+	--[[ `height` is the nametag's own pixel height, so the icons scale with the tag instead
+	of staying pinned at 30px. That was the other half of the mismatch: the text follows the
+	Scale slider and a fixed 30 did not, so the icons drifted out of line with the tag the
+	moment Scale moved off 1. Sized to the tag and sitting at y = 0, they are flush with it. ]]
+	local function positionIcons(nametag, width, height)
+		local iconSize = height or ICON_SIZE
 		local offset = width + 10
 		for _, name in rightIcons do
 			local icon = nametag:FindFirstChild(name)
@@ -4739,8 +4869,9 @@ run(function()
 				local shown = icon.Image ~= ''
 				icon.Visible = shown
 				if shown then
-					icon.Position = UDim2.fromOffset(offset, -4)
-					offset += ICON_SIZE
+					icon.Size = UDim2.fromOffset(iconSize, iconSize)
+					icon.Position = UDim2.fromOffset(offset, 0)
+					offset += iconSize
 				end
 			end
 		end
@@ -4802,6 +4933,32 @@ run(function()
 		end)
 	end
 
+	--[[ Green at full, red at none -- and never a throw.
+
+	MaxHealth is not always a usable number at the moment a tag is built: an entity can reach
+	the builder a frame before its Humanoid is populated, and 0 or nil there made this divide
+	nan or throw outright. That took the whole build down with it, and since Reference[ent] is
+	only assigned on the very last line of the build, the entity ended up with no tag AND no
+	way to get one -- which is what "sometimes they just do not appear" was.
+
+	Falling back to full health draws a tag that is briefly the wrong colour; the next update
+	corrects it. A missing tag does not correct itself. ]]
+	local function tagHealthColor(ent)
+		local maxHealth = ent.MaxHealth
+		local fraction = 1
+
+		if type(maxHealth) == 'number' and maxHealth > 0 then
+			fraction = (ent.Health or maxHealth) / maxHealth
+		end
+
+		-- clamp does not tame a nan, and Color3.fromHSV throws on one
+		if fraction ~= fraction then
+			fraction = 1
+		end
+
+		return Color3.fromHSV(math.clamp(fraction, 0, 1) / 2.5, 0.89, 0.75)
+	end
+
 	local deviceEmojis = {gamepad = '🎮', touch = '📱', keyboard = '🖥️'}
 
 	local function getDeviceEmoji(plr)
@@ -4853,7 +5010,7 @@ run(function()
 				end
 
 				if Health.Enabled then
-					local healthColor = Color3.fromHSV(math.clamp(ent.Health / ent.MaxHealth, 0, 1) / 2.5, 0.89, 0.75)
+					local healthColor = tagHealthColor(ent)
 					Strings[ent] = Strings[ent]..' <font color="rgb('..tostring(math.floor(healthColor.R * 255))..','..tostring(math.floor(healthColor.G * 255))..','..tostring(math.floor(healthColor.B * 255))..')">'..math.round(ent.Health)..'</font>'
 				end
 
@@ -4861,8 +5018,11 @@ run(function()
 					Strings[ent] = '<font color="rgb(85, 255, 85)">[</font><font color="rgb(255, 255, 255)">%s</font><font color="rgb(85, 255, 85)">]</font> '..Strings[ent]
 				end
 
+				--[[ Kit is no longer one of these. It is not equipment -- it does not change
+				as they swap items -- and it now has its own toggle and its own slot beside the
+				name. The four that are left keep the exact offsets they always had. ]]
 				if Equipment.Enabled then
-					for i, v in {'Hand', 'Helmet', 'Chestplate', 'Boots', 'Kit'} do
+					for i, v in {'Hand', 'Helmet', 'Chestplate', 'Boots'} do
 						local Icon = Instance.new('ImageLabel')
 						Icon.Name = v
 						Icon.Size = UDim2.fromOffset(30, 30)
@@ -4878,6 +5038,19 @@ run(function()
 				local size = getfontsize(removeTags(Strings[ent]), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
 				nametag.Name = ent.Player and ent.Player.Name or ent.Character.Name
 				nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
+
+				--[[ Same shape as the Rank and Enchant icons below: no Position and no Size
+				here, because positionIcons owns the layout and setting either now would flash
+				the icon at a slot and a scale it may not end up at. ]]
+				if ShowKit.Enabled and ent.Player then
+					local Icon = Instance.new('ImageLabel')
+					Icon.Name = 'Kit'
+					Icon.Size = UDim2.fromOffset(ICON_SIZE, ICON_SIZE)
+					Icon.BackgroundTransparency = 1
+					Icon.Image = getKitRenderImage(ent.Player)
+					Icon.Visible = false
+					Icon.Parent = nametag
+				end
 
 				--[[ Rank Icon: sits immediately to the right of the text, so it has to be
 				built after the text has been measured ]]
@@ -4907,8 +5080,8 @@ run(function()
 					watchEnchant(ent)
 				end
 
-				--[[ after both right-side icons exist, so each lands at its own slot ]]
-				positionIcons(nametag, size.X)
+				--[[ after every right-side icon exists, so each lands at its own slot ]]
+				positionIcons(nametag, size.X, size.Y + 7)
 
 				nametag.AnchorPoint = Vector2.new(0.5, 1)
 				nametag.BackgroundColor3 = Color3.new()
@@ -5000,11 +5173,57 @@ run(function()
 		end
 	}
 	
+	--[[ Whether this entity table has been superseded.
+
+	entitylib hands a player a NEW entity table when their character is replaced, and the old
+	one can still be sitting in entitylib.List with a RootPart that is still parented -- the
+	previous character, wherever it was left. A tag built against that table renders at that
+	position, which is how two tags for the same player ended up on screen with one of them
+	parked in the sky.
+
+	Only a DIFFERENT live entity counts as superseded. getEntity comes back nil for a moment
+	while a player is dead, and treating that as stale would tear a tag down and build it again
+	a second later, every death, for everyone. ]]
+	local function supersededEntity(ent)
+		local plr = ent.Player
+		if not plr then return false end
+
+		local live = entitylib.getEntity(plr)
+		return live ~= nil and live ~= ent
+	end
+
+	--[[ A tag that is missing gets rebuilt here rather than staying missing.
+
+	Added assigns Reference[ent] on its very last line, so anything that throws part way
+	through the build -- and the whole build sits under a pcall -- leaves that entity with no
+	tag and no way back: both Updated paths bailed on a nil Reference, and the render loop
+	only ever drops entries. One bad frame while a character streamed in and that player had
+	no nametag for the rest of the round.
+
+	EntityUpdated fires constantly (health, equipment), so this costs a table lookup on the
+	common path and repairs the rare one within moments. Added re-applies the Targets and
+	Teammates filters itself, so an entity that is deliberately untagged stays untagged. ]]
+	local function rebuildTag(ent, method)
+		local existing = Reference[ent]
+		if existing then
+			Removed[method](ent)
+		end
+
+		Added[method](ent)
+		return Reference[ent] ~= nil
+	end
+
 	local Updated = {
 		Normal = function(ent)
 			pcall(function()
 				local nametag = Reference[ent]
-				if not nametag or not nametag.Parent then return end
+
+				-- Parent as well as existence: the label is dropped by the render loop when
+				-- its container goes, and that left the entity in the same dead end
+				if not nametag or not nametag.Parent then
+					rebuildTag(ent, 'Normal')
+					return
+				end
 				
 				if vape.ThreadFix then
 					setthreadidentity(8)
@@ -5020,7 +5239,7 @@ run(function()
 				end
 
 				if Health.Enabled then
-					local healthColor = Color3.fromHSV(math.clamp(ent.Health / ent.MaxHealth, 0, 1) / 2.5, 0.89, 0.75)
+					local healthColor = tagHealthColor(ent)
 					Strings[ent] = Strings[ent]..' <font color="rgb('..tostring(math.floor(healthColor.R * 255))..','..tostring(math.floor(healthColor.G * 255))..','..tostring(math.floor(healthColor.B * 255))..')">'..math.round(ent.Health)..'</font>'
 				end
 
@@ -5029,13 +5248,20 @@ run(function()
 				end
 
 				if Equipment.Enabled and store.inventories[ent.Player] and nametag:FindFirstChild("Hand") then
-					local kit = ent.Player:GetAttribute('PlayingAsKit')
 					local inventory = store.inventories[ent.Player]
 					nametag.Hand.Image = bedwars.getIcon(inventory.hand or {itemType = ''}, true)
 					nametag.Helmet.Image = bedwars.getIcon(inventory.armor[4] or {itemType = ''}, true)
 					nametag.Chestplate.Image = bedwars.getIcon(inventory.armor[5] or {itemType = ''}, true)
 					nametag.Boots.Image = bedwars.getIcon(inventory.armor[6] or {itemType = ''}, true)
-					nametag.Kit.Image = kit and kit ~= 'none' and bedwars.BedwarsKitMeta[kit].renderImage or ''
+				end
+
+				-- FindFirstChild, not an index: the icon only exists when the toggle was on at
+				-- the moment this tag was built.
+				if ShowKit.Enabled and ent.Player then
+					local icon = nametag:FindFirstChild('Kit')
+					if icon then
+						icon.Image = getKitRenderImage(ent.Player)
+					end
 				end
 
 				if Rank.Enabled and ent.Player then
@@ -5054,14 +5280,17 @@ run(function()
 
 				local size = getfontsize(removeTags(Strings[ent]), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
 				nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
-				positionIcons(nametag, size.X)
+				positionIcons(nametag, size.X, size.Y + 7)
 				nametag.Text = Strings[ent]
 			end)
 		end,
 		Drawing = function(ent)
 			pcall(function()
 				local nametag = Reference[ent]
-				if not nametag then return end
+				if not nametag then
+					rebuildTag(ent, 'Drawing')
+					return
+				end
 				
 				if vape.ThreadFix then
 					setthreadidentity(8)
@@ -5139,27 +5368,50 @@ run(function()
 						continue
 					end
 					
+					--[[ THIS is why tags froze on screen.
+
+					The whole loop used to sit under one pcall. An entity whose RootPart had gone --
+					died, streamed out, character swapped -- threw on `ent.RootPart.Position`, and
+					that one throw abandoned the rest of the frame. Every tag after it in the
+					iteration kept the Position and the Visible it was last given, so they hung
+					wherever they had been drawn while the players they belonged to walked away. It
+					repeated every frame for as long as the dead entity stayed in Reference, which is
+					until its label is destroyed -- so it never cleared on its own.
+
+					A missing RootPart is now just a hidden tag. The entry is deliberately LEFT in
+					Reference: Removed is what destroys the label, and it finds it through this
+					very table, so clearing it here would orphan the TextLabel under Folder for
+					the rest of the round. entitylib will report the entity properly soon enough
+					and the real cleanup happens there. ]]
+					local root = ent.RootPart
+					if not (root and root.Parent) then
+						nametag.Visible = false
+						continue
+					end
+
+					local rootPos = root.Position
+
 					if DistanceCheck.Enabled then
-						local distance = selfPos and (selfPos - ent.RootPart.Position).Magnitude or math.huge
+						local distance = selfPos and (selfPos - rootPos).Magnitude or math.huge
 						if distance < DistanceLimit.ValueMin or distance > DistanceLimit.ValueMax then
 							nametag.Visible = false
 							continue
 						end
 					end
 
-					local headPos, headVis = gameCamera:WorldToViewportPoint(ent.RootPart.Position + Vector3.new(0, ent.HipHeight + 1, 0))
+					local headPos, headVis = gameCamera:WorldToViewportPoint(rootPos + Vector3.new(0, ent.HipHeight + 1, 0))
 					nametag.Visible = headVis
 					if not headVis then
 						continue
 					end
 
 					if Distance.Enabled then
-						local mag = selfPos and math.floor((selfPos - ent.RootPart.Position).Magnitude) or 0
+						local mag = selfPos and math.floor((selfPos - rootPos).Magnitude) or 0
 						if Sizes[ent] ~= mag then
 							nametag.Text = string.format(Strings[ent], mag)
-						local size = getfontsize(removeTags(nametag.Text), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
-						nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
-						positionIcons(nametag, size.X)
+							local size = getfontsize(removeTags(nametag.Text), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
+							nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
+							positionIcons(nametag, size.X, size.Y + 7)
 							Sizes[ent] = mag
 						end
 					end
@@ -5213,6 +5465,11 @@ run(function()
 		Name = 'NameTags',
 		Function = function(callback)
 			if callback then
+				--[[ Ours replaces the game's rather than sitting on top of it. Same name,
+				same health, same spot -- with both up the text renders twice and the game's
+				own icon shows up beside it. ]]
+				hideGameNametags('nametags')
+
 				methodused = DrawingToggle.Enabled and 'Drawing' or 'Normal'
 				if Removed[methodused] then
 					NameTags:Clean(entitylib.Events.EntityRemoved:Connect(Removed[methodused]))
@@ -5264,7 +5521,53 @@ run(function()
 					watchDevice(plr)
 				end
 				NameTags:Clean(playersService.PlayerAdded:Connect(watchDevice))
+
+				--[[ A repair sweep, because "no tag was ever created" has several causes and
+				every one of them looks identical from here.
+
+				The one that bites on loading into a match is the Teammates filter. Entities
+				are added while team assignment is still replicating, so ent.Targetable reads
+				false for that moment and Added turns them away -- and nothing re-runs Added,
+				so those players stay bare for the whole round. An EntityAdded that arrives
+				while the list is being rebuilt lands in exactly the same dead end, as does a
+				build that threw part way through.
+
+				EntityUpdated repairs a tag the moment anything about that entity changes, but
+				a player standing still across the map may not fire one for a long time, so
+				the list is walked on a slow timer as well. Anything already tagged is skipped
+				outright, so a full sweep is a handful of table lookups. ]]
+				task.spawn(function()
+					while NameTags.Enabled do
+						task.wait(1)
+						if not NameTags.Enabled then break end
+
+						pcall(function()
+							--[[ Prune first. A tag whose entity has been replaced has to go
+							before the replacement is tagged, or the player carries two. ]]
+							for ent in Reference do
+								if supersededEntity(ent) then
+									Removed[methodused](ent)
+								end
+							end
+
+							for _, ent in entitylib.List do
+								if Reference[ent] then continue end
+
+								--[[ Never build against a superseded table, and never against
+								one whose character has gone -- the tag would sit wherever that
+								character was last seen rather than over anybody. ]]
+								local root = ent.RootPart
+								if not (root and root.Parent) then continue end
+								if supersededEntity(ent) then continue end
+
+								rebuildTag(ent, methodused)
+							end
+						end)
+					end
+				end)
 			else
+				showGameNametags('nametags')
+
 				if Removed[methodused] then
 					for i in Reference do
 						Removed[methodused](i)
@@ -5363,6 +5666,16 @@ run(function()
 				NameTags:Toggle()
 			end
 		end
+	})
+	ShowKit = NameTags:CreateToggle({
+		Name = 'Show Kit',
+		Function = function()
+			if NameTags.Enabled then
+				NameTags:Toggle()
+				NameTags:Toggle()
+			end
+		end,
+		Tooltip = 'Puts their kit icon next to the nametag'
 	})
 	Rank = NameTags:CreateToggle({
 		Name = 'Show Rank',
@@ -7383,6 +7696,7 @@ run(function()
 		Min = 1,
 		Max = 18,
 		Default = 18,
+		Darker = true,
 		Suffix = function(val)
 			return val == 1 and 'stud' or 'studs'
 		end,
@@ -7406,6 +7720,7 @@ run(function()
 		Max = 18,
 		Default = 7.5,
 		Decimal = 10,
+		Darker = true,
 		Suffix = function(val)
 			return val == 1 and 'stud' or 'studs'
 		end,
@@ -7419,6 +7734,7 @@ run(function()
 		-- not: the stash aged out on the way home and there was nothing left to bank.
 		Default = 10,
 		Decimal = 10,
+		Darker = true,
 		Suffix = function(val) return 's' end,
 		Tooltip = 'Only deposits loot taken this recently.'
 	})
@@ -9089,42 +9405,13 @@ run(function()
 	local Nametags
 	local effects, util = {}, {}
 
-	--[[ The game's own nametag builder, stashed the first time we stub it so disable can
-	put it back. This is the ONLY thing that builds a character nametag -- the game
-	turns Roblox's own Humanoid name display off (NameDisplayDistance = 0,
-	DisplayDistanceType = None) and then calls this for every entity, players and
-	mobs alike -- so stubbing it and never restoring it left the session with no
-	nametags on anyone until a rejoin, whatever the module's knob said. ]]
-	local oldAddGameNametag
-
+	-- Shared with NameTags, and ref-counted there: see hideGameNametags above
 	local function removeGameNametags()
-		local controller = bedwars.NametagController
-		if not (controller and bedwars.AppController) then return end
-		if oldAddGameNametag then return end
-		oldAddGameNametag = controller.addGameNametag
-		controller.addGameNametag = function() end
-		for _, v in bedwars.AppController:getOpenApps() do
-			if tostring(v):find('Nametag') then
-				bedwars.AppController:closeApp(tostring(v))
-			end
-		end
+		hideGameNametags('fpsboost')
 	end
 
-	--[[ Puts the builder back and re-runs it over everything currently tagged as an
-	entity, since the tags we closed above won't come back on their own until that
-	character is re-tagged (i.e. respawns). addGameNametag bails on its own for
-	anyone whose tag is already open, so this fills in the gaps without doubling
-	anybody up, and it still honours NoNametag / shouldShowNametag. ]]
 	local function restoreGameNametags()
-		local controller = bedwars.NametagController
-		if not (controller and oldAddGameNametag) then return end
-		controller.addGameNametag = oldAddGameNametag
-		oldAddGameNametag = nil
-		for _, char in collectionService:GetTagged('entity') do
-			pcall(function()
-				controller:addGameNametag(char)
-			end)
-		end
+		showGameNametags('fpsboost')
 	end
 
 	FPSBoost = vape.Legit:CreateModule({
