@@ -796,25 +796,57 @@ run(function()
 			plr.CharacterRemoving:Connect(function(char)
 				entitylib.removeEntity(char, plr == lplr)
 			end),
-			plr:GetAttributeChangedSignal('Team'):Connect(function()
-				for _, v in entitylib.List do
-					if v.Targetable ~= entitylib.targetCheck(v) then
-						entitylib.refreshEntity(v.Character, v.Player)
-					end
-				end
+			--[[ BedWars keeps the team on an ATTRIBUTE, and it lands AFTER the entity does.
+			The game's own controllers sit in `while Attribute == nil do task.wait(1) end`
+			loops waiting for it, so every entity is necessarily built with the team still
+			unknown and Targetable comes out wrong. This signal is what corrects them, and it
+			is the only thing that does -- the library's own refresh watches the Team PROPERTY,
+			which bedwars never sets.
 
+			It used to correct them by REBUILDING, and all three ways it did that were wrong.
+
+			refreshEntity removes from entitylib.List with a swap-remove, and this loop was
+			iterating that same list: the entity swapped down into the slot just visited was
+			skipped, so an arbitrary subset of players kept a stale Targetable -- a different
+			subset every match, which is why Priority Only worked in some games and hid
+			everybody in others.
+
+			entitylib.start() tore down and rebuilt the entire library whenever the LOCAL
+			player's team landed, which is a thing that happens every single match. start()
+			re-registers only its three default connections, so the CollectionService hooks
+			this file installs for drones, guardians and training dummies were disconnected
+			and never came back: NPC tracking died the moment your own team arrived.
+
+			And every rebuild replaces every entity table, orphaning whatever the modules had
+			keyed to the old ones -- nametags included.
+
+			None of that is needed. The team is the only thing that changed, so re-run the
+			check in place and fire EntityUpdated, which is exactly what updateEntity does
+			everywhere else in the library. It also keeps Friend/Target and the raycast filter
+			in step, which the hand-rolled version above did not. ]]
+			plr:GetAttributeChangedSignal('Team'):Connect(function()
+				-- your own team flips everybody's standing; anyone else's flips only theirs
 				if plr == lplr then
-					entitylib.start()
+					for _, v in entitylib.List do
+						entitylib.updateEntity(v, true)
+					end
 				else
-					entitylib.refreshEntity(plr.Character, plr)
+					local ent = entitylib.getEntity(plr)
+					if ent then
+						entitylib.updateEntity(ent, true)
+					end
 				end
 			end)
 		}
 	end
 
+	--[[ Same thread-tracking rule as the library's own addEntity, for the same reason:
+	a build that finishes without yielding -- which is every character that is already
+	streamed in -- would otherwise leave a dead thread in EntityThreads, and the next
+	removeEntity would throw on the cancel instead of firing EntityRemoved. ]]
 	entitylib.addEntity = function(char, plr, teamfunc)
 		if not char then return end
-		entitylib.EntityThreads[char] = task.spawn(function()
+		local builder = task.spawn(function()
 			local hum, humrootpart, head
 			if plr then
 				hum = waitForChildOfType(char, 'Humanoid', 10)
@@ -922,6 +954,10 @@ run(function()
 			end
 			entitylib.EntityThreads[char] = nil
 		end)
+
+		if coroutine.status(builder) ~= 'dead' then
+			entitylib.EntityThreads[char] = builder
+		end
 	end
 
 	entitylib.getUpdateConnections = function(ent)
@@ -4809,10 +4845,14 @@ run(function()
 	local DistanceCheck
 	local DistanceLimit
 	local Strings, Sizes, Reference = {}, {}, {}
+
 	local Folder
 	
 	pcall(function()
 		Folder = Instance.new('Folder')
+		-- Named so NameHider can find it: it ignores vape's own GUI by default, and these
+		-- labels are full of player names
+		Folder.Name = 'NameTags'
 		Folder.Parent = vape.gui
 	end)
 	
@@ -4959,6 +4999,23 @@ run(function()
 		return Color3.fromHSV(math.clamp(fraction, 0, 1) / 2.5, 0.89, 0.75)
 	end
 
+	--[[ NameHider, applied before the name is ever drawn.
+
+	It also watches these labels from the outside, but that is a race this module can simply
+	not enter: it knows the name at the moment it builds the string, so it can hide it there.
+	Doing it here also survives the distance rewrite in the render loop, which puts the whole
+	original string back on the label every time the number changes.
+
+	Reads the function fresh each time rather than caching it, so turning NameHider off takes
+	effect on the next tag without either module knowing about the other. ]]
+	local function hideNames(text)
+		local hide = genv.PistonwareHideName
+		if type(hide) ~= 'function' then return text end
+
+		local ok, res = pcall(hide, text)
+		return (ok and type(res) == 'string') and res or text
+	end
+
 	local deviceEmojis = {gamepad = '🎮', touch = '📱', keyboard = '🖥️'}
 
 	local function getDeviceEmoji(plr)
@@ -4991,16 +5048,39 @@ run(function()
 		return name ~= '' and deviceEmojis.keyboard or nil
 	end
 
+	--[[ Whether this entity should carry a tag at all.
+
+	This is the upstream filter, unchanged: ent.Targetable is entitylib's own answer to
+	"is this someone I am against", and ent.Friend covers a whitelisted player on the
+	other team. What was wrong was never the rule -- it was that Targetable had stopped
+	tracking the truth.
+
+	entitylib decides Targetable through targetCheck, which for bedwars compares the Team
+	ATTRIBUTE, but the only thing that asked it to look again was a listener on the Team
+	PROPERTY, which bedwars never sets. So Targetable was fixed at the instant the entity
+	was built -- before the team had replicated, for most of them -- and stayed wrong for
+	the rest of the match. addPlayer now refreshes on the attribute instead, so this is a
+	live answer again and the workaround that used to live here is gone.
+
+	Declared HERE, above Added, on purpose. The previous version sat below it, so both
+	call sites resolved the name as a global instead of an upvalue and read nil: with
+	Priority Only on, every single tag build threw on the call and was swallowed by the
+	pcall around it. That is the whole of "nametags only work with Priority Only off". ]]
+	local function passesFilter(ent)
+		if not Targets.Players.Enabled and ent.Player then return false end
+		if not Targets.NPCs.Enabled and ent.NPC then return false end
+		if Teammates.Enabled and (not ent.Targetable) and (not ent.Friend) then return false end
+		return true
+	end
+
 	local Added = {
 		Normal = function(ent)
 			pcall(function()
-				if not Targets.Players.Enabled and ent.Player then return end
-				if not Targets.NPCs.Enabled and ent.NPC then return end
-				if Teammates.Enabled and (not ent.Targetable) and (not ent.Friend) then return end
+				if not passesFilter(ent) then return end
 				if Reference[ent] then return end --[[ Prevent duplicates ]]
 
 				local nametag = Instance.new('TextLabel')
-				Strings[ent] = ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name
+				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				if Device.Enabled and ent.Player then
 					local emoji = getDeviceEmoji(ent.Player)
@@ -5097,9 +5177,7 @@ run(function()
 		end,
 		Drawing = function(ent)
 			pcall(function()
-				if not Targets.Players.Enabled and ent.Player then return end
-				if not Targets.NPCs.Enabled and ent.NPC then return end
-				if Teammates.Enabled and (not ent.Targetable) and (not ent.Friend) then return end
+				if not passesFilter(ent) then return end
 				if Reference[ent] then return end
 
 				local nametag = {}
@@ -5112,7 +5190,7 @@ run(function()
 				nametag.Text.Size = 15 * Scale.Value
 				nametag.Text.Font = 0
 				nametag.Text.ZIndex = 2
-				Strings[ent] = ent.Player and whitelist:tag(ent.Player, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name
+				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				--[[ Drawing text only; the rank icon needs an ImageLabel, which this render
 				path has no equivalent for ]]
@@ -5188,8 +5266,21 @@ run(function()
 		local plr = ent.Player
 		if not plr then return false end
 
-		local live = entitylib.getEntity(plr)
-		return live ~= nil and live ~= ent
+		--[[ Compared against the player's OWN Character rather than asked of entitylib.
+
+		entitylib.getEntity is called with a character instance everywhere else in this file,
+		so handing it a Player was never going to come back with anything -- which made this
+		return false for everybody and pruned nothing. Duplicate tags for one player, at three
+		different places on screen, were the result.
+
+		Player.Character is the authority on which character is current, and an entity table
+		built around a previous one is by definition finished. ]]
+		local live = plr.Character
+		local mine = ent.Character
+
+		-- live is nil for a moment while they are dead; treating that as stale would tear
+		-- every tag down and rebuild it on every death
+		return live ~= nil and mine ~= nil and mine ~= live
 	end
 
 	--[[ A tag that is missing gets rebuilt here rather than staying missing.
@@ -5216,6 +5307,21 @@ run(function()
 	local Updated = {
 		Normal = function(ent)
 			pcall(function()
+				--[[ The filter is re-asked here, which the upstream module has no need to do.
+
+				Targetable now genuinely CHANGES during a round -- addPlayer refreshes it when
+				the Team attribute lands and fires this very event -- so a tag can become owed
+				to somebody who was correctly skipped a moment ago, and owed by somebody who
+				was correctly given one. Both directions are handled from the same place the
+				change is announced, which is why the retry sweep that used to sit in the
+				module loop is gone. ]]
+				if not passesFilter(ent) then
+					if Reference[ent] then
+						Removed['Normal'](ent)
+					end
+					return
+				end
+
 				local nametag = Reference[ent]
 
 				-- Parent as well as existence: the label is dropped by the render loop when
@@ -5229,7 +5335,7 @@ run(function()
 					setthreadidentity(8)
 				end
 				Sizes[ent] = nil
-				Strings[ent] = ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name
+				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				if Device.Enabled and ent.Player then
 					local emoji = getDeviceEmoji(ent.Player)
@@ -5286,6 +5392,21 @@ run(function()
 		end,
 		Drawing = function(ent)
 			pcall(function()
+				--[[ The filter is re-asked here, which the upstream module has no need to do.
+
+				Targetable now genuinely CHANGES during a round -- addPlayer refreshes it when
+				the Team attribute lands and fires this very event -- so a tag can become owed
+				to somebody who was correctly skipped a moment ago, and owed by somebody who
+				was correctly given one. Both directions are handled from the same place the
+				change is announced, which is why the retry sweep that used to sit in the
+				module loop is gone. ]]
+				if not passesFilter(ent) then
+					if Reference[ent] then
+						Removed['Drawing'](ent)
+					end
+					return
+				end
+
 				local nametag = Reference[ent]
 				if not nametag then
 					rebuildTag(ent, 'Drawing')
@@ -5296,7 +5417,7 @@ run(function()
 					setthreadidentity(8)
 				end
 				Sizes[ent] = nil
-				Strings[ent] = ent.Player and whitelist:tag(ent.Player, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name
+				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				if Device.Enabled and ent.Player then
 					local emoji = getDeviceEmoji(ent.Player)
@@ -5311,11 +5432,6 @@ run(function()
 
 				if Distance.Enabled then
 					Strings[ent] = '[%s] '..Strings[ent]
-					nametag.Text.Text = entitylib.isAlive and string.format(Strings[ent], math.floor((entitylib.character.RootPart.Position - ent.RootPart.Position).Magnitude)) or Strings[ent]
-				else
-					nametag.Text.Text = Strings[ent]
-				end
-				if Distance.Enabled then
 					nametag.Text.Text = entitylib.isAlive and string.format(Strings[ent], math.floor((entitylib.character.RootPart.Position - ent.RootPart.Position).Magnitude)) or Strings[ent]
 				else
 					nametag.Text.Text = Strings[ent]
@@ -5385,6 +5501,15 @@ run(function()
 					and the real cleanup happens there. ]]
 					local root = ent.RootPart
 					if not (root and root.Parent) then
+						nametag.Visible = false
+						continue
+					end
+
+					--[[ And never draw against a character its player has moved on from. The
+					sweep prunes these once a second, which is up to a second of a tag sitting
+					over an empty spot -- two property reads a frame is cheaper than explaining
+					that to anyone. ]]
+					if supersededEntity(ent) then
 						nametag.Visible = false
 						continue
 					end
@@ -5521,50 +5646,6 @@ run(function()
 					watchDevice(plr)
 				end
 				NameTags:Clean(playersService.PlayerAdded:Connect(watchDevice))
-
-				--[[ A repair sweep, because "no tag was ever created" has several causes and
-				every one of them looks identical from here.
-
-				The one that bites on loading into a match is the Teammates filter. Entities
-				are added while team assignment is still replicating, so ent.Targetable reads
-				false for that moment and Added turns them away -- and nothing re-runs Added,
-				so those players stay bare for the whole round. An EntityAdded that arrives
-				while the list is being rebuilt lands in exactly the same dead end, as does a
-				build that threw part way through.
-
-				EntityUpdated repairs a tag the moment anything about that entity changes, but
-				a player standing still across the map may not fire one for a long time, so
-				the list is walked on a slow timer as well. Anything already tagged is skipped
-				outright, so a full sweep is a handful of table lookups. ]]
-				task.spawn(function()
-					while NameTags.Enabled do
-						task.wait(1)
-						if not NameTags.Enabled then break end
-
-						pcall(function()
-							--[[ Prune first. A tag whose entity has been replaced has to go
-							before the replacement is tagged, or the player carries two. ]]
-							for ent in Reference do
-								if supersededEntity(ent) then
-									Removed[methodused](ent)
-								end
-							end
-
-							for _, ent in entitylib.List do
-								if Reference[ent] then continue end
-
-								--[[ Never build against a superseded table, and never against
-								one whose character has gone -- the tag would sit wherever that
-								character was last seen rather than over anybody. ]]
-								local root = ent.RootPart
-								if not (root and root.Parent) then continue end
-								if supersededEntity(ent) then continue end
-
-								rebuildTag(ent, methodused)
-							end
-						end)
-					end
-				end)
 			else
 				showGameNametags('nametags')
 
