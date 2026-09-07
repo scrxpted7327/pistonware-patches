@@ -4627,25 +4627,49 @@ run(function()
         }
     end
 
-    --[[ A model is often tagged a frame before its PrimaryPart is assigned. Reading
-    v.PrimaryPart at tag time then gives nil and the billboard is skipped forever
-    (why it only worked after a disable/re-enable, once the models were fully built).
-    Wait for PrimaryPart before adding. ]]
+    --[[ The part a billboard hangs off.
+
+    PrimaryPart on its own was the mistake, and the beekeeper skins are where it shows.
+    The stock Assets.Effects.Bee model has PrimaryPart set -- to its Root part -- but
+    MeadowBee, the model the Meadow Beekeeper skin swaps in through
+    BedwarsKitSkinMeta[MEADOW_BEEKEEPER].beekeeper.beeModel, has no PrimaryPart set at
+    all. So the wait below timed out on every bee and not one billboard was built.
+
+    The game never needed it either: bee-controller reaches for `beeModel.Root` by name
+    and moves the bee with PivotTo, which falls back to the bounding box when there is no
+    PrimaryPart. Root is also where it parents every constraint it adds, so Root is the
+    real anchor and PrimaryPart was only ever a convenience the stock asset happened to
+    carry. Any BasePart after that, so a model authored without either still gets a
+    billboard somewhere sensible instead of none.
+
+    A tagged BasePart is handled up front because indexing PrimaryPart on one throws
+    rather than returning nil, and these tags are the game's, not ours. ]]
+    local function espPart(v)
+        if v:IsA('BasePart') then return v end
+        if not v:IsA('Model') then return nil end
+        return v.PrimaryPart or v:FindFirstChild('Root') or v:FindFirstChildWhichIsA('BasePart')
+    end
+
+    --[[ A model is often tagged a frame before its parts are in place, so a first look
+    that comes back empty is retried rather than dropped (that is why this used to work
+    only after a disable/re-enable, once the models had finished building). ]]
     local function addWhenReady(v, icon)
         if not v then return end
-        if v.PrimaryPart then
-            ModelParts[v] = v.PrimaryPart
-            Added(v.PrimaryPart, icon)
+        local part = espPart(v)
+        if part then
+            ModelParts[v] = part
+            Added(part, icon)
             return
         end
         task.spawn(function()
             local timeout = os.clock() + 5
-            while not v.PrimaryPart and v.Parent and os.clock() < timeout do
+            while not part and v.Parent and os.clock() < timeout do
                 task.wait()
+                part = espPart(v)
             end
-            if v.PrimaryPart and KitESP and KitESP.Enabled then
-                ModelParts[v] = v.PrimaryPart
-                Added(v.PrimaryPart, icon)
+            if part and KitESP and KitESP.Enabled then
+                ModelParts[v] = part
+                Added(part, icon)
             end
         end)
     end
@@ -4671,7 +4695,8 @@ run(function()
         end))
 
         table.insert(kitConns, collectionService:GetInstanceRemovedSignal(tag):Connect(function(v)
-            local part = ModelParts[v] or v.PrimaryPart
+            -- espPart, not PrimaryPart, or a skinned model's billboard outlives it
+            local part = ModelParts[v] or espPart(v)
             ModelParts[v] = nil
             if part and Reference[part] then
                 if vape.ThreadFix then
