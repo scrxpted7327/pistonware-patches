@@ -4446,8 +4446,34 @@ function vape:LoadGUI()
 
 			Holder.Visible = entity ~= nil or clickgui.Visible
 			if entity then
-				Name.Text = entity.Player and (DisplayName.Enabled and entity.Player.DisplayName or entity.Player.Name) or entity.Character and entity.Character.Name or Name.Text
-				Headshot.Image = 'rbxthumb://type=AvatarHeadShot&id='..(entity.Player and entity.Player.UserId or 1)..'&w=420&h=420'
+				--[[ NameHider, applied here rather than left to catch this from outside.
+
+				This function runs on RenderStepped and writes the real name to the label
+				every single frame. NameHider watches labels for changes and rewrites them,
+				which against a once-per-frame writer is not a fix but a fight -- and it is
+				built to notice one: after two rounds of its write being undone it stops
+				touching that label for good, on the assumption that something owns it. It
+				does. This does.
+
+				So the name is hidden before it is written, and there is nothing left to
+				fight over. The avatar goes the same way: it is rebuilt from the real UserId
+				on the same frame, and it identifies someone just as well as the text. ]]
+				local hideName = shared.PistonwareHideName
+				local hideThumb = shared.PistonwareHideThumb
+
+				local shown = entity.Player and (DisplayName.Enabled and entity.Player.DisplayName or entity.Player.Name) or entity.Character and entity.Character.Name or Name.Text
+				if type(hideName) == 'function' then
+					local ok, res = pcall(hideName, shown)
+					if ok and type(res) == 'string' then shown = res end
+				end
+				Name.Text = shown
+
+				local thumb = 'rbxthumb://type=AvatarHeadShot&id='..(entity.Player and entity.Player.UserId or 1)..'&w=420&h=420'
+				if type(hideThumb) == 'function' then
+					local ok, res = pcall(hideThumb, thumb)
+					if ok and type(res) == 'string' then thumb = res end
+				end
+				Headshot.Image = thumb
 		
 				if not entity.Character then
 					entity.Health = entity.Health or 0
