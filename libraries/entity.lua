@@ -1499,10 +1499,28 @@ entitylib.getEntity = function(char)
 	return nil
 end
 
+--[[ Records the builder thread ONLY while it is still running.
+
+task.spawn runs the body up to its first yield before it ever returns, and the body
+below has no yield at all when the character is already streamed in: WaitForChild
+returns instantly for a child that exists, and waitForChildOfType breaks before its
+task.wait on the first hit. So the whole build finishes -- including the
+`EntityThreads[char] = nil` on its last line -- and only THEN does task.spawn hand
+back a thread that is already dead, which the assignment writes straight back into
+the table it just cleared.
+
+That entry is poison. task.cancel throws on a thread that is not suspended, so the
+next removeEntity for this character died on the cancel and never reached
+Events.EntityRemoved -- leaving the entity in entitylib.List and every module's
+per-entity state pointing at a character that had gone. Nametags parked over empty
+ground came from here. The guard above compounds it: a character carrying a dead
+entry can never be added again either.
+
+Storing it only when it is genuinely suspended costs one status read. ]]
 entitylib.addEntity = function(char, plr, teamfunc, spawntime)
 	if not char or entitylib.EntityByCharacter[char] or entitylib.EntityThreads[char] then return end
 
-	entitylib.EntityThreads[char] = task.spawn(function()
+	local builder = task.spawn(function()
 		local hum = waitForChildOfType(char, 'Humanoid', 10)
 		local humrootpart = hum and waitForChildOfType(hum, 'RootPart', workspace.StreamingEnabled and 9e9 or 10, true)
 		local head = char:WaitForChild('Head', 10) or humrootpart
@@ -1575,6 +1593,10 @@ entitylib.addEntity = function(char, plr, teamfunc, spawntime)
 
 		entitylib.EntityThreads[char] = nil
 	end)
+
+	if coroutine.status(builder) ~= 'dead' then
+		entitylib.EntityThreads[char] = builder
+	end
 end
 
 entitylib.removeEntity = function(char, isLocal)
@@ -1603,9 +1625,15 @@ entitylib.removeEntity = function(char, isLocal)
 	end
 
 	if char then
-		if entitylib.EntityThreads[char] then
-			task.cancel(entitylib.EntityThreads[char])
+		--[[ Cleared BEFORE the cancel, and only cancelled while suspended: everything
+		below this point -- the List removal and Events.EntityRemoved -- has to run even
+		if the entry is stale, or the entity outlives its character. ]]
+		local builder = entitylib.EntityThreads[char]
+		if builder then
 			entitylib.EntityThreads[char] = nil
+			if coroutine.status(builder) == 'suspended' then
+				pcall(task.cancel, builder)
+			end
 		end
 
 		local entity, index = entitylib.getEntity(char)
@@ -1726,7 +1754,9 @@ entitylib.stop = function()
 	end
 
 	for _, thread in entitylib.EntityThreads do
-		task.cancel(thread)
+		if coroutine.status(thread) == 'suspended' then
+			pcall(task.cancel, thread)
+		end
 	end
 
 	table.clear(entitylib.PlayerConnections)
