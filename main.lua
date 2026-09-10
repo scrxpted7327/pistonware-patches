@@ -1,3 +1,38 @@
+local pistonwareBuffer
+pcall(function()
+	local env = type(getgenv) == 'function' and getgenv() or nil
+	local namespace = type(env) == 'table' and env.pistonware or nil
+	pistonwareBuffer = type(namespace) == 'table' and namespace.buffer or nil
+end)
+
+local function bufferCall(method, event, message, details)
+	local callback = type(pistonwareBuffer) == 'table' and pistonwareBuffer[method] or nil
+	if type(callback) == 'function' then return callback(event, message, details) end
+	if shared.PistonwareDeveloper == true then
+		if method == 'warn' or method == 'error' then
+			warn('[pistonware] '..tostring(message))
+		else
+			print('[pistonware] '..tostring(message))
+		end
+	end
+end
+
+local function bufferLog(event, message, details)
+	return bufferCall('log', event, message, details)
+end
+
+local function bufferPrint(event, message, details)
+	return bufferCall('print', event, message, details)
+end
+
+local function bufferWarn(event, message, details)
+	return bufferCall('warn', event, message, details)
+end
+
+local function bufferError(event, message, details)
+	return bufferCall('error', event, message, details)
+end
+
 --[[ The loader is the only supported entry point: it runs the LuaArmor key gate and publishes
 script_key (which the protected bedwars.lua reads) before any of this downloads or executes.
 The GUI's reinject buttons go back through the loader, and a queued teleport does the same on
@@ -6,7 +41,7 @@ that state before main.lua is reached, so reaching here without it means the gat
 Checked before the uninject below, so a failed check cannot tear down a working instance on its
 way out. ]]
 if not shared.PistonwareAuthenticated then
-	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
+	bufferWarn('runtime.unauthenticated', 'not authenticated -- run the pistonware loader and enter your key')
 	return
 end
 
@@ -28,13 +63,15 @@ local function errorTrace(err)
 end
 
 local function reportRuntimeError(stage, err, trace)
+	local traceback = trace or errorTrace(err)
+	bufferError('runtime.'..tostring(stage), err, {stage = stage, traceback = traceback})
 	local reporter = shared.PistonwareTelemetry
 	if type(reporter) == 'table' and type(reporter.report) == 'function' then
 		pcall(function()
 			reporter:report('runtime_error', tostring(err), {
 				stage = stage,
 				fatal = false,
-				traceback = trace or errorTrace(err)
+					traceback = traceback
 			})
 		end)
 	end
@@ -146,19 +183,18 @@ end)
 
 --[[ Telemetry the developer build prints and the public build does not.
 
-Module counts and load timings are what you want in front of you while working on the loader,
-and noise in a paying user's console -- they are yellow, they say [pistonware], and they turn
-up at exactly the moment the script starts working, so they read as something having gone
-wrong. Real failures still use warn() directly and are unaffected.
+	Module counts and load timings are buffered for every build and mirrored into the executor
+	console only in developer mode. Public failures stay in the same buffer and are available
+	through getgenv().pistonware.buffer.dump().
 
 Gated at runtime rather than at build time because main.lua is one file serving both builds.
 PUBLIC_BUILD nulls shared.PistonwareDeveloper and locks it behind a metatable, so this is off
 for everyone except the developer build by construction -- and the queued teleport script
 carries the flag across, so it stays on for a developer through a match join. ]]
 local function debugWarn(...)
-	if shared.PistonwareDeveloper then
-		warn(...)
-	end
+	local values = {...}
+	for index, value in ipairs(values) do values[index] = tostring(value) end
+	bufferPrint('runtime.debug', table.concat(values, ' '))
 end
 
 --[[
@@ -178,6 +214,7 @@ end)
 shared.PistonwareTraceLines = {}
 local traceLines = shared.PistonwareTraceLines
 local function stage(text)
+	bufferLog('runtime.stage', text)
 	if not traceOn then return end
 	table.insert(traceLines, text)
 	if #traceLines > 200 then table.remove(traceLines, 1) end
@@ -359,13 +396,13 @@ local function finishLoading()
 		consequence of a refusal; deleting configs is not, so do neither here. ]]
 		if shared.PistonwareSessionRejected then
 			failBoot('bedwars.session', 'session was not authorised')
-			warn('[pistonware] session was not authorised -- leaving profiles untouched')
+			bufferWarn('profile.session', 'session was not authorised -- leaving profiles untouched')
 			return
 		end
 		if shared.PistonwareBootFailed then return end
 		if not moduleSetComplete then
 			failBoot('modules.timeout', 'the game payload did not signal completion within 120 seconds')
-			warn('[pistonware] payload completion timed out -- profile loading and saving are blocked for this session')
+			bufferWarn('profile.timeout', 'payload completion timed out -- profile loading and saving are blocked for this session')
 			return
 		end
 		debugWarn(('[pistonware] applying profile %s (teleported=%s)'):format(
@@ -375,7 +412,7 @@ local function finishLoading()
 		end, errorTrace)
 		if not loadOk or canSave == false then
 			failBoot('profile.apply', loadOk and 'profile data could not be loaded safely' or _)
-			warn('[pistonware] profile application failed -- profile saving is blocked for this session')
+			bufferWarn('profile.apply', 'profile application failed -- profile saving is blocked for this session')
 			return
 		end
 		debugWarn('[pistonware] profile load returned')
@@ -457,8 +494,20 @@ local function finishLoading()
 			again. The developer path restores loaderdev.lua first so its local hookfunction seam
 			is available; the public path loads the published loader and performs the official
 			Luarmor check again. ]]
-					local teleportScript = [[
-						shared.vapereload = true
+						local teleportScript = [[
+							shared.vapereload = true
+							local function queuedError(event, message)
+								local target
+								pcall(function()
+									local env = getgenv()
+									target = type(env.pistonware) == 'table' and env.pistonware.buffer or nil
+								end)
+								if type(target) == 'table' and type(target.error) == 'function' then
+									target.error(event, message)
+								elseif rawget(shared, 'PistonwareDeveloper') == true then
+									warn('[pistonware] '..tostring(message))
+								end
+							end
 						-- A developer teleport must restore the developer loader first. loaderdev.lua
 						-- installs the local LuaArmor test seam; jumping straight into main.lua loses
 						-- that seam in the new Roblox execution context and the local payload reports
@@ -477,10 +526,10 @@ local function finishLoading()
 								if developerChunk then
 									return developerChunk()
 								end
-								warn('[pistonware] queued developer loader did not compile: '..tostring(developerError))
+								queuedError('teleport.loaderdev.compile', developerError)
 								return
 							else
-								warn('[pistonware] queued developer loader is unavailable; refusing to continue without its hookfunction auth seam')
+								queuedError('teleport.loaderdev.missing', 'queued developer loader is unavailable; refusing to continue')
 								return
 							end
 						end
@@ -490,12 +539,12 @@ local function finishLoading()
 								return game:HttpGet('https://raw.githubusercontent.com/themagicpiston/pistonware/'..ref..'/loader.lua', true)
 							end)
 							if not ok or type(source) ~= 'string' or source == '' or source == '404: Not Found' then
-								warn('[pistonware] queued public loader could not be downloaded: '..tostring(source))
+								queuedError('teleport.loader.download', source)
 								return
 							end
 							local chunk, compileError = loadstring(source, 'loader')
 							if not chunk then
-								warn('[pistonware] queued public loader did not compile: '..tostring(compileError))
+								queuedError('teleport.loader.compile', compileError)
 								return
 							end
 							return chunk()
@@ -676,7 +725,6 @@ if not shared.VapeIndependent then
 		if not okUniversal then
 			failBoot('universal.load', universalError)
 			reportRuntimeError('universal.load', universalError, universalError)
-			warn('[pistonware] universal.lua errored while loading: '..tostring(universalError))
 		end
 	end
 
@@ -706,7 +754,6 @@ if not shared.VapeIndependent then
 			failBoot('game.compile', trace)
 			gameScriptFinished = true
 			reportRuntimeError('game.compile', compileError, trace)
-			warn('[pistonware] '..chunkname..' did not compile: '..trace)
 			return false
 		end
 		gameScriptFinished = false
@@ -757,7 +804,6 @@ if not shared.VapeIndependent then
 			end
 			if not ok then
 				reportRuntimeError('game.execute', result, result)
-				warn('[pistonware] '..chunkname..' errored: '..tostring(result))
 			end
 		end)
 		return true

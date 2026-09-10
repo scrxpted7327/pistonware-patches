@@ -1,3 +1,20 @@
+local pistonwareBuffer
+pcall(function()
+	local env = getgenv()
+	pistonwareBuffer = type(env.pistonware) == 'table' and env.pistonware.buffer or nil
+end)
+
+local function bufferError(event, message, details)
+	if type(pistonwareBuffer) == 'table' and type(pistonwareBuffer.error) == 'function' then
+		return pistonwareBuffer.error(event, message, details)
+	end
+	if shared.PistonwareDeveloper == true then warn('[pistonware] '..tostring(message)) end
+end
+
+shared.PistonwareRequireCapabilities({
+	'DEBUG', 'HOOKFUNCTION', 'METAMETHOD', 'THREAD', 'SIGNAL'
+}, 'universal')
+
 local loadstring = function(...)
 	local res, err = loadstring(...)
 	if err and vape then
@@ -80,7 +97,7 @@ local run = function(func)
 	simply never registered. ]]
 	local ok, err = callWithThreadFix(func)
 	if not ok then
-		warn('[pistonware] a module block failed to load: '..tostring(err))
+		bufferError('universal.module', err, {traceback = err})
 	end
 end
 local queue_on_teleport = queue_on_teleport or function() end

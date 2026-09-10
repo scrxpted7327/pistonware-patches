@@ -1,5 +1,17 @@
+local pistonwareBuffer
+pcall(function()
+	local env = getgenv()
+	pistonwareBuffer = type(env.pistonware) == 'table' and env.pistonware.buffer or nil
+end)
+
+local function bufferCall(method, event, message, details)
+	local callback = type(pistonwareBuffer) == 'table' and pistonwareBuffer[method] or nil
+	if type(callback) == 'function' then return callback(event, message, details) end
+	if shared.PistonwareDeveloper == true then warn('[pistonware] '..tostring(message)) end
+end
+
 if not shared.PistonwareAuthenticated then
-	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
+	bufferCall('warn', 'lobby.unauthenticated', 'not authenticated -- run the pistonware loader and enter your key')
 	return
 end
 
@@ -38,7 +50,7 @@ end
 local run = function(func)
 	local ok, err = callWithThreadFix(func)
 	if not ok then
-		warn('[pistonware] a module block failed to load: '..tostring(err))
+		bufferCall('error', 'lobby.module', err, {traceback = err})
 	end
 end
 local cloneref = cloneref or function(obj) return obj end

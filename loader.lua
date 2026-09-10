@@ -1,18 +1,238 @@
--- A local developer loader can temporarily hook loadstring to provide its synthetic SDK seam.
--- Public builds must clear that cross-run hook before they ask Luarmor for the real library;
--- otherwise the public loader would receive a fabricated KEY_VALID table from old shared state.
-do
-	local restore = type(shared) == 'table' and rawget(shared, 'PistonwareRestoreDeveloperHook') or nil
-	if type(restore) == 'function' then
-		local ok = pcall(restore)
-		if not ok or rawget(shared, 'PistonwareRestoreDeveloperHook') ~= nil then
-			warn('[pistonware] refusing public boot while a developer loadstring hook is still active')
-			return
+local PUBLIC_BUILD = true
+
+local function installPistonwareBuffer(developerMode)
+	local nativePrint, nativeWarn, nativeError = print, warn, error
+	local capacity = 512
+	local entries = {}
+	local head, count, dropped = 1, 0, 0
+	local dumping, dumpScheduled, pendingDump = false, false, false
+	local filesystemReady = false
+	local buffer = {}
+
+	pcall(function()
+		filesystemReady = type(isfolder) == 'function' and isfolder('pistonware') and true or false
+	end)
+
+	local function timestamp(pathSafe)
+		local value
+		pcall(function()
+			value = os.date(pathSafe and '!%Y%m%dT%H%M%SZ' or '!%Y-%m-%dT%H:%M:%SZ')
+		end)
+		return value or tostring(os.time())
+	end
+
+	local session = tostring(os.time())..'-'..tostring(math.floor(os.clock() * 1000))
+	pcall(function()
+		local guid = game:GetService('HttpService'):GenerateGUID(false)
+		if type(guid) == 'string' and guid ~= '' then session = guid end
+	end)
+	local sessionFile = session:gsub('[^%w%-]', ''):sub(1, 16)
+	local dumpPath = 'pistonware/errors/'..timestamp(true)..'-'..sessionFile..'.txt'
+
+	local function safeText(value, limit)
+		local text = tostring(value or '')
+		text = text:gsub('[\r\n]+', ' ')
+		text = text:gsub('([Ss]cript[_%s]*[Kk]ey%s*[:=]%s*)[^%s,;]+', '%1<redacted>')
+		text = text:gsub('([?&][Kk]ey=)[^&%s]+', '%1<redacted>')
+		limit = limit or 1200
+		if #text > limit then text = text:sub(1, limit - 3)..'...' end
+		return text
+	end
+
+	local function copyDetails(details)
+		local result = {}
+		if type(details) == 'table' then
+			for key, value in pairs(details) do
+				if type(value) ~= 'table' and type(value) ~= 'function' then
+					result[safeText(key, 80)] = safeText(value, 3000)
+				end
+			end
+		end
+		return result
+	end
+
+	local function formatEntry(entry)
+		local parts = {}
+		for key, value in pairs(entry.details) do
+			table.insert(parts, tostring(key)..'='..tostring(value))
+		end
+		table.sort(parts)
+		local line = ('[%s] [pistonware] [%s] [%s] %s'):format(
+			entry.timestamp,
+			entry.level:upper(),
+			entry.event,
+			entry.message
+		)
+		if #parts > 0 then line = line..' '..table.concat(parts, ' ') end
+		return line
+	end
+
+	local function orderedEntries()
+		local result = {}
+		for offset = 0, count - 1 do
+			result[#result + 1] = entries[((head + offset - 1) % capacity) + 1]
+		end
+		return result
+	end
+
+	local function requestDump()
+		pendingDump = true
+		if not filesystemReady or dumping or dumpScheduled then return end
+		dumpScheduled = true
+		local function flush()
+			dumpScheduled = false
+			buffer.dump('automatic error')
+		end
+		if task and type(task.defer) == 'function' then
+			task.defer(flush)
+		else
+			flush()
 		end
 	end
+
+	local function record(level, event, message, details)
+		local entry = {
+			timestamp = timestamp(false),
+			level = safeText(level, 20):lower(),
+			event = safeText(event, 160),
+			message = safeText(message, 1600),
+			details = copyDetails(details)
+		}
+		if count < capacity then
+			entries[((head + count - 1) % capacity) + 1] = entry
+			count += 1
+		else
+			entries[head] = entry
+			head = (head % capacity) + 1
+			dropped += 1
+		end
+
+		local line = formatEntry(entry)
+		if developerMode then
+			if entry.level == 'warn' or entry.level == 'error' or entry.level == 'fatal' then
+				pcall(nativeWarn, line)
+			else
+				pcall(nativePrint, line)
+			end
+		end
+		if entry.level == 'error' or entry.level == 'fatal' then requestDump() end
+		return line
+	end
+
+	function buffer.log(event, message, details)
+		return record('info', event, message, details)
+	end
+
+	function buffer.print(event, message, details)
+		return record('info', event, message, details)
+	end
+
+	function buffer.warn(event, message, details)
+		return record('warn', event, message, details)
+	end
+
+	function buffer.error(event, message, details)
+		return record('error', event, message, details)
+	end
+
+	function buffer.raise(event, message, details, level)
+		record('error', event, message, details)
+		buffer.dump('raised error')
+		return nativeError(message, (tonumber(level) or 1) + 1)
+	end
+
+	function buffer.guard(stage, fatal, callback, ...)
+		local args = table.pack(...)
+		local result = table.pack(xpcall(function()
+			return callback(table.unpack(args, 1, args.n))
+		end, function(err)
+			local trace
+			pcall(function()
+				trace = debug and type(debug.traceback) == 'function' and debug.traceback(tostring(err), 2)
+			end)
+			return trace or tostring(err)
+		end))
+		if not result[1] then
+			record(fatal and 'fatal' or 'error', stage, result[2], {traceback = result[2]})
+		end
+		return table.unpack(result, 1, result.n)
+	end
+
+	function buffer.snapshot()
+		local snapshot = {}
+		for index, entry in ipairs(orderedEntries()) do
+			snapshot[index] = {
+				timestamp = entry.timestamp,
+				level = entry.level,
+				event = entry.event,
+				message = entry.message,
+				details = copyDetails(entry.details)
+			}
+		end
+		return snapshot, dropped
+	end
+
+	function buffer.dump(reason)
+		if dumping then return false, 'a buffer dump is already running', count end
+		if not filesystemReady then
+			pendingDump = true
+			return false, 'the pistonware filesystem is not ready', count
+		end
+		if type(writefile) ~= 'function' then return false, 'writefile is unavailable', count end
+		pendingDump = false
+		dumping = true
+		local ok, result = pcall(function()
+			if type(isfolder) == 'function' and type(makefolder) == 'function' then
+				if not isfolder('pistonware/errors') then makefolder('pistonware/errors') end
+			end
+			local release = type(shared.PistonwareRelease) == 'table' and shared.PistonwareRelease or {}
+			local lines = {
+				'Pistonware error buffer',
+				'session='..session,
+				'dumped='..timestamp(false),
+				'reason='..safeText(reason or 'manual', 240),
+				'channel='..safeText(release.channel or 'unknown', 80),
+				'version='..safeText(release.version or 'unknown', 160),
+				'placeId='..safeText(game and game.PlaceId or 0, 40),
+				'entries='..tostring(count),
+				'dropped='..tostring(dropped),
+				''
+			}
+			for _, entry in ipairs(orderedEntries()) do
+				lines[#lines + 1] = formatEntry(entry)
+			end
+			writefile(dumpPath, table.concat(lines, '\n')..'\n')
+			return dumpPath
+		end)
+		dumping = false
+		if ok then
+			if pendingDump then requestDump() end
+			return true, result, count
+		end
+		pendingDump = true
+		return false, tostring(result), count
+	end
+
+	local function markFilesystemReady()
+		filesystemReady = true
+		if pendingDump then requestDump() end
+	end
+
+	pcall(function()
+		local env = type(getgenv) == 'function' and getgenv() or nil
+		if type(env) ~= 'table' then return end
+		local namespace = env.pistonware
+		if type(namespace) ~= 'table' then
+			namespace = {}
+			env.pistonware = namespace
+		end
+		namespace.buffer = buffer
+	end)
+
+	return buffer, markFilesystemReady
 end
 
-local PUBLIC_BUILD = true
+local pistonwareBuffer, markPistonwareBufferFilesystemReady = installPistonwareBuffer(false)
 
 local VERSION_SCHEMA = 1
 local CHANNELS = {
@@ -181,23 +401,12 @@ function Logger:emit(level, event, message, details)
 	if self.console then
 		pcall(function() self.console:SetLine(line) end)
 	end
-	--[[ Developer-only from here down. The log line carries a timestamp, a session id, an event
-	name and a details tail: exactly what you want while working on the loader, and pure noise
-	in somebody's executor output, where a wall of INFO lines during a boot that went fine
-	reads like something is wrong.
-
-	Gated on logToConsole, which is captured at the top of the file: the public build clears
-	shared.PistonwareDeveloper a couple of hundred lines below, so reading the flag live here
-	would light up the one loader.start line that runs before the clear and nothing after it.
-
-	Nothing is lost by hiding it: every line still went to the log files above, failures still
-	land on the loader window through Fail(), and an injection error is still copied to the
-	clipboard. ]]
-	if not logToConsole then return line end
-	if level == 'error' or level == 'warn' then
-		pcall(warn, line)
+	if level == 'error' then
+		pistonwareBuffer.error(event, message, details)
+	elseif level == 'warn' then
+		pistonwareBuffer.warn(event, message, details)
 	else
-		pcall(print, line)
+		pistonwareBuffer.log(event, message, details)
 	end
 	return line
 end
@@ -360,9 +569,7 @@ local function phase(name)
 	local now = os.clock()
 	local elapsed = now - phaseClock
 	logger:info('boot.phase', name..' completed', {seconds = ('%.2f'):format(elapsed)})
-	if isDeveloper then
-		warn(('[pistonware] boot: %s took %.2fs'):format(name, elapsed))
-	end
+	if isDeveloper then pistonwareBuffer.print('boot.phase', name..' completed', {seconds = ('%.2f'):format(elapsed)}) end
 	phaseClock = now
 end
 
@@ -1183,12 +1390,11 @@ local function createConsole()
 	local inputService = cloneref(game:GetService('UserInputService'))
 	local playersService = cloneref(game:GetService('Players'))
 
-	--[[ Whatever a previous run left standing goes first. Several paths through this file
-	return without destroying the console -- the unsupported-executor bail and Fail() both
-	leave the window up on purpose so the message can be read -- and each one leaves behind
-	a GUI tree, three service-level connections and the reveal thread below. Re-executing
-	is the natural response to all of them, so without this the leak grows once per attempt
-	rather than being replaced. ]]
+		--[[ Whatever a previous run left standing goes first. Several Fail() paths through this
+		file return without destroying the console so the message can be read, and each leaves behind
+		a GUI tree, three service-level connections and the reveal thread below. Re-executing
+		is the natural response to all of them, so without this the leak grows once per attempt
+		rather than being replaced. ]]
 	pcall(function()
 		if type(shared.PistonwareLoaderTeardown) == 'function' then
 			shared.PistonwareLoaderTeardown()
@@ -1928,35 +2134,6 @@ console:SetStatus('AUTHENTICATING', nil, '<')
 console:SetLine('Checking your key...')
 console:SetProgress(0.08)
 
---[[ Executors known not to run pistonware correctly. Checked before anything is downloaded so
-the run stops on the console instead of failing somewhere deep in the GUI. identifyexecutor
-is absent on some executors, hence the pcall -- an unknown name is allowed through. ]]
-do
-	local unsupported = {'xeno', 'solara'}
-	local executorName = ''
-	pcall(function()
-		executorName = identifyexecutor and identifyexecutor() or ''
-	end)
-	local lowered = tostring(executorName):lower()
-	for _, name in unsupported do
-		if lowered:find(name, 1, true) then
-			local message = 'Unsupported executor ('..tostring(executorName)..'), please look in the #supported-executors channel for more info.'
-			console:SetStatus('ERROR', '#E15046')
-			console:SetLine(message, Palette.Error)
-			stopExecution(console, 'executor.unsupported', message)
-			--[[ The window deliberately stays up so the message can be read, but the boot is
-			over -- so the reveal thread stops instead of spinning at ~14Hz for the rest of
-			the session. The GUI and its connections go when [x] is pressed, or when the
-			next execution tears this console down before building its own. ]]
-			console:Halt()
-			--[[ Release the duplicate-boot and reload guards so the next execution gets a window. ]]
-			shared.PistonwareLoaderBoot = nil
-			shared.vapereload = nil
-			return
-		end
-	end
-end
-
 --[[
 	Step 0: the key gate.
 
@@ -1964,9 +2141,6 @@ end
 	files are downloaded, no config prompts appear, main.lua is never reached, and so neither
 	are guis/*.lua, games/<PlaceId>.lua or games/bedwars.lua. Vape cannot load unkeyed because
 	the code that loads it is on the far side of this block.
-
-	It sits after the unsupported-executor check on purpose: there is no point sending someone
-	through ad checkpoints for a key they could never use.
 ]]
 do
 	local httpService = cloneref(game:GetService('HttpService'))
@@ -2429,8 +2603,8 @@ do
 				if not console:IsAborted() then
 					console:Fail(message)
 				end
-				--[[ warn() as well as the console line: a headless reload has no window to read,
-				and silently doing nothing is the one outcome nobody can debug. ]]
+				--[[ Keep the failure in the buffer as well as the console line so a headless reload
+				still leaves a reportable result. ]]
 				logger:warn('loader.cancelled', message)
 				--[[ Flags only. No uninject, no delete: leaving the gate without a key ends
 				this boot, not the session that is already running and not the install. ]]
@@ -2458,11 +2632,12 @@ local foldersOk, foldersError = xpcall(function()
 		end
 	end
 end, errorTrace)
-if not foldersOk then
+	if not foldersOk then
 	stopExecution(console, 'filesystem.setup', foldersError, foldersError)
 	return
-end
-logger:addFile('pistonware/loader.log')
+	end
+	markPistonwareBufferFilesystemReady()
+	logger:addFile('pistonware/loader.log')
 telemetry:addFile('pistonware/loader_telemetry.jsonl')
 
 local releaseOk, releaseError = resolveRelease()
@@ -2546,6 +2721,58 @@ if not updateDone then
 end
 phase('update check')
 console:SetProgress(0.46)
+
+local function installCapabilities()
+	local source = downloadFile('pistonware/libraries/capabilities.lua')
+	local chunk, compileError = loadstring(source, 'capabilities')
+	if not chunk then error(compileError or 'capabilities.lua did not compile', 0) end
+	local createCapabilities = chunk()
+	if type(createCapabilities) ~= 'function' then
+		error('capabilities.lua returned no factory', 0)
+	end
+
+	local environment = type(getgenv) == 'function' and getgenv() or {}
+	shared.PistonwareUnsupportedExecutor = nil
+	local capabilities = createCapabilities({
+		environment = environment,
+		game = game,
+		Instance = Instance,
+		buffer = pistonwareBuffer,
+		onMissing = function(scope, _, message)
+			if scope == 'universal' then
+				warn('[pistonware] '..message)
+				return
+			end
+			if shared.PistonwareUnsupportedExecutor ~= nil then return end
+			shared.PistonwareUnsupportedExecutor = message
+			pcall(function()
+				game:GetService('StarterGui'):SetCore('SendNotification', {
+					Title = 'pistonware',
+					Text = message,
+					Duration = 10
+				})
+			end)
+		end
+	})
+	capabilities:run()
+
+	local namespace = environment.pistonware
+	if type(namespace) ~= 'table' then
+		namespace = {}
+		environment.pistonware = namespace
+	end
+	namespace.capabilities = capabilities
+	shared.PistonwareRequireCapabilities = function(required, scope)
+		return capabilities:require(scope or 'legacy', required)
+	end
+	return capabilities
+end
+
+local capabilitiesOk, capabilities = xpcall(installCapabilities, errorTrace)
+if not capabilitiesOk then
+	stopExecution(console, 'executor.capabilities', capabilities, capabilities)
+	return
+end
 
 --[[ Detect the very first run (empty/near-empty profiles folder) BEFORE downloading, so we
 know afterwards whether to show the prompts below. ]]
@@ -2774,7 +3001,7 @@ task.spawn(function()
 end)
 
 --[[ Protected so a failure surfaces on the console line instead of leaving the window stuck on
-'Loading pistonware...'; warn() keeps it in the executor output too. ]]
+'Loading pistonware...'; the buffer retains the diagnostic without public executor output. ]]
 local ok, result = xpcall(function()
 	local chunk, compileError = loadstring(downloadFile('pistonware/main.lua'), 'main')
 	if not chunk then
