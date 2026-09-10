@@ -1,5 +1,19 @@
+local pistonwareBuffer
+pcall(function()
+	local env = getgenv()
+	pistonwareBuffer = type(env.pistonware) == 'table' and env.pistonware.buffer or nil
+end)
+
+local function bufferCall(method, event, message, details)
+	local callback = type(pistonwareBuffer) == 'table' and pistonwareBuffer[method] or nil
+	if type(callback) == 'function' then return callback(event, message, details) end
+	if shared.PistonwareDeveloper == true then
+		if method == 'print' then print('[pistonware] '..tostring(message)) else warn('[pistonware] '..tostring(message)) end
+	end
+end
+
 if not shared.PistonwareAuthenticated then
-	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
+	bufferCall('warn', 'bedwars.unauthenticated', 'not authenticated -- run the pistonware loader and enter your key')
 	return
 end
 
@@ -46,7 +60,7 @@ local run = function(func)
 	if shared.VapeSmoothBoot then task.wait() end
 	local ok, err = callWithThreadFix(func)
 	if not ok then
-		warn('[pistonware] a module block failed to load: '..tostring(err))
+		bufferCall('error', 'bedwars.module', err, {traceback = err})
 	end
 end
 
@@ -468,6 +482,13 @@ local function getSpeed()
     return _baseGetSpeed()
 end
 
+--[[ The same reading with nothing layered on top -- straight past whatever DamageBoost wrapped
+around it. Speed's Legit mode uses this so the top-up is measured against the speed the server
+believes you have rather than one the boost inflated. ]]
+local function rawGetSpeed()
+    return _baseGetSpeed()
+end
+
 local function getTableSize(tab)
 	local ind = 0
 	for _ in tab do
@@ -517,6 +538,44 @@ local function hotbarSwitch(slot)
 		return true
 	end
 	return false
+end
+
+--[[ The kit to SHOW for a player, and the icon for it.
+
+Two separate problems lived in the one line this replaces:
+
+  * PlayingAsKit (singular) is the older attribute. The live one is PlayingAsKits, a comma
+    separated LIST -- kit-util's getKitArrayFromCommaSeparatedString is a plain string.split
+    on ',' because a player can be on more than one kit at once. Reading only the singular
+    meant the nametag icon was blank for anyone the game describes the modern way.
+  * BedwarsKitMeta[kit].renderImage was indexed with no nil guard, so any value without a
+    meta entry -- an unknown kit, a combined string, a renamed id after an update -- was a
+    hard error raised inside the nametag loop rather than a missing icon.
+
+The first non-empty entry is the one to show: KitController:getPrimaryActiveKit is exactly
+getActiveKits()[1]. ]]
+local function getKitRenderImage(plr)
+	if not plr then return '' end
+
+	local kit = plr:GetAttribute('PlayingAsKits')
+	if type(kit) == 'string' and kit ~= '' then
+		local primary
+		for _, name in string.split(kit, ',') do
+			if name ~= '' then
+				primary = name
+				break
+			end
+		end
+		kit = primary
+	else
+		kit = nil
+	end
+
+	kit = kit or plr:GetAttribute('PlayingAsKit')
+	if not kit or kit == '' or kit == 'none' then return '' end
+
+	local meta = bedwars.BedwarsKitMeta and bedwars.BedwarsKitMeta[kit]
+	return (meta and meta.renderImage) or ''
 end
 
 local function isFriend(plr, recolor)
@@ -751,25 +810,57 @@ run(function()
 			plr.CharacterRemoving:Connect(function(char)
 				entitylib.removeEntity(char, plr == lplr)
 			end),
-			plr:GetAttributeChangedSignal('Team'):Connect(function()
-				for _, v in entitylib.List do
-					if v.Targetable ~= entitylib.targetCheck(v) then
-						entitylib.refreshEntity(v.Character, v.Player)
-					end
-				end
+			--[[ BedWars keeps the team on an ATTRIBUTE, and it lands AFTER the entity does.
+			The game's own controllers sit in `while Attribute == nil do task.wait(1) end`
+			loops waiting for it, so every entity is necessarily built with the team still
+			unknown and Targetable comes out wrong. This signal is what corrects them, and it
+			is the only thing that does -- the library's own refresh watches the Team PROPERTY,
+			which bedwars never sets.
 
+			It used to correct them by REBUILDING, and all three ways it did that were wrong.
+
+			refreshEntity removes from entitylib.List with a swap-remove, and this loop was
+			iterating that same list: the entity swapped down into the slot just visited was
+			skipped, so an arbitrary subset of players kept a stale Targetable -- a different
+			subset every match, which is why Priority Only worked in some games and hid
+			everybody in others.
+
+			entitylib.start() tore down and rebuilt the entire library whenever the LOCAL
+			player's team landed, which is a thing that happens every single match. start()
+			re-registers only its three default connections, so the CollectionService hooks
+			this file installs for drones, guardians and training dummies were disconnected
+			and never came back: NPC tracking died the moment your own team arrived.
+
+			And every rebuild replaces every entity table, orphaning whatever the modules had
+			keyed to the old ones -- nametags included.
+
+			None of that is needed. The team is the only thing that changed, so re-run the
+			check in place and fire EntityUpdated, which is exactly what updateEntity does
+			everywhere else in the library. It also keeps Friend/Target and the raycast filter
+			in step, which the hand-rolled version above did not. ]]
+			plr:GetAttributeChangedSignal('Team'):Connect(function()
+				-- your own team flips everybody's standing; anyone else's flips only theirs
 				if plr == lplr then
-					entitylib.start()
+					for _, v in entitylib.List do
+						entitylib.updateEntity(v, true)
+					end
 				else
-					entitylib.refreshEntity(plr.Character, plr)
+					local ent = entitylib.getEntity(plr)
+					if ent then
+						entitylib.updateEntity(ent, true)
+					end
 				end
 			end)
 		}
 	end
 
+	--[[ Same thread-tracking rule as the library's own addEntity, for the same reason:
+	a build that finishes without yielding -- which is every character that is already
+	streamed in -- would otherwise leave a dead thread in EntityThreads, and the next
+	removeEntity would throw on the cancel instead of firing EntityRemoved. ]]
 	entitylib.addEntity = function(char, plr, teamfunc)
 		if not char then return end
-		entitylib.EntityThreads[char] = task.spawn(function()
+		local builder = task.spawn(function()
 			local hum, humrootpart, head
 			if plr then
 				hum = waitForChildOfType(char, 'Humanoid', 10)
@@ -877,6 +968,10 @@ run(function()
 			end
 			entitylib.EntityThreads[char] = nil
 		end)
+
+		if coroutine.status(builder) ~= 'dead' then
+			entitylib.EntityThreads[char] = builder
+		end
 	end
 
 	entitylib.getUpdateConnections = function(ent)
@@ -1936,23 +2031,6 @@ local function entryMatches(objName, list)
     return false
 end
 
-local function safeGetProto(func, index)
-    if not func then return nil end
-    local success, proto = pcall(debug.getproto, func, index)
-    if success then
-        return proto
-    else
-        --[[ Developer-only. This prints a raw function pointer and an index, which means nothing
-        to a user and fires on executors whose debug.getproto is simply missing -- so on
-        those it used to spray the console on every call for no reason. The caller already
-        handles nil. ]]
-        if shared.PistonwareDeveloper then
-            warn('[pistonware] getproto failed -- function:', func, 'index:', index)
-        end
-        return nil
-    end
-end
-
 --[[ The `out` barrel re-exports sound-manager, but each of its re-exports is guarded by
 `or {}`, so a build where that submodule fails to resolve silently drops the key and
 leaves SoundManager nil -- which is how "attempt to index nil with 'playSound'" reached
@@ -1971,31 +2049,74 @@ end
 
 --[[ pistonware funcs ]]
 
-run(function()
-	local KnitInit, Knit
-	repeat
-		KnitInit, Knit = pcall(function()
-			return debug.getupvalue(require(lplr.PlayerScripts.TS.knit).setup, 9)
-		end)
-		if KnitInit then break end
-		task.wait()
-	until KnitInit
-
-	--[[ The wait is protected by pcall and has a deadline. Two separate hazards, both fatal here before the fix:
-	Knit.Start is nil if a game update reshapes Knit, and debug.getupvalue(nil, 1) THROWS --
-	which killed this block before the bedwars table on the next line was ever built, taking
-	every module in this file and bedwars.lua with it. And a Knit that loads but never
-	finishes starting parked this loop at frame rate for the rest of the session. ]]
+do
+if shared.VapeSmoothBoot then task.wait() end
+local bootstrapOk, bootstrapError = callWithThreadFix(function()
+	local Knit = require(
+		replicatedStorage.rbxts_include.node_modules['@easy-games'].knit.src.Knit.KnitClient
+	)
+	assert(type(Knit) == 'table', 'KnitClient returned no controller table')
 	local knitDeadline = os.clock() + 60
+	assert(type(Knit.OnStart) == 'function', 'Knit.OnStart is unavailable')
+	local knitStarted = false
+	local knitStartError
+	local startup = Knit.OnStart()
+	assert(startup and type(startup.andThen) == 'function',
+		'Knit.OnStart returned no startup promise')
+	local observer = startup:andThen(function()
+		knitStarted = true
+	end, function(err)
+		knitStartError = tostring(err)
+	end)
+	local function stopObserving()
+		if observer and type(observer.cancel) == 'function' then
+			pcall(function() observer:cancel() end)
+		end
+	end
 	while true do
-		local started, value = pcall(debug.getupvalue, Knit.Start, 1)
-		if started and value then break end
-		if os.clock() > knitDeadline then
-			warn('[pistonware] Knit did not finish starting within 60s -- loading anyway')
+		if vape.Loaded == nil then
+			stopObserving()
+			error('Knit initialization canceled by unload', 0)
+		end
+		if knitStartError then
+			stopObserving()
+			error('Knit startup failed: '..knitStartError, 0)
+		end
+		local controllers = Knit.Controllers
+		if knitStarted and type(controllers) == 'table'
+			and controllers.SwordController
+			and controllers.ProjectileController
+			and controllers.BlockBreakController
+			and controllers.MatchController
+			and controllers.ItemDropController then
 			break
 		end
-		task.wait()
+		if os.clock() >= knitDeadline then
+			stopObserving()
+			error('Knit startup and controllers did not become ready within 60s', 0)
+		end
+		task.wait(0.1)
 	end
+
+	local BowConstantsTable
+	if debug and type(debug.getupvalue) == 'function' then
+		local suc, result = pcall(
+			debug.getupvalue,
+			Knit.Controllers.ProjectileController.enableBeam,
+			8
+		)
+		if suc and type(result) == 'table' then
+			BowConstantsTable = result
+		end
+	end
+	BowConstantsTable = BowConstantsTable or {
+		BeamGrowthMultiplier = 0.08,
+		CameraMultiplier = 10,
+		RelX = 0.8,
+		RelY = -0.6,
+		RelZ = 0,
+		YTargetOffset = 0.05
+	}
 
 	local Flamework = require(replicatedStorage['rbxts_include']['node_modules']['@flamework'].core.out).Flamework
 	local InventoryUtil = require(replicatedStorage.TS.inventory['inventory-util']).InventoryUtil
@@ -2018,7 +2139,7 @@ run(function()
 		BlockController = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['block-engine'].out).BlockEngine,
 		BlockEngine = require(lplr.PlayerScripts.TS.lib['block-engine']['client-block-engine']).ClientBlockEngine,
 		BlockPlacer = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['block-engine'].out.client.placement['block-placer']).BlockPlacer,
-		BowConstantsTable = debug.getupvalue(Knit.Controllers.ProjectileController.enableBeam, 8),
+		BowConstantsTable = BowConstantsTable,
 		ClickHold = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out.client.ui.lib.util['click-hold']).ClickHold,
 		Client = Client,
 		ClientSyncEvents = require(lplr.PlayerScripts.TS['client-sync-events']).ClientSyncEvents,
@@ -2045,11 +2166,24 @@ run(function()
 			}
 		end,
 		HudAliveCount = require(lplr.PlayerScripts.TS.controllers.global['top-bar'].ui.game['hud-alive-player-counts']).HudAlivePlayerCounts,
-		ItemMeta = debug.getupvalue(require(replicatedStorage.TS.item['item-meta']).getItemMeta, 1),
+		ItemMeta = require(replicatedStorage.TS.item['item-meta']).items,
+		-- Wanted by SkinChanger. Paths taken from where the game's own controllers import
+		-- them (armor-item-skin-util for the meta, battle-pass-rewards for the id table).
+		ItemSkinType = require(replicatedStorage.TS.games.bedwars['item-skin']['item-skin-types']).ItemSkinType,
+		BedwarsKitSkin = require(replicatedStorage.TS.games.bedwars['kit-skin']['bedwars-kit-skin']).BedwarsKitSkin,
+		BedwarsKitSkinMeta = require(replicatedStorage.TS.games.bedwars['kit-skin']['bedwars-kit-skin-meta']).BedwarsKitSkinMeta,
+		getItemSkinMeta = require(replicatedStorage.TS.games.bedwars['item-skin']['item-skin-meta']).getItemSkinMeta,
 		KillEffectMeta = require(replicatedStorage.TS.locker['kill-effect']['kill-effect-meta']).KillEffectMeta,
 		KillFeedController = Flamework.resolveDependency('client/controllers/game/kill-feed/kill-feed-controller@KillFeedController'),
 		Knit = Knit,
 		KnockbackUtil = require(replicatedStorage.TS.damage['knockback-util']).KnockbackUtil,
+		-- Wanted by the ported kit modules, and by nothing else in this file yet. Paths taken
+		-- from where the game's own controllers import them.
+		AudioManager = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out).AudioManager,
+		BalanceFile = require(replicatedStorage.TS.balance['balance-file']).BalanceFile,
+		FrostyGunMode = require(replicatedStorage.TS.games.bedwars.kit.kits['frosty-gun']['frosty-gun-util']).FrostyGunMode,
+		SoulBrokerConstants = require(replicatedStorage.TS.games.bedwars.kit.kits['soul-broker']['soul-broker-constants']).SoulBrokerConstants,
+		TaliyahUtil = require(replicatedStorage.TS.games.bedwars.kit.kits.taliyah['taliyah-util']).TaliyahUtil,
 		MageKitUtil = require(replicatedStorage.TS.games.bedwars.kit.kits.mage['mage-kit-util']).MageKitUtil,
 		NametagController = Knit.Controllers.NametagController,
 		PartyController = Flamework.resolveDependency('@easy-games/lobby:client/controllers/party-controller@PartyController'),
@@ -2068,7 +2202,7 @@ run(function()
 		Store = require(lplr.PlayerScripts.TS.ui.store).ClientStore,
 		SummonerKitBalance = require(replicatedStorage.TS.games.bedwars.kit.kits.summoner['summoner-kit-balance']).SummonerKitBalance,
 		SyncEventPriority = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['sync-event'].out).SyncEventPriority,
-		TeamUpgradeMeta = debug.getupvalue(require(replicatedStorage.TS.games.bedwars['team-upgrade']['team-upgrade-meta']).getTeamUpgradeMetaForQueue, 7),
+		TeamUpgradeMeta = require(replicatedStorage.TS.games.bedwars['team-upgrade']['team-upgrade-meta']).getTeamUpgradeMetaForQueue(),
 		UILayers = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out).UILayers,
 		VisualizerUtils = require(lplr.PlayerScripts.TS.lib.visualizer['visualizer-utils']).VisualizerUtils,
 		WeldTable = require(replicatedStorage.TS.util['weld-util']).WeldUtil,
@@ -2081,55 +2215,41 @@ run(function()
 		end
 	})
 
-	local remoteNames = {
-		AfkStatus = safeGetProto(Knit.Controllers.AfkController.KnitStart, 1),
-		AttackEntity = Knit.Controllers.SwordController.sendServerRequest,
-		BeePickup = Knit.Controllers.BeeNetController.trigger,
-		CannonAim = safeGetProto(Knit.Controllers.CannonController.startAiming, 5),
-		CannonLaunch = Knit.Controllers.CannonHandController.launchSelf,
-		ConsumeBattery = safeGetProto(Knit.Controllers.BatteryController.onKitLocalActivated, 1),
-		ConsumeItem = safeGetProto(Knit.Controllers.ConsumeController.onEnable, 1),
-		ConsumeSoul = Knit.Controllers.GrimReaperController.consumeSoul,
-		DepositPinata = safeGetProto(safeGetProto(Knit.Controllers.PiggyBankController.KnitStart, 2), 5),
-		DragonBreath = safeGetProto(Knit.Controllers.VoidDragonController.onKitLocalActivated, 5),
-		DragonEndFly = safeGetProto(Knit.Controllers.VoidDragonController.flapWings, 1),
-		DragonFly = Knit.Controllers.VoidDragonController.flapWings,
-		DropItem = Knit.Controllers.ItemDropController.dropItemInHand,
-		EquipItem = safeGetProto(require(replicatedStorage.TS.entity.entities['inventory-entity']).InventoryEntity.equipItem, 4),
-		FireProjectile = debug.getupvalue(Knit.Controllers.ProjectileController.launchProjectileWithValues, 2),
-		GroundHit = Knit.Controllers.FallDamageController.KnitStart,
-		GuitarHeal = Knit.Controllers.GuitarController.performHeal,
-		HannahKill = safeGetProto(Knit.Controllers.HannahController.registerExecuteInteractions, 1),
-		HarvestCrop = safeGetProto(safeGetProto(Knit.Controllers.CropController.KnitStart, 4), 1),
-		KaliyahPunch = safeGetProto(Knit.Controllers.DragonSlayerController.onKitLocalActivated, 1),
-		MageSelect = safeGetProto(Knit.Controllers.MageController.registerTomeInteraction, 1),
-		MinerDig = safeGetProto(Knit.Controllers.MinerController.setupMinerPrompts, 1),
-		PickupItem = Knit.Controllers.ItemDropController.checkForPickup,
-		PickupMetal = safeGetProto(Knit.Controllers.HiddenMetalController.onKitLocalActivated, 4),
-		ReportPlayer = require(lplr.PlayerScripts.TS.controllers.global.report['report-controller']).default.reportPlayer,
-		ResetCharacter = safeGetProto(Knit.Controllers.ResetController.createBindable, 1),
-		SpawnRaven = safeGetProto(Knit.Controllers.RavenController.KnitStart, 1),
-		SummonerClawAttack = Knit.Controllers.SummonerClawHandController.attack,
-		WarlockTarget = safeGetProto(Knit.Controllers.WarlockStaffController.KnitStart, 2)
-	}
+	assert(type(bedwars.ItemMeta) == 'table', 'item-meta.items is unavailable')
+	assert(type(bedwars.TeamUpgradeMeta) == 'table', 'queue team upgrades are unavailable')
 
-	local function dumpRemote(tab)
-		local ind
-		for i, v in tab do
-			if v == 'Client' then
-				ind = i
-				break
-			end
-		end
-		return ind and tab[ind + 1] or ''
-	end
-
-	for i, v in remoteNames do
-		local remote = dumpRemote(debug.getconstants(v))
-		if remote == '' then
-			--[[ notif('Pistonware', 'Failed to grab remote ('..i..')', 10, 'alert') ]]
-		end
-		remotes[i] = remote
+	for name, remote in {
+		AfkStatus = 'AfkInfo',
+		AttackEntity = 'SwordHit',
+		BeePickup = 'PickUpBee',
+		CannonAim = 'AimCannon',
+		CannonLaunch = 'LaunchSelfFromCannon',
+		ConsumeBattery = 'ConsumeBattery',
+		ConsumeItem = 'ConsumeItem',
+		ConsumeSoul = 'ConsumeGrimReaperSoul',
+		DepositPinata = 'DepositCoins',
+		DragonBreath = 'DragonBreath',
+		DragonEndFly = 'VoidDragonEndFlying',
+		DragonFly = 'DragonFlap',
+		DropItem = 'DropItem',
+		EquipItem = 'SetInvItem',
+		FireProjectile = 'ProjectileFire',
+		GroundHit = 'GroundHit',
+		GuitarHeal = 'PlayGuitar',
+		HannahKill = 'HannahPromptTrigger',
+		HarvestCrop = 'CropHarvest',
+		KaliyahPunch = 'PlayerDragonPunched',
+		MageSelect = 'LearnElementTome',
+		MinerDig = 'DestroyPetrifiedPlayer',
+		PickupItem = 'PickupItemDrop',
+		PickupMetal = 'CollectCollectableEntity',
+		ReportPlayer = 'ReportPlayer',
+		ResetCharacter = 'ResetCharacter',
+		SpawnRaven = 'SpawnRaven',
+		SummonerClawAttack = 'SummonerClawAttackRequest',
+		WarlockTarget = 'WarlockLinkTarget'
+	} do
+		remotes[name] = remote
 	end
 
 	OldBreak = bedwars.BlockController.isBlockBreakable
@@ -2422,22 +2542,62 @@ run(function()
 		return worldpos
 	end
 
+	--[[ Suppressing the place-block animation has to be re-entrancy safe.
+
+	It used to save whatever sat in AnimationUtil.playAnimation, stub it, and put the saved
+	value back when the placement finished. That is only correct for one placement at a
+	time, and placements are never one at a time: blockPlacer:placeBlock ends in
+	BlockEngineRemotes.Client:Get('PlaceBlock'):CallServer(...), which yields on the round
+	trip, and Scaffold and Nuker both dispatch through task.spawn. So two overlap
+	constantly:
+
+	    A: saves the real function, installs the stub, yields in CallServer
+	    B: saves THE STUB as "the real function", installs the stub, yields
+	    A: resumes, restores the real function
+	    B: resumes, restores the stub  <- permanent
+
+	AnimationUtil.playAnimation is game-core's shared animation entry point, not a
+	block-placement detail, so from that moment the client plays no animations at all --
+	no swing, no place, no break -- until a rejoin. It bites hardest on mobile, where the
+	framerate is low enough that a CallServer spans several placement ticks.
+
+	One stored original and a depth count instead: the stub goes in when the first
+	placement starts and comes out only when the last one finishes, in whatever order they
+	happen to interleave. ]]
+	local placeAnimOriginal, placeAnimDepth = nil, 0
+
+	local function suppressPlaceAnimation()
+		if not bedwars.AnimationUtil then return false end
+		if placeAnimDepth == 0 then
+			placeAnimOriginal = bedwars.AnimationUtil.playAnimation
+			bedwars.AnimationUtil.playAnimation = function() end
+		end
+		placeAnimDepth += 1
+		return true
+	end
+
+	local function restorePlaceAnimation()
+		placeAnimDepth -= 1
+		if placeAnimDepth > 0 then return end
+		placeAnimDepth = 0
+		if placeAnimOriginal then
+			bedwars.AnimationUtil.playAnimation = placeAnimOriginal
+			placeAnimOriginal = nil
+		end
+	end
+
 	bedwars.placeBlock = function(pos, item, animate)
 		if not getItem(item) then return end
 
 		store.blockPlacer.blockType = item
-		local oldAnimation
-		if animate == false and bedwars.AnimationUtil then
-			oldAnimation = bedwars.AnimationUtil.playAnimation
-			bedwars.AnimationUtil.playAnimation = function() end
-		end
+		local suppressed = animate == false and suppressPlaceAnimation()
 
 		local ok, result = pcall(function()
 			return store.blockPlacer:placeBlock(bedwars.BlockController:getBlockPosition(pos))
 		end)
-		if oldAnimation then
-			bedwars.AnimationUtil.playAnimation = oldAnimation
-		end
+		-- Inside the pcall's shadow on purpose: an error thrown by placeBlock must still
+		-- decrement, or the depth never returns to zero and the stub stays for good.
+		if suppressed then restorePlaceAnimation() end
 		if not ok then error(result, 0) end
 		return result
 	end
@@ -2913,28 +3073,56 @@ run(function()
 		until vape.Loaded == nil
 	end)
 
-	pcall(function()
-		if getthreadidentity and setthreadidentity then
-			local old = getthreadidentity()
-			setthreadidentity(2)
+	task.spawn(function()
+		local deadline = os.clock() + 60
+		local lastError = 'shop initialization has not completed'
+		while vape.Loaded ~= nil do
+			local oldIdentity
+			local shop
+			local canSetIdentity = type(getthreadidentity) == 'function'
+				and type(setthreadidentity) == 'function'
+			local ok, err = xpcall(function()
+				if canSetIdentity then
+					oldIdentity = getthreadidentity()
+					assert(type(oldIdentity) == 'number', 'thread identity is unavailable')
+					setthreadidentity(2)
+				else
+					assert(bedwars.AppController
+						and bedwars.AppController:isAppOpen('BedwarsItemShopApp'),
+						'open the item shop to initialize AutoBuy on this executor')
+				end
 
-			bedwars.Shop = require(replicatedStorage.TS.games.bedwars.shop['bedwars-shop']).BedwarsShop
-			bedwars.ShopItems = debug.getupvalue(debug.getupvalue(bedwars.Shop.getShopItem, 1), 2)
-			bedwars.Shop.getShopItem('iron_sword', lplr)
+				shop = require(replicatedStorage.TS.games.bedwars.shop['bedwars-shop']).BedwarsShop
+				assert(type(shop) == 'table' and type(shop.getShopItem) == 'function'
+					and type(shop.ShopItems) == 'table', 'shop data is not ready')
+				shop.getShopItem('iron_sword', lplr)
+			end, errorTrace)
 
-			setthreadidentity(old)
-			store.shopLoaded = true
-		else
-			task.spawn(function()
-				repeat
-					task.wait(0.1)
-				until vape.Loaded == nil or bedwars.AppController:isAppOpen('BedwarsItemShopApp')
-
-				bedwars.Shop = require(replicatedStorage.TS.games.bedwars.shop['bedwars-shop']).BedwarsShop
-				bedwars.ShopItems = debug.getupvalue(debug.getupvalue(bedwars.Shop.getShopItem, 1), 2)
+			if type(oldIdentity) == 'number' then
+				local restored, restoreError = pcall(setthreadidentity, oldIdentity)
+				if not restored then
+					bufferCall('error', 'bedwars.shop.identity', tostring(restoreError))
+					if vape.Loaded ~= nil then
+						notif('AutoBuy', 'Shop initialization could not restore thread identity.', 10, 'alert')
+					end
+					return
+				end
+			end
+			if vape.Loaded == nil then return end
+			if ok then
+				bedwars.Shop = shop
+				bedwars.ShopItems = shop.ShopItems
 				store.shopLoaded = true
-			end)
+				return
+			end
+
+			lastError = tostring(err)
+			if os.clock() >= deadline then break end
+			task.wait(0.5)
 		end
+		if vape.Loaded == nil then return end
+		bufferCall('error', 'bedwars.shop.initialize', lastError)
+		notif('AutoBuy', 'Shop initialization failed. Open the item shop and reinject; see the error log.', 10, 'alert')
 	end)
 
 	vape:Clean(function()
@@ -2954,6 +3142,15 @@ run(function()
 		storeChanged = nil
 	end)
 end)
+if not bootstrapOk then
+	bufferCall('error', 'bedwars.bootstrap', bootstrapError)
+	return {
+		PistonwareBootFailure = true,
+		stage = 'bedwars.bootstrap',
+		error = tostring(bootstrapError)
+	}
+end
+end
 
 for _, v in {'AntiRagdoll', 'TriggerBot', 'SilentAim', 'AutoRejoin', 'Rejoin', 'Disabler', 'Timer', 'ServerHop', 'MouseTP', 'MurderMystery', 'Swim', 'Jesus', 'Invisible', 'Desync', 'Waypoints', 'PlayerModel', 'Schematica'} do
 	vape:Remove(v)
@@ -3572,11 +3769,6 @@ run(function()
 		Max = 9,
 		DefaultMin = 7,
 		DefaultMax = 7
-	})
-	AFKCheck = TriggerBot:CreateToggle({
-		Name = 'AFK check',
-		Default = true,
-		Tooltip = 'Skips players who expose an AFK attribute.'
 	})
 end)
 	
@@ -4237,6 +4429,7 @@ end)
 	
 run(function()
 	local Speed
+	local Mode
 	local Value
 	local WallCheck
 	local AutoJump
@@ -4262,7 +4455,13 @@ run(function()
 						local state = hum:GetState()
 						if state == Enum.HumanoidStateType.Climbing then return end
 
-						local root, velo = char.RootPart, getSpeed()
+						--[[ getSpeed() is the wrapped one -- DamageBoost adds its boost on top of
+						the real walk speed, and this module spends whatever it reports. So on
+						Blatant a hit that boosts you also makes Speed carry you further, on top
+						of the boost itself. Legit reads the unwrapped figure instead, which is
+						the speed the server thinks you have. ]]
+						local root = char.RootPart
+						local velo = (Mode.Value == 'Legit' and rawGetSpeed or getSpeed)()
 						local moveDirection = AntiFallDirection or hum.MoveDirection
 						local destination = (moveDirection * math.max(Value.Value - velo, 0) * dt)
 
@@ -4292,6 +4491,13 @@ run(function()
 			return 'Heatseeker'
 		end,
 		Tooltip = 'Speeds you up. Pick whichever method works best for you.'
+	})
+	--[[ First in the list because it changes what the slider below is measured against. ]]
+	Mode = Speed:CreateDropdown({
+		Name = 'Mode',
+		List = {'Blatant', 'Legit'},
+		Default = 'Blatant',
+		Tooltip = 'Legit ignores the DamageBoost speed boost when working out how\nmuch to top you up. Blatant spends it.'
 	})
 	Value = Speed:CreateSlider({
 		Name = 'Speed',
@@ -4484,25 +4690,49 @@ run(function()
         }
     end
 
-    --[[ A model is often tagged a frame before its PrimaryPart is assigned. Reading
-    v.PrimaryPart at tag time then gives nil and the billboard is skipped forever
-    (why it only worked after a disable/re-enable, once the models were fully built).
-    Wait for PrimaryPart before adding. ]]
+    --[[ The part a billboard hangs off.
+
+    PrimaryPart on its own was the mistake, and the beekeeper skins are where it shows.
+    The stock Assets.Effects.Bee model has PrimaryPart set -- to its Root part -- but
+    MeadowBee, the model the Meadow Beekeeper skin swaps in through
+    BedwarsKitSkinMeta[MEADOW_BEEKEEPER].beekeeper.beeModel, has no PrimaryPart set at
+    all. So the wait below timed out on every bee and not one billboard was built.
+
+    The game never needed it either: bee-controller reaches for `beeModel.Root` by name
+    and moves the bee with PivotTo, which falls back to the bounding box when there is no
+    PrimaryPart. Root is also where it parents every constraint it adds, so Root is the
+    real anchor and PrimaryPart was only ever a convenience the stock asset happened to
+    carry. Any BasePart after that, so a model authored without either still gets a
+    billboard somewhere sensible instead of none.
+
+    A tagged BasePart is handled up front because indexing PrimaryPart on one throws
+    rather than returning nil, and these tags are the game's, not ours. ]]
+    local function espPart(v)
+        if v:IsA('BasePart') then return v end
+        if not v:IsA('Model') then return nil end
+        return v.PrimaryPart or v:FindFirstChild('Root') or v:FindFirstChildWhichIsA('BasePart')
+    end
+
+    --[[ A model is often tagged a frame before its parts are in place, so a first look
+    that comes back empty is retried rather than dropped (that is why this used to work
+    only after a disable/re-enable, once the models had finished building). ]]
     local function addWhenReady(v, icon)
         if not v then return end
-        if v.PrimaryPart then
-            ModelParts[v] = v.PrimaryPart
-            Added(v.PrimaryPart, icon)
+        local part = espPart(v)
+        if part then
+            ModelParts[v] = part
+            Added(part, icon)
             return
         end
         task.spawn(function()
             local timeout = os.clock() + 5
-            while not v.PrimaryPart and v.Parent and os.clock() < timeout do
+            while not part and v.Parent and os.clock() < timeout do
                 task.wait()
+                part = espPart(v)
             end
-            if v.PrimaryPart and KitESP and KitESP.Enabled then
-                ModelParts[v] = v.PrimaryPart
-                Added(v.PrimaryPart, icon)
+            if part and KitESP and KitESP.Enabled then
+                ModelParts[v] = part
+                Added(part, icon)
             end
         end)
     end
@@ -4528,7 +4758,8 @@ run(function()
         end))
 
         table.insert(kitConns, collectionService:GetInstanceRemovedSignal(tag):Connect(function(v)
-            local part = ModelParts[v] or v.PrimaryPart
+            -- espPart, not PrimaryPart, or a skinned model's billboard outlives it
+            local part = ModelParts[v] or espPart(v)
             ModelParts[v] = nil
             if part and Reference[part] then
                 if vape.ThreadFix then
@@ -4627,6 +4858,61 @@ run(function()
     })
 end)
 
+--[[ The game's own nametags, and who wants them gone.
+
+They are drawn by NametagController.addGameNametag -- the only thing that builds one, since
+the game turns Roblox's own Humanoid display off (NameDisplayDistance = 0) and calls this for
+every entity, players and mobs alike.
+
+Two modules want them out of the way now. FPS Boost has always had a toggle for it, and
+NameTags needs it as well: ours draws the same name and the same health in the same place, so
+with the game's still up you get both, one on top of the other. That is what the doubled text
+and the stray coloured icon beside each name were -- the icon is the game's, not ours (ours
+cannot be drawn at the left of the text: positionIcons is the only thing that ever makes one
+visible, and it sets the position in the same breath).
+
+Ref-counted rather than a plain flag, because two owners would otherwise fight: turning FPS
+Boost off would hand the game's tags back while NameTags was still drawing its own, and the
+doubling would return with no obvious cause. ]]
+local gameNametagHiders = {}
+local oldAddGameNametag
+
+local function hideGameNametags(owner)
+    gameNametagHiders[owner] = true
+
+    local controller = bedwars.NametagController
+    if not (controller and bedwars.AppController) then return end
+    if oldAddGameNametag then return end
+
+    oldAddGameNametag = controller.addGameNametag
+    controller.addGameNametag = function() end
+    for _, v in bedwars.AppController:getOpenApps() do
+        if tostring(v):find('Nametag') then
+            bedwars.AppController:closeApp(tostring(v))
+        end
+    end
+end
+
+--[[ Puts the builder back and re-runs it over everything currently tagged as an entity, since
+the tags closed above will not come back on their own until that character is re-tagged (i.e.
+respawns). addGameNametag bails on its own for anyone whose tag is already open, so this fills
+the gaps without doubling anybody up, and it still honours NoNametag / shouldShowNametag. ]]
+local function showGameNametags(owner)
+    gameNametagHiders[owner] = nil
+    if next(gameNametagHiders) ~= nil then return end
+
+    local controller = bedwars.NametagController
+    if not (controller and oldAddGameNametag) then return end
+
+    controller.addGameNametag = oldAddGameNametag
+    oldAddGameNametag = nil
+    for _, char in collectionService:GetTagged('entity') do
+        pcall(function()
+            controller:addGameNametag(char)
+        end)
+    end
+end
+
 run(function()
 	local NameTags
 	local Targets
@@ -4636,6 +4922,7 @@ run(function()
 	local Health
 	local Distance
 	local Equipment
+	local ShowKit
 	local Rank
 	local Enchant
 	local Device
@@ -4646,10 +4933,14 @@ run(function()
 	local DistanceCheck
 	local DistanceLimit
 	local Strings, Sizes, Reference = {}, {}, {}
+
 	local Folder
 	
 	pcall(function()
 		Folder = Instance.new('Folder')
+		-- Named so NameHider can find it: it ignores vape's own GUI by default, and these
+		-- labels are full of player names
+		Folder.Name = 'NameTags'
 		Folder.Parent = vape.gui
 	end)
 	
@@ -4688,8 +4979,17 @@ run(function()
 	unaffected, and with both showing they sit flush against each other -- the same
 	30px step the equipment row above uses, so the two rows line up. ]]
 	local ICON_SIZE = 30
-	local rightIcons = {'RankIcon', 'EnchantIcon'}
-	local function positionIcons(nametag, width)
+	--[[ Kit leads the row: it is the thing you read first about a player, and it used to be
+	stranded up in the equipment strip a whole row above the name. These sit INLINE with the
+	text instead, which is what the rest of this row has always done. ]]
+	local rightIcons = {'Kit', 'RankIcon', 'EnchantIcon'}
+
+	--[[ `height` is the nametag's own pixel height, so the icons scale with the tag instead
+	of staying pinned at 30px. That was the other half of the mismatch: the text follows the
+	Scale slider and a fixed 30 did not, so the icons drifted out of line with the tag the
+	moment Scale moved off 1. Sized to the tag and sitting at y = 0, they are flush with it. ]]
+	local function positionIcons(nametag, width, height)
+		local iconSize = height or ICON_SIZE
 		local offset = width + 10
 		for _, name in rightIcons do
 			local icon = nametag:FindFirstChild(name)
@@ -4697,8 +4997,9 @@ run(function()
 				local shown = icon.Image ~= ''
 				icon.Visible = shown
 				if shown then
-					icon.Position = UDim2.fromOffset(offset, -4)
-					offset += ICON_SIZE
+					icon.Size = UDim2.fromOffset(iconSize, iconSize)
+					icon.Position = UDim2.fromOffset(offset, 0)
+					offset += iconSize
 				end
 			end
 		end
@@ -4760,6 +5061,49 @@ run(function()
 		end)
 	end
 
+	--[[ Green at full, red at none -- and never a throw.
+
+	MaxHealth is not always a usable number at the moment a tag is built: an entity can reach
+	the builder a frame before its Humanoid is populated, and 0 or nil there made this divide
+	nan or throw outright. That took the whole build down with it, and since Reference[ent] is
+	only assigned on the very last line of the build, the entity ended up with no tag AND no
+	way to get one -- which is what "sometimes they just do not appear" was.
+
+	Falling back to full health draws a tag that is briefly the wrong colour; the next update
+	corrects it. A missing tag does not correct itself. ]]
+	local function tagHealthColor(ent)
+		local maxHealth = ent.MaxHealth
+		local fraction = 1
+
+		if type(maxHealth) == 'number' and maxHealth > 0 then
+			fraction = (ent.Health or maxHealth) / maxHealth
+		end
+
+		-- clamp does not tame a nan, and Color3.fromHSV throws on one
+		if fraction ~= fraction then
+			fraction = 1
+		end
+
+		return Color3.fromHSV(math.clamp(fraction, 0, 1) / 2.5, 0.89, 0.75)
+	end
+
+	--[[ NameHider, applied before the name is ever drawn.
+
+	It also watches these labels from the outside, but that is a race this module can simply
+	not enter: it knows the name at the moment it builds the string, so it can hide it there.
+	Doing it here also survives the distance rewrite in the render loop, which puts the whole
+	original string back on the label every time the number changes.
+
+	Reads the function fresh each time rather than caching it, so turning NameHider off takes
+	effect on the next tag without either module knowing about the other. ]]
+	local function hideNames(text)
+		local hide = genv.PistonwareHideName
+		if type(hide) ~= 'function' then return text end
+
+		local ok, res = pcall(hide, text)
+		return (ok and type(res) == 'string') and res or text
+	end
+
 	local deviceEmojis = {gamepad = '🎮', touch = '📱', keyboard = '🖥️'}
 
 	local function getDeviceEmoji(plr)
@@ -4792,16 +5136,40 @@ run(function()
 		return name ~= '' and deviceEmojis.keyboard or nil
 	end
 
+	--[[ Whether this entity should carry a tag at all.
+
+	This is the upstream filter, unchanged: ent.Targetable is entitylib's own answer to
+	"is this someone I am against", and ent.Friend covers a whitelisted player on the
+	other team. What was wrong was never the rule -- it was that Targetable had stopped
+	tracking the truth.
+
+	entitylib decides Targetable through targetCheck, which for bedwars compares the Team
+	ATTRIBUTE, but the only thing that asked it to look again was a listener on the Team
+	PROPERTY, which bedwars never sets. So Targetable was fixed at the instant the entity
+	was built -- before the team had replicated, for most of them -- and stayed wrong for
+	the rest of the match. addPlayer now refreshes on the attribute instead, so this is a
+	live answer again and the workaround that used to live here is gone.
+
+	Declared HERE, above Added, on purpose. The previous version sat below it, so both
+	call sites resolved the name as a global instead of an upvalue and read nil: with
+	Priority Only on, every single tag build threw on the call and was swallowed by the
+	pcall around it. That is the whole of "nametags only work with Priority Only off". ]]
+	local function passesFilter(ent)
+		if not Targets.Players.Enabled and ent.Player then return false end
+		if not Targets.NPCs.Enabled and ent.NPC then return false end
+		if Teammates.Enabled and (not ent.Targetable) and (not ent.Friend) then return false end
+		return true
+	end
+
 	local Added = {
 		Normal = function(ent)
 			pcall(function()
-				if not Targets.Players.Enabled and ent.Player then return end
-				if not Targets.NPCs.Enabled and ent.NPC then return end
-				if Teammates.Enabled and (not ent.Targetable) and (not ent.Friend) then return end
+				if not passesFilter(ent) then return end
 				if Reference[ent] then return end --[[ Prevent duplicates ]]
 
 				local nametag = Instance.new('TextLabel')
-				Strings[ent] = ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name
+				Reference[ent] = nametag
+				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				if Device.Enabled and ent.Player then
 					local emoji = getDeviceEmoji(ent.Player)
@@ -4811,7 +5179,7 @@ run(function()
 				end
 
 				if Health.Enabled then
-					local healthColor = Color3.fromHSV(math.clamp(ent.Health / ent.MaxHealth, 0, 1) / 2.5, 0.89, 0.75)
+					local healthColor = tagHealthColor(ent)
 					Strings[ent] = Strings[ent]..' <font color="rgb('..tostring(math.floor(healthColor.R * 255))..','..tostring(math.floor(healthColor.G * 255))..','..tostring(math.floor(healthColor.B * 255))..')">'..math.round(ent.Health)..'</font>'
 				end
 
@@ -4819,8 +5187,11 @@ run(function()
 					Strings[ent] = '<font color="rgb(85, 255, 85)">[</font><font color="rgb(255, 255, 255)">%s</font><font color="rgb(85, 255, 85)">]</font> '..Strings[ent]
 				end
 
+				--[[ Kit is no longer one of these. It is not equipment -- it does not change
+				as they swap items -- and it now has its own toggle and its own slot beside the
+				name. The four that are left keep the exact offsets they always had. ]]
 				if Equipment.Enabled then
-					for i, v in {'Hand', 'Helmet', 'Chestplate', 'Boots', 'Kit'} do
+					for i, v in {'Hand', 'Helmet', 'Chestplate', 'Boots'} do
 						local Icon = Instance.new('ImageLabel')
 						Icon.Name = v
 						Icon.Size = UDim2.fromOffset(30, 30)
@@ -4834,8 +5205,25 @@ run(function()
 				nametag.TextSize = 14 * Scale.Value
 				nametag.FontFace = FontOption.Value
 				local size = getfontsize(removeTags(Strings[ent]), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
+				if Reference[ent] ~= nametag then
+					nametag:Destroy()
+					return
+				end
 				nametag.Name = ent.Player and ent.Player.Name or ent.Character.Name
 				nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
+
+				--[[ Same shape as the Rank and Enchant icons below: no Position and no Size
+				here, because positionIcons owns the layout and setting either now would flash
+				the icon at a slot and a scale it may not end up at. ]]
+				if ShowKit.Enabled and ent.Player then
+					local Icon = Instance.new('ImageLabel')
+					Icon.Name = 'Kit'
+					Icon.Size = UDim2.fromOffset(ICON_SIZE, ICON_SIZE)
+					Icon.BackgroundTransparency = 1
+					Icon.Image = getKitRenderImage(ent.Player)
+					Icon.Visible = false
+					Icon.Parent = nametag
+				end
 
 				--[[ Rank Icon: sits immediately to the right of the text, so it has to be
 				built after the text has been measured ]]
@@ -4865,8 +5253,8 @@ run(function()
 					watchEnchant(ent)
 				end
 
-				--[[ after both right-side icons exist, so each lands at its own slot ]]
-				positionIcons(nametag, size.X)
+				--[[ after every right-side icon exists, so each lands at its own slot ]]
+				positionIcons(nametag, size.X, size.Y + 7)
 
 				nametag.AnchorPoint = Vector2.new(0.5, 1)
 				nametag.BackgroundColor3 = Color3.new()
@@ -4876,15 +5264,16 @@ run(function()
 				nametag.Text = Strings[ent]
 				nametag.TextColor3 = entitylib.getEntityColor(ent) or Color3.fromHSV(Color.Hue, Color.Sat, Color.Value)
 				nametag.RichText = true
+				if Reference[ent] ~= nametag then
+					nametag:Destroy()
+					return
+				end
 				nametag.Parent = Folder
-				Reference[ent] = nametag
 			end)
 		end,
 		Drawing = function(ent)
 			pcall(function()
-				if not Targets.Players.Enabled and ent.Player then return end
-				if not Targets.NPCs.Enabled and ent.NPC then return end
-				if Teammates.Enabled and (not ent.Targetable) and (not ent.Friend) then return end
+				if not passesFilter(ent) then return end
 				if Reference[ent] then return end
 
 				local nametag = {}
@@ -4897,7 +5286,7 @@ run(function()
 				nametag.Text.Size = 15 * Scale.Value
 				nametag.Text.Font = 0
 				nametag.Text.ZIndex = 2
-				Strings[ent] = ent.Player and whitelist:tag(ent.Player, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name
+				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				--[[ Drawing text only; the rank icon needs an ImageLabel, which this render
 				path has no equivalent for ]]
@@ -4930,10 +5319,13 @@ run(function()
 				unwatchEnchant(ent)
 				local v = Reference[ent]
 				if v then
+					if vape.ThreadFix then
+						setthreadidentity(8)
+					end
+					v:Destroy()
 					Reference[ent] = nil
 					Strings[ent] = nil
 					Sizes[ent] = nil
-					v:Destroy()
 				end
 			end)
 		end,
@@ -4958,17 +5350,91 @@ run(function()
 		end
 	}
 	
+	--[[ Whether this entity table has been superseded.
+
+	entitylib hands a player a NEW entity table when their character is replaced, and the old
+	one can still be sitting in entitylib.List with a RootPart that is still parented -- the
+	previous character, wherever it was left. A tag built against that table renders at that
+	position, which is how two tags for the same player ended up on screen with one of them
+	parked in the sky.
+
+	Only a DIFFERENT live entity counts as superseded. getEntity comes back nil for a moment
+	while a player is dead, and treating that as stale would tear a tag down and build it again
+	a second later, every death, for everyone. ]]
+	local function supersededEntity(ent)
+		local plr = ent.Player
+		if not plr then return false end
+
+		--[[ Compared against the player's OWN Character rather than asked of entitylib.
+
+		entitylib.getEntity is called with a character instance everywhere else in this file,
+		so handing it a Player was never going to come back with anything -- which made this
+		return false for everybody and pruned nothing. Duplicate tags for one player, at three
+		different places on screen, were the result.
+
+		Player.Character is the authority on which character is current, and an entity table
+		built around a previous one is by definition finished. ]]
+		local live = plr.Character
+		local mine = ent.Character
+
+		-- live is nil for a moment while they are dead; treating that as stale would tear
+		-- every tag down and rebuild it on every death
+		return live ~= nil and mine ~= nil and mine ~= live
+	end
+
+	--[[ A tag that is missing gets rebuilt here rather than staying missing.
+
+	Added assigns Reference[ent] on its very last line, so anything that throws part way
+	through the build -- and the whole build sits under a pcall -- leaves that entity with no
+	tag and no way back: both Updated paths bailed on a nil Reference, and the render loop
+	only ever drops entries. One bad frame while a character streamed in and that player had
+	no nametag for the rest of the round.
+
+	EntityUpdated fires constantly (health, equipment), so this costs a table lookup on the
+	common path and repairs the rare one within moments. Added re-applies the Targets and
+	Teammates filters itself, so an entity that is deliberately untagged stays untagged. ]]
+	local function rebuildTag(ent, method)
+		local existing = Reference[ent]
+		if existing then
+			Removed[method](ent)
+		end
+
+		Added[method](ent)
+		return Reference[ent] ~= nil
+	end
+
 	local Updated = {
 		Normal = function(ent)
 			pcall(function()
+				--[[ The filter is re-asked here, which the upstream module has no need to do.
+
+				Targetable now genuinely CHANGES during a round -- addPlayer refreshes it when
+				the Team attribute lands and fires this very event -- so a tag can become owed
+				to somebody who was correctly skipped a moment ago, and owed by somebody who
+				was correctly given one. Both directions are handled from the same place the
+				change is announced, which is why the retry sweep that used to sit in the
+				module loop is gone. ]]
+				if not passesFilter(ent) then
+					if Reference[ent] then
+						Removed['Normal'](ent)
+					end
+					return
+				end
+
 				local nametag = Reference[ent]
-				if not nametag or not nametag.Parent then return end
+
+				-- Parent as well as existence: the label is dropped by the render loop when
+				-- its container goes, and that left the entity in the same dead end
+				if not nametag or not nametag.Parent then
+					rebuildTag(ent, 'Normal')
+					return
+				end
 				
 				if vape.ThreadFix then
 					setthreadidentity(8)
 				end
 				Sizes[ent] = nil
-				Strings[ent] = ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name
+				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				if Device.Enabled and ent.Player then
 					local emoji = getDeviceEmoji(ent.Player)
@@ -4978,7 +5444,7 @@ run(function()
 				end
 
 				if Health.Enabled then
-					local healthColor = Color3.fromHSV(math.clamp(ent.Health / ent.MaxHealth, 0, 1) / 2.5, 0.89, 0.75)
+					local healthColor = tagHealthColor(ent)
 					Strings[ent] = Strings[ent]..' <font color="rgb('..tostring(math.floor(healthColor.R * 255))..','..tostring(math.floor(healthColor.G * 255))..','..tostring(math.floor(healthColor.B * 255))..')">'..math.round(ent.Health)..'</font>'
 				end
 
@@ -4987,13 +5453,20 @@ run(function()
 				end
 
 				if Equipment.Enabled and store.inventories[ent.Player] and nametag:FindFirstChild("Hand") then
-					local kit = ent.Player:GetAttribute('PlayingAsKit')
 					local inventory = store.inventories[ent.Player]
 					nametag.Hand.Image = bedwars.getIcon(inventory.hand or {itemType = ''}, true)
 					nametag.Helmet.Image = bedwars.getIcon(inventory.armor[4] or {itemType = ''}, true)
 					nametag.Chestplate.Image = bedwars.getIcon(inventory.armor[5] or {itemType = ''}, true)
 					nametag.Boots.Image = bedwars.getIcon(inventory.armor[6] or {itemType = ''}, true)
-					nametag.Kit.Image = kit and kit ~= 'none' and bedwars.BedwarsKitMeta[kit].renderImage or ''
+				end
+
+				-- FindFirstChild, not an index: the icon only exists when the toggle was on at
+				-- the moment this tag was built.
+				if ShowKit.Enabled and ent.Player then
+					local icon = nametag:FindFirstChild('Kit')
+					if icon then
+						icon.Image = getKitRenderImage(ent.Player)
+					end
 				end
 
 				if Rank.Enabled and ent.Player then
@@ -5012,20 +5485,38 @@ run(function()
 
 				local size = getfontsize(removeTags(Strings[ent]), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
 				nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
-				positionIcons(nametag, size.X)
+				positionIcons(nametag, size.X, size.Y + 7)
 				nametag.Text = Strings[ent]
 			end)
 		end,
 		Drawing = function(ent)
 			pcall(function()
+				--[[ The filter is re-asked here, which the upstream module has no need to do.
+
+				Targetable now genuinely CHANGES during a round -- addPlayer refreshes it when
+				the Team attribute lands and fires this very event -- so a tag can become owed
+				to somebody who was correctly skipped a moment ago, and owed by somebody who
+				was correctly given one. Both directions are handled from the same place the
+				change is announced, which is why the retry sweep that used to sit in the
+				module loop is gone. ]]
+				if not passesFilter(ent) then
+					if Reference[ent] then
+						Removed['Drawing'](ent)
+					end
+					return
+				end
+
 				local nametag = Reference[ent]
-				if not nametag then return end
+				if not nametag then
+					rebuildTag(ent, 'Drawing')
+					return
+				end
 				
 				if vape.ThreadFix then
 					setthreadidentity(8)
 				end
 				Sizes[ent] = nil
-				Strings[ent] = ent.Player and whitelist:tag(ent.Player, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name
+				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				if Device.Enabled and ent.Player then
 					local emoji = getDeviceEmoji(ent.Player)
@@ -5040,11 +5531,6 @@ run(function()
 
 				if Distance.Enabled then
 					Strings[ent] = '[%s] '..Strings[ent]
-					nametag.Text.Text = entitylib.isAlive and string.format(Strings[ent], math.floor((entitylib.character.RootPart.Position - ent.RootPart.Position).Magnitude)) or Strings[ent]
-				else
-					nametag.Text.Text = Strings[ent]
-				end
-				if Distance.Enabled then
 					nametag.Text.Text = entitylib.isAlive and string.format(Strings[ent], math.floor((entitylib.character.RootPart.Position - ent.RootPart.Position).Magnitude)) or Strings[ent]
 				else
 					nametag.Text.Text = Strings[ent]
@@ -5085,6 +5571,80 @@ run(function()
 		end
 	}
 	
+	--[[ One tag's worth of work, under its own pcall.
+
+	The comment inside spells out why a throw here used to freeze every tag after it in the
+	iteration. The RootPart read it describes is guarded now, but that was never the only
+	thing in here that can throw: ent.HipHeight is arithmetic on a field nothing guarantees,
+	string.format walks a Strings entry that has to carry a %s, and getfontsize is handed a
+	FontFace. Any one of them abandoning the frame leaves every remaining tag exactly where
+	it was last drawn -- and it repeats every frame, so they stay there while you walk away.
+
+	A pcall per tag per frame is a handful of nanoseconds against sixteen tags. Losing one
+	tag for a frame is a flicker; losing the rest of the list is the bug being reported. ]]
+	local function drawTag(ent, nametag, selfPos)
+		pcall(function()
+					
+			--[[ THIS is why tags froze on screen.
+
+			The whole loop used to sit under one pcall. An entity whose RootPart had gone --
+			died, streamed out, character swapped -- threw on `ent.RootPart.Position`, and
+			that one throw abandoned the rest of the frame. Every tag after it in the
+			iteration kept the Position and the Visible it was last given, so they hung
+			wherever they had been drawn while the players they belonged to walked away. It
+			repeated every frame for as long as the dead entity stayed in Reference, which is
+			until its label is destroyed -- so it never cleared on its own.
+
+			A missing RootPart is now just a hidden tag. The entry is deliberately LEFT in
+			Reference: Removed is what destroys the label, and it finds it through this
+			very table, so clearing it here would orphan the TextLabel under Folder for
+			the rest of the round. entitylib will report the entity properly soon enough
+			and the real cleanup happens there. ]]
+			local root = ent.RootPart
+			if not (root and root.Parent) then
+				nametag.Visible = false
+				return
+			end
+
+			--[[ And never draw against a character its player has moved on from. The
+			sweep prunes these once a second, which is up to a second of a tag sitting
+			over an empty spot -- two property reads a frame is cheaper than explaining
+			that to anyone. ]]
+			if supersededEntity(ent) then
+				nametag.Visible = false
+				return
+			end
+
+			local rootPos = root.Position
+
+			if DistanceCheck.Enabled then
+				local distance = selfPos and (selfPos - rootPos).Magnitude or math.huge
+				if distance < DistanceLimit.ValueMin or distance > DistanceLimit.ValueMax then
+					nametag.Visible = false
+					return
+				end
+			end
+
+			local headPos, headVis = gameCamera:WorldToViewportPoint(rootPos + Vector3.new(0, ent.HipHeight + 1, 0))
+			nametag.Visible = headVis
+			if not headVis then
+				return
+			end
+
+			if Distance.Enabled then
+				local mag = selfPos and math.floor((selfPos - rootPos).Magnitude) or 0
+				if Sizes[ent] ~= mag then
+					nametag.Text = string.format(Strings[ent], mag)
+					local size = getfontsize(removeTags(nametag.Text), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
+					nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
+					positionIcons(nametag, size.X, size.Y + 7)
+					Sizes[ent] = mag
+				end
+			end
+			nametag.Position = UDim2.fromOffset(headPos.X, headPos.Y)
+		end)
+	end
+
 	local Loop = {
 		Normal = function()
 			pcall(function()
@@ -5096,32 +5656,7 @@ run(function()
 						Reference[ent] = nil
 						continue
 					end
-					
-					if DistanceCheck.Enabled then
-						local distance = selfPos and (selfPos - ent.RootPart.Position).Magnitude or math.huge
-						if distance < DistanceLimit.ValueMin or distance > DistanceLimit.ValueMax then
-							nametag.Visible = false
-							continue
-						end
-					end
-
-					local headPos, headVis = gameCamera:WorldToViewportPoint(ent.RootPart.Position + Vector3.new(0, ent.HipHeight + 1, 0))
-					nametag.Visible = headVis
-					if not headVis then
-						continue
-					end
-
-					if Distance.Enabled then
-						local mag = selfPos and math.floor((selfPos - ent.RootPart.Position).Magnitude) or 0
-						if Sizes[ent] ~= mag then
-							nametag.Text = string.format(Strings[ent], mag)
-						local size = getfontsize(removeTags(nametag.Text), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
-						nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
-						positionIcons(nametag, size.X)
-							Sizes[ent] = mag
-						end
-					end
-					nametag.Position = UDim2.fromOffset(headPos.X, headPos.Y)
+					drawTag(ent, nametag, selfPos)
 				end
 			end)
 		end,
@@ -5167,10 +5702,72 @@ run(function()
 		end
 	}
 	
+	--[[ One live setup at a time, however many starts arrive.
+
+	Nearly every toggle below reacts with `if NameTags.Enabled then NameTags:Toggle()
+	NameTags:Toggle() end`, which is fine when a person clicks one. Applying a profile
+	clicks all of them: LoadOptions walks the saved options and fires that Function for
+	every one whose value differs from the profile you were on.
+
+	And while a profile is applying the GUI splits that pair. The OFF runs inline, but the
+	ON goes through queueStart -- deferred onto a drain thread so sixty modules do not all
+	start in one frame. So switching between two profiles that both have this module on
+	queues one start per changed option and then runs them back to back with nothing in
+	between.
+
+	Every one of those starts connected another RenderStepped loop, another EntityAdded,
+	another EntityRemoved and another set of device watchers on top of the last, and none
+	were ever dropped -- the module's maid is emptied only when it is toggled OFF, and no
+	toggle-off ever ran. Eight changed options meant eight of everything, all writing into
+	the one Reference table.
+
+	So a start ends the previous one first. Same two steps the GUI takes on a disable --
+	empty the maid, then let the module drop its own state -- done from in here because a
+	second start never gives the GUI the chance. ]]
+	local liveSetup = false
+
+	local function dropSetup()
+		for _, connection in NameTags.Connections do
+			pcall(function()
+				local disconnect = connection.Disconnect or connection.disconnect or connection.Destroy
+				if type(disconnect) == 'function' then
+					disconnect(connection)
+				end
+			end)
+		end
+		table.clear(NameTags.Connections)
+
+		showGameNametags('nametags')
+
+		if Removed[methodused] then
+			for ent in Reference do
+				Removed[methodused](ent)
+			end
+		end
+		--[[ the loop above only reaches entities that still have a tag; sweep the rest so
+		no attribute listener outlives the setup ]]
+		for ent in enchantConns do
+			unwatchEnchant(ent)
+		end
+
+		liveSetup = false
+	end
+
 	NameTags = vape.Categories.Render:CreateModule({
 		Name = 'NameTags',
 		Function = function(callback)
 			if callback then
+				-- a start with no disable in front of it is a restart, not an addition
+				if liveSetup then
+					dropSetup()
+				end
+				liveSetup = true
+
+				--[[ Ours replaces the game's rather than sitting on top of it. Same name,
+				same health, same spot -- with both up the text renders twice and the game's
+				own icon shows up beside it. ]]
+				hideGameNametags('nametags')
+
 				methodused = DrawingToggle.Enabled and 'Drawing' or 'Normal'
 				if Removed[methodused] then
 					NameTags:Clean(entitylib.Events.EntityRemoved:Connect(Removed[methodused]))
@@ -5223,16 +5820,7 @@ run(function()
 				end
 				NameTags:Clean(playersService.PlayerAdded:Connect(watchDevice))
 			else
-				if Removed[methodused] then
-					for i in Reference do
-						Removed[methodused](i)
-					end
-				end
-				--[[ the loop above only reaches entities that still have a tag; sweep the
-				rest so no attribute listener outlives the module ]]
-				for ent in enchantConns do
-					unwatchEnchant(ent)
-				end
+				dropSetup()
 			end
 		end,
 		Tooltip = 'Draws nametags through walls.'
@@ -5321,6 +5909,16 @@ run(function()
 				NameTags:Toggle()
 			end
 		end
+	})
+	ShowKit = NameTags:CreateToggle({
+		Name = 'Show Kit',
+		Function = function()
+			if NameTags.Enabled then
+				NameTags:Toggle()
+				NameTags:Toggle()
+			end
+		end,
+		Tooltip = 'Puts their kit icon next to the nametag'
 	})
 	Rank = NameTags:CreateToggle({
 		Name = 'Show Rank',
@@ -5625,104 +6223,6 @@ run(function()
 				bedwars.CatController.leap = old
 			end)
 		end,
-		farmer_cletus = function()
-			kitCollection('HarvestableCrop', function(v)
-				if bedwars.Client:Get(remotes.HarvestCrop):CallServer({position = bedwars.BlockController:getBlockPosition(v.Position)}) then
-					bedwars.GameAnimationUtil:playAnimation(lplr.Character, bedwars.AnimationType.PUNCH)
-					bedwars.SoundManager:playSound(bedwars.SoundList.CROP_HARVEST)
-				end
-			end, 10, false)
-		end,
-		gingerbread_man = function()
-			local old = bedwars.LaunchPadController.attemptLaunch
-			bedwars.LaunchPadController.attemptLaunch = function(...)
-				local res = {old(...)}
-				local self, block = ...
-	
-				-- AutoGumdrop owns the pad while it is on, toggles and all. This break is
-				-- unconditional, so with both running its 'Break gumdrop' toggle did nothing
-				-- visible -- the pad went either way -- and the two modules raced to break the
-				-- same block.
-				if not genv.AutoGumdropActive and (workspace:GetServerTimeNow() - self.lastLaunch) < 0.4 then
-					if block:GetAttribute('PlacedByUserId') == lplr.UserId and (block.Position - entitylib.character.RootPart.Position).Magnitude < 30 then
-						task.spawn(bedwars.breakBlock, block, false, nil, true)
-					end
-				end
-	
-				return unpack(res)
-			end
-	
-			AutoKit:Clean(function()
-				bedwars.LaunchPadController.attemptLaunch = old
-			end)
-		end,
-		void_dragon = function()
-			local oldflap = bedwars.VoidDragonController.flapWings
-			local flapped
-	
-			bedwars.VoidDragonController.flapWings = function(self)
-				if not flapped and bedwars.Client:Get(remotes.DragonFly):CallServer() then
-					local modifier = bedwars.SprintController:getMovementStatusModifier():addModifier({
-						blockSprint = true,
-						constantSpeedMultiplier = 2
-					})
-					self.SpeedMaid:GiveTask(modifier)
-					self.SpeedMaid:GiveTask(function()
-						flapped = false
-					end)
-					flapped = true
-				end
-			end
-	
-			AutoKit:Clean(function()
-				bedwars.VoidDragonController.flapWings = oldflap
-			end)
-	
-			repeat
-				if bedwars.VoidDragonController.inDragonForm then
-					local plr = entitylib.EntityPosition({
-						Range = 30,
-						Part = 'RootPart',
-						Players = true
-					})
-	
-					if plr then
-						bedwars.Client:Get(remotes.DragonBreath):SendToServer({
-							player = lplr,
-							targetPoint = plr.RootPart.Position
-						})
-					end
-				end
-				task.wait(0.1)
-			until not AutoKit.Enabled
-		end,
-		warlock = function()
-			local lastTarget
-			repeat
-				if store.hand.tool and store.hand.tool.Name == 'warlock_staff' then
-					local plr = entitylib.EntityPosition({
-						Range = 30,
-						Part = 'RootPart',
-						Players = true,
-						NPCs = true
-					})
-	
-					if plr and plr.Character ~= lastTarget then
-						if not bedwars.Client:Get(remotes.WarlockTarget):CallServer({
-							target = plr.Character
-						}) then
-							plr = nil
-						end
-					end
-	
-					lastTarget = plr and plr.Character
-				else
-					lastTarget = nil
-				end
-	
-				task.wait(0.1)
-			until not AutoKit.Enabled
-		end,
 	}
 	
 	AutoKit = vape.Categories.Utility:CreateModule({
@@ -5731,12 +6231,11 @@ run(function()
 			if callback then
 				--[[ Every kit loop below touches Instances and fires remotes, and this
 				thread is whatever enabled the module -- a profile apply on load, or a
-				GUI click -- neither of which carries the elevated identity. Without
-				this, farmer_cletus' harvest remote throws 'lacking capability Plugin'
-				on the first crop in range and takes the whole kit loop with it, since
-				nothing here is pcall'd. Set once for the thread rather than inside
-				the loops: it persists across task.wait, and every kit function runs
-				on this same thread. ]]
+				GUI click -- neither of which carries the elevated identity. Without it
+				a remote that needs the raised identity throws on the first call and
+				takes the whole kit loop with it, since nothing here is pcall'd. Set
+				once for the thread rather than inside the loops: it persists across
+				task.wait, and every kit function runs on this same thread. ]]
 				if vape.ThreadFix then
 					setthreadidentity(8)
 				end
@@ -6621,8 +7120,24 @@ run(function()
 	local Open
 	local Skywars
 	local Delay
+	local Steal
+	local LootRange
+	local Deposit
+	local DepositRange
+	local StolenWithin
 	local Delays = {}
+	-- Paces the deposit sweep off the same slider the loot passes use. Without it a full
+	-- inventory is thirty-odd remotes every tenth of a second.
+	local nextDeposit = 0
+	-- What Steal has taken and when. Deposit only banks what is still inside the Stolen
+	-- Within window, so your own gear is never swept up by standing near the chest.
+	local Stash = {}
+	--[[ Also consulted by the tail of scoreChestItem, where an item with no mechanical meta
+	at all lands. A kit item is exactly that shape -- the raven's whole entry is displayName,
+	sharingDisabled and an image -- so naming one here is what makes it worth taking. ]]
 	local chestItemPriority = {
+		raven = 1200,
+		recon_raven = 1150,
 		emerald = 1000,
 		diamond = 900,
 		gold = 800,
@@ -6746,6 +7261,19 @@ run(function()
 		return profile
 	end
 
+	--[[ The gear branches below used to `return` whenever an item wasn't a strict upgrade,
+	which is why things like a wood_bow got left sitting in the chest. Gear is tested before
+	the generic branches, so a non-upgrade didn't fall through to them either -- it scored
+	nil, and nil means "leave it". Carrying any bow at all made every bow in the map
+	invisible to the module; the same went for swords, tools and armour.
+
+	A chest stealer should take everything it can actually carry. The priority is there to
+	decide the ORDER items come out in, not whether to bother with them, so the upgrade
+	tests now only add a bonus on top of a base score. What still refuses an item is limited
+	to the three real blockers: no item meta, a block the game won't let you pick up, and a
+	stack that is already full. ]]
+	local UPGRADE_BONUS = 1000000
+
 	local function scoreChestItem(item, profile)
 		if not item or not item:IsA('Accessory') then return end
 		local itemType = item.Name
@@ -6763,42 +7291,56 @@ run(function()
 		if armor and armor.slot ~= nil then
 			local value = tonumber(armor.damageReductionMultiplier) or 0
 			local current = profile.armor[armor.slot] or 0
-			if value <= current then return end
-			return 100000 + value * 100000 + (value - current) * 1000
+			local score = 100000 + value * 10000
+			if value > current then
+				return score + UPGRADE_BONUS + (value - current) * 1000
+			end
+			return score
 		end
 
 		local sword = meta.sword
 		if sword then
 			local value = tonumber(sword.damage) or 0
-			if value <= profile.sword then return end
-			return 100000 + value * 10000 + (value - profile.sword) * 100
+			local score = 100000 + value * 10000
+			if value > profile.sword then
+				return score + UPGRADE_BONUS + (value - profile.sword) * 100
+			end
+			return score
 		end
 
 		local breakBlock = meta.breakBlock
 		if breakBlock then
+			-- bestValue is gathered outside the improvement test now: a tool that beats
+			-- nothing you carry still needs a base score that reflects how good it is.
 			local bestValue, improvement = 0, 0
 			for breakType, value in breakBlock do
 				if type(value) == 'number' then
+					bestValue = math.max(bestValue, value)
 					local current = profile.tools[breakType] or 0
 					if value > current then
-						bestValue = math.max(bestValue, value)
 						improvement = math.max(improvement, value - current)
 					end
 				end
 			end
-			if improvement <= 0 then return end
-			return 100000 + bestValue * 10000 + improvement * 100
+			local score = 100000 + bestValue * 10000
+			if improvement > 0 then
+				return score + UPGRADE_BONUS + improvement * 100
+			end
+			return score
 		end
 
 		local bowValue = getBowValue(meta)
 		if bowValue then
-			if bowValue <= profile.bow then return end
-			return 100000 + bowValue * 10000 + (bowValue - profile.bow) * 100
+			local score = 100000 + bowValue * 10000
+			if bowValue > profile.bow then
+				return score + UPGRADE_BONUS + (bowValue - profile.bow) * 100
+			end
+			return score
 		end
 
 		if meta.backpack then
-			if profile.backpack then return end
-			return 90000 + getItemPriority(itemType) * 10 + math.min(amount, 100)
+			local score = 90000 + getItemPriority(itemType) * 10 + math.min(amount, 100)
+			return profile.backpack and score or score + UPGRADE_BONUS
 		end
 
 		if meta.hotbarFillRight then
@@ -6816,6 +7358,31 @@ run(function()
 		if block then
 			return 10000 + (tonumber(block.health) or 0) * 10 + math.min(amount, 100)
 		end
+
+		--[[ Nothing mechanical in the meta at all, so every branch above fell through.
+
+		This used to end in an implicit nil, which reads as "leave it", and kit items are
+		precisely the shape that reaches here:
+
+		    [ItemType.RAVEN] = {displayName = "Raven", sharingDisabled = true, image = ...}
+
+		No sword, no block, no projectileSource, no stack size -- so ravens were being walked
+		past entirely.
+
+		An item named in chestItemPriority is deliberate and outranks everything, upgrades
+		included: a raven is worth more than a marginally better sword. Anything else still
+		gets a floor rather than nil, so an item a future update adds and this list has never
+		heard of is taken instead of ignored. ]]
+		--[[ Clear of every gear branch, which is not a small number: those scale with the
+		item's own stat before UPGRADE_BONUS is added, so a damage-55 sword upgrade already
+		reaches ~1.66m. Five million leaves room for whatever the next update's numbers look
+		like without having to revisit this. ]]
+		local KIT_ITEM_BASE = 5000000
+		local named = chestItemPriority[itemType]
+		if named then
+			return KIT_ITEM_BASE + named * 10 + math.min(amount, 100)
+		end
+		return 5000 + math.min(amount, 100)
 	end
 
 	local function getBestChestItem(items, chest, profile)
@@ -6831,9 +7398,94 @@ run(function()
 		return bestIndex
 	end
 
-	local function lootChest(chest)
+	-- `taken` collects what actually left the chest, stamped with the time. Only the Steal
+	-- path passes one -- ordinary looting has nothing to deposit afterwards.
+	--[[ Whatever the server currently has us observing, if anything.
+
+	It matters because SetObservedChest(nil) is what the client turns into a ChestClear
+	dispatch, and ChestClear is what empties the open Chest panel. Un-observing a chest the
+	player is actually looking at leaves every item still in it but nothing on screen. ]]
+	local function observedFolder()
+		local character = lplr.Character
+		local observed = character and character:FindFirstChild('ObservedChestFolder')
+		return observed and observed.Value or nil
+	end
+
+	--[[ Your own storage is not loot: in GUI Check mode the open chest is whatever you
+	opened, personal chest included, and without this the loot pass pulls straight back out
+	whatever Deposit just put in, re-stashes it, and the two trade the same items forever.
+
+	Matched by NAME, not by parentage. Every inventory-backed folder lives under
+	ReplicatedStorage.Inventories -- ordinary chests and team crates as much as your own --
+	so "is it in Inventories" refuses everything and stops the module dead. Only the three
+	folders keyed to your own username are yours. ]]
+	local function isOwnStorage(folder)
+		if not folder then return false end
+		local inventories = replicatedStorage:FindFirstChild('Inventories')
+		if not inventories or folder.Parent ~= inventories then return false end
+
+		local name = folder.Name
+		return name == lplr.Name
+			or name == lplr.Name .. '_personal'
+			or name == lplr.Name .. '_smelter'
+	end
+
+	--[[ Whose crate is it.
+
+	game-player-util's getTeamId is literally `player:GetAttribute("Team")`, and the game
+	compares block teams to player teams the same way everywhere -- player-render-controller
+	does `v:GetAttribute("Team") ~= Players.LocalPlayer:GetAttribute("Team")` -- so the
+	attribute pair is the right test.
+
+	Compared through tonumber as well as raw: an attribute stored as a string on one side
+	and a number on the other is unequal to Lua while naming the same team. ]]
+	local function sameTeam(a, b)
+		if a == nil or b == nil then return false end
+		if a == b then return true end
+		local na = tonumber(a)
+		return na ~= nil and na == tonumber(b)
+	end
+
+	--[[ A team crate carries BOTH the `team-crate` tag and the ordinary `chest` tag:
+
+	    u22[ItemType.TEAM_CRATE] = {block = {collectionServiceTags = {"chest", "team-crate"}}}
+
+	which is how our own crate was being emptied even with Steal off. The team check lived
+	only in the Steal pass; the plain chest loop iterates everything tagged `chest` inside
+	Range and never asked whose it was. Asking here covers both paths at once.
+
+	A crate with no Team attribute belongs to nobody and stays fair game. An UNKNOWN local
+	team is the opposite -- our own Team has not replicated for the first moments of a
+	round, and while it is nil every crate on the map reads as an enemy's, so the very first
+	pass would empty our own. Unknown means leave every crate alone. ]]
+	local function isFriendlyCrate(block)
+		local crateTeam = block:GetAttribute('Team')
+		if crateTeam == nil then return false end
+
+		local myTeam = lplr:GetAttribute('Team')
+		if myTeam == nil then return true end
+
+		return sameTeam(crateTeam, myTeam)
+	end
+
+	-- The GUI path is handed a folder rather than a block, and the Team attribute lives on
+	-- the block -- so the crate that owns the folder has to be found before its team can be
+	-- read. Cheap: there are only ever a handful of crates on a map.
+	local function folderIsFriendlyCrate(crates, folder)
+		if not folder then return false end
+		for _, crate in crates do
+			local value = crate:FindFirstChild('ChestFolderValue')
+			if value and value.Value == folder then
+				return isFriendlyCrate(crate)
+			end
+		end
+		return false
+	end
+
+	local function lootChest(chest, taken)
 		chest = chest and chest.Value or nil
 		if not chest or (Delays[chest] or 0) >= tick() then return end
+		if isOwnStorage(chest) then return end
 
 		local accessories = {}
 		for _, v in chest:GetChildren() do
@@ -6853,34 +7505,237 @@ run(function()
 		local inventory = bedwars.Client:GetNamespace('Inventory')
 		local setObservedChest = inventory:Get('SetObservedChest')
 		local chestGetItem = inventory:Get('ChestGetItem')
-		local observed = pcall(function()
-			setObservedChest:SendToServer(chest)
-		end)
-		if not observed then return end
 
+		-- Already the open chest (GUI Check mode passes exactly that): the server has it
+		-- observed, so opening it again is a no-op and closing it afterwards is the bug --
+		-- it blanks the panel the player is reading. Only chests we opened get closed.
+		local alreadyOpen = chest == observedFolder()
+		if not alreadyOpen then
+			local observed = pcall(function()
+				setObservedChest:SendToServer(chest)
+			end)
+			if not observed then return end
+		end
+
+		local firstItem = true
 		while #accessories > 0 do
+			-- The module can be switched off mid-chest, and a chest can be broken or
+			-- emptied by someone else while we are waiting between items.
+			if not ChestSteal.Enabled then break end
+
+			if firstItem then
+				firstItem = false
+			else
+				-- Delay paces the items too, not just the chests. Skipped before the first
+				-- one, so a chest is not held up before anything has been taken from it.
+				task.wait(Delay.Value)
+				if not (ChestSteal.Enabled and chest.Parent) then break end
+			end
+
 			local bestIndex = getBestChestItem(accessories, chest, profile)
 			if not bestIndex then break end
 			local item = table.remove(accessories, bestIndex)
+			-- Gone while we waited: taken by someone else, or the chest was emptied.
+			if item.Parent ~= chest then continue end
+
 			local amount = getChestAmount(item)
 			local success, result = pcall(function()
 				return chestGetItem:CallServer(chest, item)
 			end)
 			if success and result ~= false then
 				addProfileItem(profile, item.Name, amount)
+				if taken then
+					table.insert(taken, {Type = item.Name, Time = tick()})
+				end
 			end
 		end
 
-		pcall(function()
-			setObservedChest:SendToServer(nil)
-		end)
+		if not alreadyOpen then
+			pcall(function()
+				setObservedChest:SendToServer(nil)
+			end)
+		end
 	end
 	
+	--[[ Steal: the same looting, pointed at the enemy team's crate, plus the half that
+	makes raiding one worth doing -- emptying your inventory into your own personal chest
+	between trips so the next trip has room.
+
+	It goes through lootChest rather than grabbing everything blindly, so the priority
+	ordering and the stack-size limits apply here too: a crate raid that fills your
+	inventory with the first thing it sees is a crate raid that leaves the diamonds
+	behind. ]]
+	local function inventoryRemote(name)
+		return bedwars.Client:GetNamespace('Inventory'):Get(name)
+	end
+
+	local function personalInventory()
+		local inventories = replicatedStorage:FindFirstChild('Inventories')
+		return inventories and inventories:FindFirstChild(lplr.Name .. '_personal') or nil
+	end
+
+	--[[ Deposit banks only what Steal recently took, inside the Stolen Within window.
+
+	The window is what makes the toggle safe to leave on: an entry that has aged out is
+	dropped rather than deposited, so walking past your own chest with a sword you have
+	been carrying all game does not bank it. It also bounds the retry -- an item the
+	server never actually handed over stops being chased once it ages out. ]]
+	--[[ One worker, walking the stash until it empties.
+
+	The previous shape drained the stash into a snapshot and fired every ChestGiveItem as
+	its own spawned call, relying on failures being re-queued and picked up by some later
+	pass. That made success a matter of timing: the server routinely refuses an item that
+	is still mid-move out of the chest it was just taken from -- a `false` reply is normal,
+	not a rejection -- and between the drain and the re-queue the stash reads as empty, so
+	the pass that would have retried bails out instead.
+
+	Now nothing leaves the stash until the server has actually taken it, the sweep retries
+	in place until the window closes, and `depositing` keeps two sweeps from firing
+	overlapping calls for the same tool. It runs in one spawned thread so the sequential
+	CallServers never park the module's own loop. ]]
+	local depositing = false
+
+	local function depositAll()
+		if depositing then return end
+
+		local inventory = personalInventory()
+		if not inventory then return end
+
+		local window = StolenWithin.Value
+		local now = tick()
+		for index = #Stash, 1, -1 do
+			if now - Stash[index].Time > window then
+				table.remove(Stash, index)
+			end
+		end
+		if #Stash == 0 then return end
+
+		depositing = true
+		task.spawn(function()
+			local chestGiveItem = inventoryRemote('ChestGiveItem')
+			local index = 1
+
+			while index <= #Stash do
+				if not (ChestSteal.Enabled and Deposit.Enabled) then break end
+
+				local entry = Stash[index]
+				if tick() - entry.Time > StolenWithin.Value then
+					table.remove(Stash, index)
+					continue
+				end
+
+				local item = getItem(entry.Type)
+				local given = false
+				if item and item.tool then
+					local success, result = pcall(function()
+						return chestGiveItem:CallServer(inventory, item.tool)
+					end)
+					given = success and result ~= false
+				end
+
+				if given then
+					table.remove(Stash, index)
+					-- Back to the front: an item that would not go a moment ago often will
+					-- once another has moved, and the ones behind it are the older ones.
+					index = 1
+				else
+					-- Left in place. It is either still replicating into the inventory or
+					-- still mid-move out of the chest; both clear on their own, and the
+					-- window is what stops this going round forever.
+					index += 1
+				end
+
+				-- Same Delay as the chest side: one item per tick of it, whether it went in
+				-- or has to be tried again.
+				task.wait(Delay.Value)
+			end
+
+			depositing = false
+		end)
+	end
+
+	--[[ Found two ways, because the two sources disagree and only one of them is a
+	runtime fact.
+
+	The match server tags the block `personal-chest` -- that is the tag AutoSteal collects
+	and it demonstrably works. The lobby dump shows no such tag, only a script folder by
+	that name, and its ChestController recognises the block by NAME off the ordinary
+	`chest` tag instead. Reading the dump alone is what led to dropping the tag, and
+	dropping it is why nothing was ever found in range.
+
+	Taking both costs one extra collection and means neither being wrong sinks it. ]]
+	local PERSONAL_CHESTS = {personal_chest = true, og_personal_chest = true}
+
+	local function nearestPersonalChest(chests, personalChests, localPosition)
+		local best, bestDistance = nil, math.huge
+		for _, chest in personalChests do
+			local distance = (localPosition - chest.Position).Magnitude
+			if distance < bestDistance then best, bestDistance = chest, distance end
+		end
+		for _, chest in chests do
+			if PERSONAL_CHESTS[chest.Name] then
+				local distance = (localPosition - chest.Position).Magnitude
+				if distance < bestDistance then best, bestDistance = chest, distance end
+			end
+		end
+		return best, bestDistance
+	end
+
+	--[[ GUI Check reads the ScreenGui rather than asking the AppController.
+
+	bedwars.AppController is the app-controller module's exported CLASS, not the instance
+	Flamework hands out -- chest-controller resolves the real one as
+	Flamework.resolveDependency("@easy-games/game-core:client/controllers/app-controller@AppController")
+	-- so isAppOpen is being called on the wrong table. An error thrown there takes the
+	whole ChestSteal loop with it, which is why nothing ran at all while GUI Check was on,
+	deposit included.
+
+	The app parents a ScreenGui named ChestApp into PlayerGui while it is open, which is
+	the same fact observable without resolving anything. The old call stays as a fallback
+	for a build that does not name it that way, but pcall'd this time. ]]
+	local function chestAppOpen()
+		local playerGui = lplr:FindFirstChildOfClass('PlayerGui')
+		local app = playerGui and playerGui:FindFirstChild('ChestApp')
+		-- Left parented but disabled is not open.
+		if app then return app.Enabled ~= false end
+
+		local ok, open = pcall(function()
+			return bedwars.AppController:isAppOpen('ChestApp')
+		end)
+		return (ok and open) and true or false
+	end
+
+	local function stealPass(crates, localPosition)
+		for _, crate in crates do
+			if isFriendlyCrate(crate) then continue end
+			if (localPosition - crate.Position).Magnitude <= LootRange.Value then
+				lootChest(crate:FindFirstChild('ChestFolderValue'), Stash)
+			end
+		end
+	end
+
+	local function depositPass(chests, personalChests, localPosition)
+		-- Paced before the checks, not after, so the logging below runs at the Delay rate
+		-- rather than ten times a second.
+		if tick() < nextDeposit then return end
+		nextDeposit = tick() + Delay.Value
+
+		local chest, distance = nearestPersonalChest(chests, personalChests, localPosition)
+		if not chest or distance > DepositRange.Value then return end
+
+		depositAll()
+	end
+
 	ChestSteal = vape.Categories.World:CreateModule({
 		Name = 'ChestSteal',
 		Function = function(callback)
 			if callback then
 				local chests = collection('chest', ChestSteal)
+				-- Collected up front rather than when Steal is switched on: collection()
+				-- registers tag listeners, and doing that mid-run would miss every crate
+				-- already on the map.
+				local crates = collection('team-crate', ChestSteal)
+				local personalChests = collection('personal-chest', ChestSteal)
 				--[[ The enabled check is the exit, not just the queue type: without it, toggling the
 				module back off inside a test queue left this spinning at frame rate forever. ]]
 				repeat task.wait(0.1) until store.queueType ~= 'bedwars_test' or (not ChestSteal.Enabled)
@@ -6888,26 +7743,60 @@ run(function()
 				if (not Skywars.Enabled) or store.queueType:find('skywars') then
 					repeat
 						if entitylib.isAlive and store.matchState ~= 2 then
+							local localPosition = entitylib.character.RootPart.Position
+							-- Resolved once: both the loot branch and the deposit below ask
+							-- the same question, and with GUI Check off the answer is always
+							-- yes without touching PlayerGui at all.
+							local guiOpen = (not Open.Enabled) or chestAppOpen()
+
 							if Open.Enabled then
-								if bedwars.AppController:isAppOpen('ChestApp') then
-									lootChest(lplr.Character:FindFirstChild('ObservedChestFolder'))
-								end
-							else
-								local localPosition = entitylib.character.RootPart.Position
-								for _, v in chests do
-									if (localPosition - v.Position).Magnitude <= Range.Value then
-										lootChest(v:FindFirstChild('ChestFolderValue'))
+								if guiOpen then
+									local observed = lplr.Character and lplr.Character:FindFirstChild('ObservedChestFolder')
+									-- Opening our own crate by hand must not empty it either.
+									if not folderIsFriendlyCrate(crates, observed and observed.Value) then
+										lootChest(observed, Stash)
 									end
 								end
+							else
+								for _, v in chests do
+									-- Team crates are in here too, tagged `chest` alongside
+									-- `team-crate`, so our own has to be skipped by name of
+									-- team rather than left to the Steal pass.
+									if isFriendlyCrate(v) then continue end
+									if (localPosition - v.Position).Magnitude <= Range.Value then
+										lootChest(v:FindFirstChild('ChestFolderValue'), Stash)
+									end
+								end
+
+								-- Kept inside the range branch: taking from a crate you have
+								-- not opened is exactly what GUI Check is there to stop.
+								if Steal.Enabled then
+									stealPass(crates, localPosition)
+								end
+							end
+
+							-- Outside the branch so it runs in both modes, but still behind
+							-- GUI Check: with that on, nothing happens until a chest is
+							-- actually open. What was breaking it before was not this gate,
+							-- it was chestAppOpen throwing and killing the whole loop.
+							if Deposit.Enabled and guiOpen then
+								depositPass(chests, personalChests, localPosition)
 							end
 						end
-						task.wait(0.1)
+						-- The loop itself runs off the slider too, so nothing is left
+						-- pacing on a hardcoded number.
+						task.wait(Delay.Value)
 					until not ChestSteal.Enabled
 				end
 			else
 				--[[ Keyed by chest folder, which is destroyed with the chest -- without this
 				the table holds a reference to every chest looted this session. ]]
 				table.clear(Delays)
+				table.clear(Stash)
+				nextDeposit = 0
+				-- The sweep exits on its own once the toggles go, but the flag has to be
+				-- cleared here or a re-enable finds a deposit already in progress.
+				depositing = false
 			end
 		end,
 		Tooltip = 'Pulls items out of the chests near you.'
@@ -6919,18 +7808,93 @@ run(function()
 		Default = 18,
 		Suffix = function(val)
 			return val == 1 and 'stud' or 'studs'
-		end
+		end,
+		Tooltip = 'How far to reach for a chest.'
 	})
 	Delay = ChestSteal:CreateSlider({
 		Name = 'Delay',
-		Min = 0.2,
+		-- Floors at zero: Delay is per-ITEM now, not per-chest, so the old 0.2 minimum was
+		-- pacing something far smaller than it was chosen for. task.wait(0) still yields a
+		-- frame, so the bottom of the slider is as fast as the round trips allow and no
+		-- faster.
+		Min = 0,
 		Max = 3,
 		Default = 0.5,
 		Decimal = 10,
 		Suffix = function(val) return 's' end,
-		Tooltip = 'How long before it tries the same chest again.\nRaise it if looting dies off mid round, each pass\ncosts two remotes out of a 299/min budget.'
+		Tooltip = 'Wait between every action - item, chest and deposit.'
 	})
-	Open = ChestSteal:CreateToggle({Name = 'GUI Check'})
+	Steal = ChestSteal:CreateToggle({
+		Name = 'Steal',
+		Function = function()
+			-- Guarded: the toggle's Function fires once while the options are still being
+			-- built, before the slider below exists.
+			if LootRange and LootRange.Object then
+				LootRange.Object.Visible = Steal.Enabled
+			end
+		end,
+		Tooltip = 'Also loots enemy team crates.'
+	})
+	LootRange = ChestSteal:CreateSlider({
+		Name = 'Loot Range',
+		Min = 1,
+		Max = 18,
+		Default = 18,
+		Darker = true,
+		Suffix = function(val)
+			return val == 1 and 'stud' or 'studs'
+		end,
+		Tooltip = 'How far to reach for a crate.'
+	})
+	Deposit = ChestSteal:CreateToggle({
+		Name = 'Deposit',
+		Function = function()
+			if DepositRange and DepositRange.Object then
+				DepositRange.Object.Visible = Deposit.Enabled
+			end
+			if StolenWithin and StolenWithin.Object then
+				StolenWithin.Object.Visible = Deposit.Enabled
+			end
+		end,
+		Tooltip = 'Puts fresh loot into your personal chest.'
+	})
+	DepositRange = ChestSteal:CreateSlider({
+		Name = 'Deposit Range',
+		Min = 1,
+		Max = 18,
+		Default = 7.5,
+		Decimal = 10,
+		Darker = true,
+		Suffix = function(val)
+			return val == 1 and 'stud' or 'studs'
+		end,
+		Tooltip = 'How close to your personal chest to deposit.'
+	})
+	StolenWithin = ChestSteal:CreateSlider({
+		Name = 'Stolen Within',
+		Min = 1,
+		Max = 15,
+		-- Long enough to cover the walk back from an enemy crate, which ten seconds was
+		-- not: the stash aged out on the way home and there was nothing left to bank.
+		Default = 10,
+		Decimal = 10,
+		Darker = true,
+		Suffix = function(val) return 's' end,
+		Tooltip = 'Only deposits loot taken this recently.'
+	})
+	if LootRange.Object then
+		LootRange.Object.Visible = Steal.Enabled
+	end
+	if DepositRange.Object then
+		DepositRange.Object.Visible = Deposit.Enabled
+	end
+	if StolenWithin.Object then
+		StolenWithin.Object.Visible = Deposit.Enabled
+	end
+	Open = ChestSteal:CreateToggle({
+		Name = 'GUI Check',
+		Tooltip = 'Only acts on the chest you have open.'
+	})
 	Skywars = ChestSteal:CreateToggle({
 		Name = 'Only Skywars',
 		Function = function()
@@ -6939,7 +7903,8 @@ run(function()
 				ChestSteal:Toggle()
 			end
 		end,
-		Default = true
+		Default = true,
+		Tooltip = 'Stays off outside Skywars.'
 	})
 end)
 	
@@ -8294,7 +9259,7 @@ run(function()
 				end
 	
 				bedwars.ClickHold.showProgress = function(self)
-					local roact = debug.getupvalue(oldshowprogress, 1)
+					local roact = bedwars.Roact
 					local countdown = roact.mount(roact.createElement('ScreenGui', {}, { roact.createElement('Frame', {
 						[roact.Ref] = self.wrapperRef,
 						Size = UDim2.new(),
@@ -8584,42 +9549,13 @@ run(function()
 	local Nametags
 	local effects, util = {}, {}
 
-	--[[ The game's own nametag builder, stashed the first time we stub it so disable can
-	put it back. This is the ONLY thing that builds a character nametag -- the game
-	turns Roblox's own Humanoid name display off (NameDisplayDistance = 0,
-	DisplayDistanceType = None) and then calls this for every entity, players and
-	mobs alike -- so stubbing it and never restoring it left the session with no
-	nametags on anyone until a rejoin, whatever the module's knob said. ]]
-	local oldAddGameNametag
-
+	-- Shared with NameTags, and ref-counted there: see hideGameNametags above
 	local function removeGameNametags()
-		local controller = bedwars.NametagController
-		if not (controller and bedwars.AppController) then return end
-		if oldAddGameNametag then return end
-		oldAddGameNametag = controller.addGameNametag
-		controller.addGameNametag = function() end
-		for _, v in bedwars.AppController:getOpenApps() do
-			if tostring(v):find('Nametag') then
-				bedwars.AppController:closeApp(tostring(v))
-			end
-		end
+		hideGameNametags('fpsboost')
 	end
 
-	--[[ Puts the builder back and re-runs it over everything currently tagged as an
-	entity, since the tags we closed above won't come back on their own until that
-	character is re-tagged (i.e. respawns). addGameNametag bails on its own for
-	anyone whose tag is already open, so this fills in the gaps without doubling
-	anybody up, and it still honours NoNametag / shouldShowNametag. ]]
 	local function restoreGameNametags()
-		local controller = bedwars.NametagController
-		if not (controller and oldAddGameNametag) then return end
-		controller.addGameNametag = oldAddGameNametag
-		oldAddGameNametag = nil
-		for _, char in collectionService:GetTagged('entity') do
-			pcall(function()
-				controller:addGameNametag(char)
-			end)
-		end
+		showGameNametags('fpsboost')
 	end
 
 	FPSBoost = vape.Legit:CreateModule({
@@ -9792,7 +10728,8 @@ shared.bedwars = {
     targetinfo          = targetinfo,
     prediction          = prediction,
     color               = color,
-    uipallet            = uipallet,
+	uipallet            = uipallet,
+	buffer              = pistonwareBuffer,
 
     --[[ Game state ]]
     lplr                = lplr,
@@ -9879,7 +10816,7 @@ local function compileBedwarsSource(source, chunkName)
     local func, err = loadstring(source, chunkName)
     if not func then
         local size = type(source) == 'string' and #source or 0
-        warn(string.format('[pistonware] %s failed to compile (%d bytes): %s', chunkName, size, tostring(err)))
+		bufferCall('error', 'bedwars.compile', err, {chunk = chunkName, bytes = size})
     end
     return func, err
 end
@@ -9929,7 +10866,7 @@ local function downloadBedwars()
         if not localFunc then
             return nil, bootFailure('bedwars.local.compile', compileError)
         end
-        warn('[pistonware] developer mode: running local games/bedwars.lua (not the published build)')
+		bufferCall('print', 'bedwars.developer', 'running local games/bedwars.lua')
         return res
     end
 
@@ -9986,7 +10923,7 @@ end
 local bedwarsSource, bedwarsFailure = downloadBedwars()
 if not bedwarsSource then
     local failure = bedwarsFailure or bootFailure('bedwars.download', 'no usable BedWars payload')
-    warn('[pistonware] '..failure.stage..': '..failure.error)
+	bufferCall('error', failure.stage, failure.error)
     pcall(function()
         vape:CreateNotification('Vape', 'BedWars modules could not be loaded ('..failure.stage..'). Rejoin the game to retry.', 30, 'alert')
     end)
@@ -9996,7 +10933,7 @@ end
 local bedwarsFn, bedwarsCompileError = compileBedwarsSource(bedwarsSource, 'bedwars')
 if not bedwarsFn then
     local failure = bootFailure('bedwars.compile', bedwarsCompileError)
-    warn('[pistonware] '..failure.stage..': '..failure.error)
+	bufferCall('error', failure.stage, failure.error)
     pcall(function()
         vape:CreateNotification('Vape', 'Combat modules could not be loaded (bedwars.compile). Rejoin the game to retry.', 30, 'alert')
     end)
@@ -10009,7 +10946,7 @@ end
         of their session, and names the actual problem. ]]
 if not republishKey() then
     local failure = bootFailure('bedwars.key', 'no validated key was available for the BedWars payload')
-    warn('[pistonware] '..failure.stage..': '..failure.error)
+	bufferCall('error', failure.stage, failure.error)
     pcall(function()
         vape:CreateNotification('Vape', 'Your key was not available when combat modules tried to load. Re-run the pistonware loader to fix this.', 30, 'alert')
     end)
@@ -10019,7 +10956,7 @@ end
 local ok, result = xpcall(bedwarsFn, errorTrace)
 if not ok then
     local failure = bootFailure('bedwars.payload.execute', result)
-    warn('[pistonware] '..failure.stage..': '..failure.error)
+	bufferCall('error', failure.stage, failure.error)
     return failure
 end
 if type(result) == 'table' and result.PistonwareBootFailure then

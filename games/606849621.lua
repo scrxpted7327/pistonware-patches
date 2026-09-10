@@ -1,3 +1,18 @@
+local pistonwareBuffer
+pcall(function()
+	local env = getgenv()
+	pistonwareBuffer = type(env.pistonware) == 'table' and env.pistonware.buffer or nil
+end)
+
+local function bufferLog(event, message, details)
+	if type(pistonwareBuffer) == 'table' and type(pistonwareBuffer.log) == 'function' then
+		return pistonwareBuffer.log(event, message, details)
+	end
+	if shared.PistonwareDeveloper == true then print('[pistonware] '..tostring(message)) end
+end
+
+if not shared.PistonwareRequireCapabilities({'DEBUG', 'HOOKFUNCTION', 'SCRIPT'}) then return end
+
 local loadstring = function(...)
 	local res, err = loadstring(...)
 	if err and vape then vape:CreateNotification('Vape', 'Failed to load : '..err, 30, 'alert') end
@@ -320,8 +335,10 @@ run(function()
 		if rem ~= 'LookAngle' and rem ~= 'AimPosition' then
 			local called = getfenv(3)
 			called = called and called.script
-			if called and (not rem) then print(id, 'called with', called:GetFullName()) end
-			print(id, rem or id, ...)
+			if called and (not rem) then
+				bufferLog('jailbreak.remote', 'unmapped remote call', {id = id, caller = called:GetFullName()})
+			end
+			bufferLog('jailbreak.remote', 'remote call', {id = id, remote = rem or id, arguments = select('#', ...)})
 		end
 
 		return hook(self, id, ...)

@@ -1,3 +1,20 @@
+local pistonwareBuffer
+pcall(function()
+	local env = getgenv()
+	pistonwareBuffer = type(env.pistonware) == 'table' and env.pistonware.buffer or nil
+end)
+
+local function bufferError(event, message, details)
+	if type(pistonwareBuffer) == 'table' and type(pistonwareBuffer.error) == 'function' then
+		return pistonwareBuffer.error(event, message, details)
+	end
+	if shared.PistonwareDeveloper == true then warn('[pistonware] '..tostring(message)) end
+end
+
+shared.PistonwareRequireCapabilities({
+	'DEBUG', 'HOOKFUNCTION', 'METAMETHOD', 'THREAD', 'SIGNAL'
+}, 'universal')
+
 local loadstring = function(...)
 	local res, err = loadstring(...)
 	if err and vape then
@@ -80,7 +97,7 @@ local run = function(func)
 	simply never registered. ]]
 	local ok, err = callWithThreadFix(func)
 	if not ok then
-		warn('[pistonware] a module block failed to load: '..tostring(err))
+		bufferError('universal.module', err, {traceback = err})
 	end
 end
 local queue_on_teleport = queue_on_teleport or function() end
@@ -7921,6 +7938,12 @@ run(function()
 				part.Material = Enum.Material.SmoothPlastic
 				part.Color = Color3.new()
 				part.CastShadow = false
+				--[[ Ours, not the game's. The cape hangs off the CAMERA rather than off the
+				character, so FpsBoostPlus' Clean Self check -- which asks whether an instance
+				is a descendant of lplr.Character -- never covered it, and No Decals blanked
+				the cape image along with every other ImageLabel in the world. Anything else
+				this script parents into the world can set the same attribute to opt out. ]]
+				part:SetAttribute('PistonwareSelf', true)
 				part.Parent = gameCamera
 				local capesurface = Instance.new('SurfaceGui')
 				capesurface.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud

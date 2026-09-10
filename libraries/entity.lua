@@ -41,12 +41,37 @@ local entitylib = {
 				}
 			end
 
+			--[[ Dispatched over a copy of the list, not the list itself.
+
+			task.spawn resumes its function INLINE on this thread, so every handler runs
+			to its first yield before the next one is reached -- and a handler is free to
+			connect and disconnect while the dispatch is still walking. Applying a profile
+			does exactly that: it toggles a module off and straight back on for every
+			option whose value differs, and the off empties that module's maid from inside
+			whatever Fire happens to be running at the time.
+
+			Disconnect swap-removes -- it moves the LAST record down into the freed slot.
+			If that slot has already been passed, the record moved into it is never
+			reached, so a handler that was connected when the event fired silently misses
+			it. A missed EntityRemoved is a nametag with nothing left that will ever
+			destroy it or move it again; a missed EntityAdded is a player who never gets
+			one at all.
+
+			The ConnectionIndex read is what makes the copy safe in the other direction: a
+			handler disconnected earlier in this same dispatch is skipped rather than
+			called after the fact, which is the behaviour a real signal has. ]]
 			function event:Fire(...)
 				local connections = self.Connections
 				if not connections then return end
-				for i = 1, #connections do
-					local record = connections[i]
-					if record and record.Callback then
+
+				local count = #connections
+				if count == 0 then return end
+
+				local snapshot = table.move(connections, 1, count, 1, table.create(count))
+				local indexMap = self.ConnectionIndex
+				for i = 1, count do
+					local record = snapshot[i]
+					if record and record.Callback and indexMap[record] then
 						task.spawn(record.Callback, ...)
 					end
 				end
@@ -753,8 +778,8 @@ end
 local positionCaches = {}
 local positionCacheOrder = {}
 local positionCacheVersion = 0
-local positionCacheMarginRatio = 0.25
-local positionCacheMinimumMargin = 10
+local positionCacheRangeMultiplier = 1.5
+local positionCacheMinimumRadius = 20
 local positionCacheLimit = 8
 
 local function lowEndMode()
@@ -1097,13 +1122,33 @@ local function entityPartIsEligible(entity, settings, partName)
 	return part
 end
 
-local function getPositionCacheKey(settings, partName)
-	return (settings.Players and 'players' or 'players-off') .. ':'
-		.. (settings.NPCs and 'npcs' or 'npcs-off') .. ':' .. tostring(partName)
+local function getPositionCacheKey(settings, partName, range)
+	for _, key in positionCacheOrder do
+		if key.Players == settings.Players
+			and key.NPCs == settings.NPCs
+			and key.Part == partName
+			and key.Range == range
+			and key.Origin == settings.Origin
+			and key.Sort == settings.Sort
+			and key.Wallcheck == settings.Wallcheck
+			and key.Limit == settings.Limit then
+			return key
+		end
+	end
+	return {
+		Players = settings.Players,
+		NPCs = settings.NPCs,
+		Part = partName,
+		Range = range,
+		Origin = settings.Origin,
+		Sort = settings.Sort,
+		Wallcheck = settings.Wallcheck,
+		Limit = settings.Limit
+	}
 end
 
 local function getPositionCandidates(settings, origin, range, partName, now)
-	local key = getPositionCacheKey(settings, partName)
+	local key = getPositionCacheKey(settings, partName, range)
 	local cache = positionCaches[key]
 	if not cache then
 		if #positionCacheOrder >= positionCacheLimit then
@@ -1117,31 +1162,13 @@ local function getPositionCandidates(settings, origin, range, partName, now)
 		positionCacheOrder[#positionCacheOrder + 1] = key
 	end
 
-	local coverageRadius = cache.CoverageRadius
-	local withinCoverage = cache.Version == positionCacheVersion and cache.ExpiresAt and cache.ExpiresAt > now
-	if withinCoverage then
-		if coverageRadius == math.huge then
-			withinCoverage = true
-		elseif not coverageRadius then
-			withinCoverage = false
-		else
-			local availableMargin = coverageRadius - range
-			if availableMargin < 0 then
-				withinCoverage = false
-			else
-				local delta = origin - cache.Origin
-				withinCoverage = delta:Dot(delta) <= availableMargin * availableMargin
-			end
-		end
-	end
-
-	if withinCoverage then
+	if cache.Version == positionCacheVersion
+		and cache.ExpiresAt and now < cache.ExpiresAt then
 		countStat('TargetCacheHits')
 		return cache.Entities
 	end
 
-	local margin = math.max(range * positionCacheMarginRatio, positionCacheMinimumMargin)
-	coverageRadius = range == math.huge and math.huge or range + margin
+	local coverageRadius = math.max(range * positionCacheRangeMultiplier, positionCacheMinimumRadius)
 	local coverageRadiusSq = coverageRadius * coverageRadius
 	local candidates = cache.Entities
 	table.clear(candidates)
@@ -1154,15 +1181,12 @@ local function getPositionCandidates(settings, origin, range, partName, now)
 				local delta = part.Position - origin
 				if coverageRadius == math.huge or delta:Dot(delta) <= coverageRadiusSq then
 					candidates[#candidates + 1] = entity
-					if #candidates >= (lowEndMode() and 64 or 128) then break end
 				end
 			end
 		end
 	end
 
-	cache.Origin = origin
-	cache.CoverageRadius = coverageRadius
-	cache.ExpiresAt = now + (lowEndMode() and 0.12 or 0.06)
+	cache.ExpiresAt = now + 1
 	cache.Version = positionCacheVersion
 	countStat('TargetCacheRefreshes')
 	return candidates
@@ -1423,7 +1447,7 @@ entitylib.AllPosition = function(entitysettings)
 	local partName = entitysettings.Part
 	local limit = entitysettings.Limit
 	local boundedLimit = limit and limit < math.huge and math.max(1, limit) or nil
-	local entities = entitysettings.Cache == true
+	local entities = entitysettings.Cache ~= false
 		and getPositionCandidates(entitysettings, localPosition, range, partName, os.clock())
 		or entitylib.List
 
@@ -1499,10 +1523,28 @@ entitylib.getEntity = function(char)
 	return nil
 end
 
+--[[ Records the builder thread ONLY while it is still running.
+
+task.spawn runs the body up to its first yield before it ever returns, and the body
+below has no yield at all when the character is already streamed in: WaitForChild
+returns instantly for a child that exists, and waitForChildOfType breaks before its
+task.wait on the first hit. So the whole build finishes -- including the
+`EntityThreads[char] = nil` on its last line -- and only THEN does task.spawn hand
+back a thread that is already dead, which the assignment writes straight back into
+the table it just cleared.
+
+That entry is poison. task.cancel throws on a thread that is not suspended, so the
+next removeEntity for this character died on the cancel and never reached
+Events.EntityRemoved -- leaving the entity in entitylib.List and every module's
+per-entity state pointing at a character that had gone. Nametags parked over empty
+ground came from here. The guard above compounds it: a character carrying a dead
+entry can never be added again either.
+
+Storing it only when it is genuinely suspended costs one status read. ]]
 entitylib.addEntity = function(char, plr, teamfunc, spawntime)
 	if not char or entitylib.EntityByCharacter[char] or entitylib.EntityThreads[char] then return end
 
-	entitylib.EntityThreads[char] = task.spawn(function()
+	local builder = task.spawn(function()
 		local hum = waitForChildOfType(char, 'Humanoid', 10)
 		local humrootpart = hum and waitForChildOfType(hum, 'RootPart', workspace.StreamingEnabled and 9e9 or 10, true)
 		local head = char:WaitForChild('Head', 10) or humrootpart
@@ -1575,6 +1617,10 @@ entitylib.addEntity = function(char, plr, teamfunc, spawntime)
 
 		entitylib.EntityThreads[char] = nil
 	end)
+
+	if coroutine.status(builder) ~= 'dead' then
+		entitylib.EntityThreads[char] = builder
+	end
 end
 
 entitylib.removeEntity = function(char, isLocal)
@@ -1603,9 +1649,15 @@ entitylib.removeEntity = function(char, isLocal)
 	end
 
 	if char then
-		if entitylib.EntityThreads[char] then
-			task.cancel(entitylib.EntityThreads[char])
+		--[[ Cleared BEFORE the cancel, and only cancelled while suspended: everything
+		below this point -- the List removal and Events.EntityRemoved -- has to run even
+		if the entry is stale, or the entity outlives its character. ]]
+		local builder = entitylib.EntityThreads[char]
+		if builder then
 			entitylib.EntityThreads[char] = nil
+			if coroutine.status(builder) == 'suspended' then
+				pcall(task.cancel, builder)
+			end
 		end
 
 		local entity, index = entitylib.getEntity(char)
@@ -1726,7 +1778,9 @@ entitylib.stop = function()
 	end
 
 	for _, thread in entitylib.EntityThreads do
-		task.cancel(thread)
+		if coroutine.status(thread) == 'suspended' then
+			pcall(task.cancel, thread)
+		end
 	end
 
 	table.clear(entitylib.PlayerConnections)
