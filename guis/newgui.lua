@@ -1468,6 +1468,15 @@ function vape:CreateOverlay(props)
 	return components.Overlay(props)
 end
 
+local function migrateKillauraRange(data)
+	local modules = type(data) == 'table' and data.Modules
+	local options = type(modules) == 'table' and type(modules.Killaura) == 'table'
+		and modules.Killaura.Options
+	if type(options) == 'table' and options['Swing range'] and not options['Scan range'] then
+		options['Scan range'] = options['Swing range']
+	end
+end
+
 function vape:Load(skipgui, profile)
 	--[[
 		Applying a profile yields now (see yieldBuild), so this can be interrupted -- by a profile
@@ -1537,6 +1546,7 @@ function vape:Load(skipgui, profile)
 			self:CreateNotification('Vape', 'Failed to load '..self.Profile..' profile.', 10, 'alert')
 			canSave = false
 		end
+		migrateKillauraRange(mainData)
 
 		if mainData.v ~= 1 then
 			for _, data in mainData.Modules do
@@ -1698,6 +1708,7 @@ function vape:LoadLate()
 
 	local mainData = loadJson(path)
 	if type(mainData) ~= 'table' or type(mainData.Modules) ~= 'table' then return 0 end
+	migrateKillauraRange(mainData)
 
 	self.LoadGeneration += 1
 	local generation = self.LoadGeneration

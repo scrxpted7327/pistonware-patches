@@ -1,3 +1,5 @@
+if not shared.PistonwareRequireCapabilities({'DEBUG', 'THREAD', 'SIGNAL'}) then return end
+
 local run = function(func) 
 	func() 
 end

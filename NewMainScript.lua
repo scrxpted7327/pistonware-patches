@@ -1,5 +1,15 @@
+local pistonwareBuffer
+pcall(function()
+	local env = getgenv()
+	pistonwareBuffer = type(env.pistonware) == 'table' and env.pistonware.buffer or nil
+end)
+
 if not shared.PistonwareAuthenticated then
-	warn('[pistonware] NewMainScript.lua is the old loader and no longer injects on its own -- run loader.lua instead')
+	if type(pistonwareBuffer) == 'table' and type(pistonwareBuffer.warn) == 'function' then
+		pistonwareBuffer.warn('legacy.entrypoint', 'NewMainScript.lua no longer injects on its own -- run loader.lua instead')
+	elseif shared.PistonwareDeveloper == true then
+		warn('[pistonware] NewMainScript.lua no longer injects on its own -- run loader.lua instead')
+	end
 	return
 end
 

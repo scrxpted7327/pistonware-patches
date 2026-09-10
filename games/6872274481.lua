@@ -1,5 +1,19 @@
+local pistonwareBuffer
+pcall(function()
+	local env = getgenv()
+	pistonwareBuffer = type(env.pistonware) == 'table' and env.pistonware.buffer or nil
+end)
+
+local function bufferCall(method, event, message, details)
+	local callback = type(pistonwareBuffer) == 'table' and pistonwareBuffer[method] or nil
+	if type(callback) == 'function' then return callback(event, message, details) end
+	if shared.PistonwareDeveloper == true then
+		if method == 'print' then print('[pistonware] '..tostring(message)) else warn('[pistonware] '..tostring(message)) end
+	end
+end
+
 if not shared.PistonwareAuthenticated then
-	warn('[pistonware] not authenticated -- run the pistonware loader and enter your key')
+	bufferCall('warn', 'bedwars.unauthenticated', 'not authenticated -- run the pistonware loader and enter your key')
 	return
 end
 
@@ -46,7 +60,7 @@ local run = function(func)
 	if shared.VapeSmoothBoot then task.wait() end
 	local ok, err = callWithThreadFix(func)
 	if not ok then
-		warn('[pistonware] a module block failed to load: '..tostring(err))
+		bufferCall('error', 'bedwars.module', err, {traceback = err})
 	end
 end
 
@@ -2017,23 +2031,6 @@ local function entryMatches(objName, list)
     return false
 end
 
-local function safeGetProto(func, index)
-    if not func then return nil end
-    local success, proto = pcall(debug.getproto, func, index)
-    if success then
-        return proto
-    else
-        --[[ Developer-only. This prints a raw function pointer and an index, which means nothing
-        to a user and fires on executors whose debug.getproto is simply missing -- so on
-        those it used to spray the console on every call for no reason. The caller already
-        handles nil. ]]
-        if shared.PistonwareDeveloper then
-            warn('[pistonware] getproto failed -- function:', func, 'index:', index)
-        end
-        return nil
-    end
-end
-
 --[[ The `out` barrel re-exports sound-manager, but each of its re-exports is guarded by
 `or {}`, so a build where that submodule fails to resolve silently drops the key and
 leaves SoundManager nil -- which is how "attempt to index nil with 'playSound'" reached
@@ -2052,31 +2049,74 @@ end
 
 --[[ pistonware funcs ]]
 
-run(function()
-	local KnitInit, Knit
-	repeat
-		KnitInit, Knit = pcall(function()
-			return debug.getupvalue(require(lplr.PlayerScripts.TS.knit).setup, 9)
-		end)
-		if KnitInit then break end
-		task.wait()
-	until KnitInit
-
-	--[[ The wait is protected by pcall and has a deadline. Two separate hazards, both fatal here before the fix:
-	Knit.Start is nil if a game update reshapes Knit, and debug.getupvalue(nil, 1) THROWS --
-	which killed this block before the bedwars table on the next line was ever built, taking
-	every module in this file and bedwars.lua with it. And a Knit that loads but never
-	finishes starting parked this loop at frame rate for the rest of the session. ]]
+do
+if shared.VapeSmoothBoot then task.wait() end
+local bootstrapOk, bootstrapError = callWithThreadFix(function()
+	local Knit = require(
+		replicatedStorage.rbxts_include.node_modules['@easy-games'].knit.src.Knit.KnitClient
+	)
+	assert(type(Knit) == 'table', 'KnitClient returned no controller table')
 	local knitDeadline = os.clock() + 60
+	assert(type(Knit.OnStart) == 'function', 'Knit.OnStart is unavailable')
+	local knitStarted = false
+	local knitStartError
+	local startup = Knit.OnStart()
+	assert(startup and type(startup.andThen) == 'function',
+		'Knit.OnStart returned no startup promise')
+	local observer = startup:andThen(function()
+		knitStarted = true
+	end, function(err)
+		knitStartError = tostring(err)
+	end)
+	local function stopObserving()
+		if observer and type(observer.cancel) == 'function' then
+			pcall(function() observer:cancel() end)
+		end
+	end
 	while true do
-		local started, value = pcall(debug.getupvalue, Knit.Start, 1)
-		if started and value then break end
-		if os.clock() > knitDeadline then
-			warn('[pistonware] Knit did not finish starting within 60s -- loading anyway')
+		if vape.Loaded == nil then
+			stopObserving()
+			error('Knit initialization canceled by unload', 0)
+		end
+		if knitStartError then
+			stopObserving()
+			error('Knit startup failed: '..knitStartError, 0)
+		end
+		local controllers = Knit.Controllers
+		if knitStarted and type(controllers) == 'table'
+			and controllers.SwordController
+			and controllers.ProjectileController
+			and controllers.BlockBreakController
+			and controllers.MatchController
+			and controllers.ItemDropController then
 			break
 		end
-		task.wait()
+		if os.clock() >= knitDeadline then
+			stopObserving()
+			error('Knit startup and controllers did not become ready within 60s', 0)
+		end
+		task.wait(0.1)
 	end
+
+	local BowConstantsTable
+	if debug and type(debug.getupvalue) == 'function' then
+		local suc, result = pcall(
+			debug.getupvalue,
+			Knit.Controllers.ProjectileController.enableBeam,
+			8
+		)
+		if suc and type(result) == 'table' then
+			BowConstantsTable = result
+		end
+	end
+	BowConstantsTable = BowConstantsTable or {
+		BeamGrowthMultiplier = 0.08,
+		CameraMultiplier = 10,
+		RelX = 0.8,
+		RelY = -0.6,
+		RelZ = 0,
+		YTargetOffset = 0.05
+	}
 
 	local Flamework = require(replicatedStorage['rbxts_include']['node_modules']['@flamework'].core.out).Flamework
 	local InventoryUtil = require(replicatedStorage.TS.inventory['inventory-util']).InventoryUtil
@@ -2099,7 +2139,7 @@ run(function()
 		BlockController = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['block-engine'].out).BlockEngine,
 		BlockEngine = require(lplr.PlayerScripts.TS.lib['block-engine']['client-block-engine']).ClientBlockEngine,
 		BlockPlacer = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['block-engine'].out.client.placement['block-placer']).BlockPlacer,
-		BowConstantsTable = debug.getupvalue(Knit.Controllers.ProjectileController.enableBeam, 8),
+		BowConstantsTable = BowConstantsTable,
 		ClickHold = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out.client.ui.lib.util['click-hold']).ClickHold,
 		Client = Client,
 		ClientSyncEvents = require(lplr.PlayerScripts.TS['client-sync-events']).ClientSyncEvents,
@@ -2126,7 +2166,7 @@ run(function()
 			}
 		end,
 		HudAliveCount = require(lplr.PlayerScripts.TS.controllers.global['top-bar'].ui.game['hud-alive-player-counts']).HudAlivePlayerCounts,
-		ItemMeta = debug.getupvalue(require(replicatedStorage.TS.item['item-meta']).getItemMeta, 1),
+		ItemMeta = require(replicatedStorage.TS.item['item-meta']).items,
 		-- Wanted by SkinChanger. Paths taken from where the game's own controllers import
 		-- them (armor-item-skin-util for the meta, battle-pass-rewards for the id table).
 		ItemSkinType = require(replicatedStorage.TS.games.bedwars['item-skin']['item-skin-types']).ItemSkinType,
@@ -2162,7 +2202,7 @@ run(function()
 		Store = require(lplr.PlayerScripts.TS.ui.store).ClientStore,
 		SummonerKitBalance = require(replicatedStorage.TS.games.bedwars.kit.kits.summoner['summoner-kit-balance']).SummonerKitBalance,
 		SyncEventPriority = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['sync-event'].out).SyncEventPriority,
-		TeamUpgradeMeta = debug.getupvalue(require(replicatedStorage.TS.games.bedwars['team-upgrade']['team-upgrade-meta']).getTeamUpgradeMetaForQueue, 7),
+		TeamUpgradeMeta = require(replicatedStorage.TS.games.bedwars['team-upgrade']['team-upgrade-meta']).getTeamUpgradeMetaForQueue(),
 		UILayers = require(replicatedStorage['rbxts_include']['node_modules']['@easy-games']['game-core'].out).UILayers,
 		VisualizerUtils = require(lplr.PlayerScripts.TS.lib.visualizer['visualizer-utils']).VisualizerUtils,
 		WeldTable = require(replicatedStorage.TS.util['weld-util']).WeldUtil,
@@ -2175,55 +2215,41 @@ run(function()
 		end
 	})
 
-	local remoteNames = {
-		AfkStatus = safeGetProto(Knit.Controllers.AfkController.KnitStart, 1),
-		AttackEntity = Knit.Controllers.SwordController.sendServerRequest,
-		BeePickup = Knit.Controllers.BeeNetController.trigger,
-		CannonAim = safeGetProto(Knit.Controllers.CannonController.startAiming, 5),
-		CannonLaunch = Knit.Controllers.CannonHandController.launchSelf,
-		ConsumeBattery = safeGetProto(Knit.Controllers.BatteryController.onKitLocalActivated, 1),
-		ConsumeItem = safeGetProto(Knit.Controllers.ConsumeController.onEnable, 1),
-		ConsumeSoul = Knit.Controllers.GrimReaperController.consumeSoul,
-		DepositPinata = safeGetProto(safeGetProto(Knit.Controllers.PiggyBankController.KnitStart, 2), 5),
-		DragonBreath = safeGetProto(Knit.Controllers.VoidDragonController.onKitLocalActivated, 5),
-		DragonEndFly = safeGetProto(Knit.Controllers.VoidDragonController.flapWings, 1),
-		DragonFly = Knit.Controllers.VoidDragonController.flapWings,
-		DropItem = Knit.Controllers.ItemDropController.dropItemInHand,
-		EquipItem = safeGetProto(require(replicatedStorage.TS.entity.entities['inventory-entity']).InventoryEntity.equipItem, 4),
-		FireProjectile = debug.getupvalue(Knit.Controllers.ProjectileController.launchProjectileWithValues, 2),
-		GroundHit = Knit.Controllers.FallDamageController.KnitStart,
-		GuitarHeal = Knit.Controllers.GuitarController.performHeal,
-		HannahKill = safeGetProto(Knit.Controllers.HannahController.registerExecuteInteractions, 1),
-		HarvestCrop = safeGetProto(safeGetProto(Knit.Controllers.CropController.KnitStart, 4), 1),
-		KaliyahPunch = safeGetProto(Knit.Controllers.DragonSlayerController.onKitLocalActivated, 1),
-		MageSelect = safeGetProto(Knit.Controllers.MageController.registerTomeInteraction, 1),
-		MinerDig = safeGetProto(Knit.Controllers.MinerController.setupMinerPrompts, 1),
-		PickupItem = Knit.Controllers.ItemDropController.checkForPickup,
-		PickupMetal = safeGetProto(Knit.Controllers.HiddenMetalController.onKitLocalActivated, 4),
-		ReportPlayer = require(lplr.PlayerScripts.TS.controllers.global.report['report-controller']).default.reportPlayer,
-		ResetCharacter = safeGetProto(Knit.Controllers.ResetController.createBindable, 1),
-		SpawnRaven = safeGetProto(Knit.Controllers.RavenController.KnitStart, 1),
-		SummonerClawAttack = Knit.Controllers.SummonerClawHandController.attack,
-		WarlockTarget = safeGetProto(Knit.Controllers.WarlockStaffController.KnitStart, 2)
-	}
+	assert(type(bedwars.ItemMeta) == 'table', 'item-meta.items is unavailable')
+	assert(type(bedwars.TeamUpgradeMeta) == 'table', 'queue team upgrades are unavailable')
 
-	local function dumpRemote(tab)
-		local ind
-		for i, v in tab do
-			if v == 'Client' then
-				ind = i
-				break
-			end
-		end
-		return ind and tab[ind + 1] or ''
-	end
-
-	for i, v in remoteNames do
-		local remote = dumpRemote(debug.getconstants(v))
-		if remote == '' then
-			--[[ notif('Pistonware', 'Failed to grab remote ('..i..')', 10, 'alert') ]]
-		end
-		remotes[i] = remote
+	for name, remote in {
+		AfkStatus = 'AfkInfo',
+		AttackEntity = 'SwordHit',
+		BeePickup = 'PickUpBee',
+		CannonAim = 'AimCannon',
+		CannonLaunch = 'LaunchSelfFromCannon',
+		ConsumeBattery = 'ConsumeBattery',
+		ConsumeItem = 'ConsumeItem',
+		ConsumeSoul = 'ConsumeGrimReaperSoul',
+		DepositPinata = 'DepositCoins',
+		DragonBreath = 'DragonBreath',
+		DragonEndFly = 'VoidDragonEndFlying',
+		DragonFly = 'DragonFlap',
+		DropItem = 'DropItem',
+		EquipItem = 'SetInvItem',
+		FireProjectile = 'ProjectileFire',
+		GroundHit = 'GroundHit',
+		GuitarHeal = 'PlayGuitar',
+		HannahKill = 'HannahPromptTrigger',
+		HarvestCrop = 'CropHarvest',
+		KaliyahPunch = 'PlayerDragonPunched',
+		MageSelect = 'LearnElementTome',
+		MinerDig = 'DestroyPetrifiedPlayer',
+		PickupItem = 'PickupItemDrop',
+		PickupMetal = 'CollectCollectableEntity',
+		ReportPlayer = 'ReportPlayer',
+		ResetCharacter = 'ResetCharacter',
+		SpawnRaven = 'SpawnRaven',
+		SummonerClawAttack = 'SummonerClawAttackRequest',
+		WarlockTarget = 'WarlockLinkTarget'
+	} do
+		remotes[name] = remote
 	end
 
 	OldBreak = bedwars.BlockController.isBlockBreakable
@@ -3047,28 +3073,56 @@ run(function()
 		until vape.Loaded == nil
 	end)
 
-	pcall(function()
-		if getthreadidentity and setthreadidentity then
-			local old = getthreadidentity()
-			setthreadidentity(2)
+	task.spawn(function()
+		local deadline = os.clock() + 60
+		local lastError = 'shop initialization has not completed'
+		while vape.Loaded ~= nil do
+			local oldIdentity
+			local shop
+			local canSetIdentity = type(getthreadidentity) == 'function'
+				and type(setthreadidentity) == 'function'
+			local ok, err = xpcall(function()
+				if canSetIdentity then
+					oldIdentity = getthreadidentity()
+					assert(type(oldIdentity) == 'number', 'thread identity is unavailable')
+					setthreadidentity(2)
+				else
+					assert(bedwars.AppController
+						and bedwars.AppController:isAppOpen('BedwarsItemShopApp'),
+						'open the item shop to initialize AutoBuy on this executor')
+				end
 
-			bedwars.Shop = require(replicatedStorage.TS.games.bedwars.shop['bedwars-shop']).BedwarsShop
-			bedwars.ShopItems = debug.getupvalue(debug.getupvalue(bedwars.Shop.getShopItem, 1), 2)
-			bedwars.Shop.getShopItem('iron_sword', lplr)
+				shop = require(replicatedStorage.TS.games.bedwars.shop['bedwars-shop']).BedwarsShop
+				assert(type(shop) == 'table' and type(shop.getShopItem) == 'function'
+					and type(shop.ShopItems) == 'table', 'shop data is not ready')
+				shop.getShopItem('iron_sword', lplr)
+			end, errorTrace)
 
-			setthreadidentity(old)
-			store.shopLoaded = true
-		else
-			task.spawn(function()
-				repeat
-					task.wait(0.1)
-				until vape.Loaded == nil or bedwars.AppController:isAppOpen('BedwarsItemShopApp')
-
-				bedwars.Shop = require(replicatedStorage.TS.games.bedwars.shop['bedwars-shop']).BedwarsShop
-				bedwars.ShopItems = debug.getupvalue(debug.getupvalue(bedwars.Shop.getShopItem, 1), 2)
+			if type(oldIdentity) == 'number' then
+				local restored, restoreError = pcall(setthreadidentity, oldIdentity)
+				if not restored then
+					bufferCall('error', 'bedwars.shop.identity', tostring(restoreError))
+					if vape.Loaded ~= nil then
+						notif('AutoBuy', 'Shop initialization could not restore thread identity.', 10, 'alert')
+					end
+					return
+				end
+			end
+			if vape.Loaded == nil then return end
+			if ok then
+				bedwars.Shop = shop
+				bedwars.ShopItems = shop.ShopItems
 				store.shopLoaded = true
-			end)
+				return
+			end
+
+			lastError = tostring(err)
+			if os.clock() >= deadline then break end
+			task.wait(0.5)
 		end
+		if vape.Loaded == nil then return end
+		bufferCall('error', 'bedwars.shop.initialize', lastError)
+		notif('AutoBuy', 'Shop initialization failed. Open the item shop and reinject; see the error log.', 10, 'alert')
 	end)
 
 	vape:Clean(function()
@@ -3088,6 +3142,15 @@ run(function()
 		storeChanged = nil
 	end)
 end)
+if not bootstrapOk then
+	bufferCall('error', 'bedwars.bootstrap', bootstrapError)
+	return {
+		PistonwareBootFailure = true,
+		stage = 'bedwars.bootstrap',
+		error = tostring(bootstrapError)
+	}
+end
+end
 
 for _, v in {'AntiRagdoll', 'TriggerBot', 'SilentAim', 'AutoRejoin', 'Rejoin', 'Disabler', 'Timer', 'ServerHop', 'MouseTP', 'MurderMystery', 'Swim', 'Jesus', 'Invisible', 'Desync', 'Waypoints', 'PlayerModel', 'Schematica'} do
 	vape:Remove(v)
@@ -5105,6 +5168,7 @@ run(function()
 				if Reference[ent] then return end --[[ Prevent duplicates ]]
 
 				local nametag = Instance.new('TextLabel')
+				Reference[ent] = nametag
 				Strings[ent] = hideNames(ent.Player and whitelist:tag(ent.Player, true, true)..(DisplayName.Enabled and ent.Player.DisplayName or ent.Player.Name) or ent.Character.Name)
 
 				if Device.Enabled and ent.Player then
@@ -5141,6 +5205,10 @@ run(function()
 				nametag.TextSize = 14 * Scale.Value
 				nametag.FontFace = FontOption.Value
 				local size = getfontsize(removeTags(Strings[ent]), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
+				if Reference[ent] ~= nametag then
+					nametag:Destroy()
+					return
+				end
 				nametag.Name = ent.Player and ent.Player.Name or ent.Character.Name
 				nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
 
@@ -5196,8 +5264,11 @@ run(function()
 				nametag.Text = Strings[ent]
 				nametag.TextColor3 = entitylib.getEntityColor(ent) or Color3.fromHSV(Color.Hue, Color.Sat, Color.Value)
 				nametag.RichText = true
+				if Reference[ent] ~= nametag then
+					nametag:Destroy()
+					return
+				end
 				nametag.Parent = Folder
-				Reference[ent] = nametag
 			end)
 		end,
 		Drawing = function(ent)
@@ -5248,10 +5319,13 @@ run(function()
 				unwatchEnchant(ent)
 				local v = Reference[ent]
 				if v then
+					if vape.ThreadFix then
+						setthreadidentity(8)
+					end
+					v:Destroy()
 					Reference[ent] = nil
 					Strings[ent] = nil
 					Sizes[ent] = nil
-					v:Destroy()
 				end
 			end)
 		end,
@@ -5497,6 +5571,80 @@ run(function()
 		end
 	}
 	
+	--[[ One tag's worth of work, under its own pcall.
+
+	The comment inside spells out why a throw here used to freeze every tag after it in the
+	iteration. The RootPart read it describes is guarded now, but that was never the only
+	thing in here that can throw: ent.HipHeight is arithmetic on a field nothing guarantees,
+	string.format walks a Strings entry that has to carry a %s, and getfontsize is handed a
+	FontFace. Any one of them abandoning the frame leaves every remaining tag exactly where
+	it was last drawn -- and it repeats every frame, so they stay there while you walk away.
+
+	A pcall per tag per frame is a handful of nanoseconds against sixteen tags. Losing one
+	tag for a frame is a flicker; losing the rest of the list is the bug being reported. ]]
+	local function drawTag(ent, nametag, selfPos)
+		pcall(function()
+					
+			--[[ THIS is why tags froze on screen.
+
+			The whole loop used to sit under one pcall. An entity whose RootPart had gone --
+			died, streamed out, character swapped -- threw on `ent.RootPart.Position`, and
+			that one throw abandoned the rest of the frame. Every tag after it in the
+			iteration kept the Position and the Visible it was last given, so they hung
+			wherever they had been drawn while the players they belonged to walked away. It
+			repeated every frame for as long as the dead entity stayed in Reference, which is
+			until its label is destroyed -- so it never cleared on its own.
+
+			A missing RootPart is now just a hidden tag. The entry is deliberately LEFT in
+			Reference: Removed is what destroys the label, and it finds it through this
+			very table, so clearing it here would orphan the TextLabel under Folder for
+			the rest of the round. entitylib will report the entity properly soon enough
+			and the real cleanup happens there. ]]
+			local root = ent.RootPart
+			if not (root and root.Parent) then
+				nametag.Visible = false
+				return
+			end
+
+			--[[ And never draw against a character its player has moved on from. The
+			sweep prunes these once a second, which is up to a second of a tag sitting
+			over an empty spot -- two property reads a frame is cheaper than explaining
+			that to anyone. ]]
+			if supersededEntity(ent) then
+				nametag.Visible = false
+				return
+			end
+
+			local rootPos = root.Position
+
+			if DistanceCheck.Enabled then
+				local distance = selfPos and (selfPos - rootPos).Magnitude or math.huge
+				if distance < DistanceLimit.ValueMin or distance > DistanceLimit.ValueMax then
+					nametag.Visible = false
+					return
+				end
+			end
+
+			local headPos, headVis = gameCamera:WorldToViewportPoint(rootPos + Vector3.new(0, ent.HipHeight + 1, 0))
+			nametag.Visible = headVis
+			if not headVis then
+				return
+			end
+
+			if Distance.Enabled then
+				local mag = selfPos and math.floor((selfPos - rootPos).Magnitude) or 0
+				if Sizes[ent] ~= mag then
+					nametag.Text = string.format(Strings[ent], mag)
+					local size = getfontsize(removeTags(nametag.Text), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
+					nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
+					positionIcons(nametag, size.X, size.Y + 7)
+					Sizes[ent] = mag
+				end
+			end
+			nametag.Position = UDim2.fromOffset(headPos.X, headPos.Y)
+		end)
+	end
+
 	local Loop = {
 		Normal = function()
 			pcall(function()
@@ -5508,64 +5656,7 @@ run(function()
 						Reference[ent] = nil
 						continue
 					end
-					
-					--[[ THIS is why tags froze on screen.
-
-					The whole loop used to sit under one pcall. An entity whose RootPart had gone --
-					died, streamed out, character swapped -- threw on `ent.RootPart.Position`, and
-					that one throw abandoned the rest of the frame. Every tag after it in the
-					iteration kept the Position and the Visible it was last given, so they hung
-					wherever they had been drawn while the players they belonged to walked away. It
-					repeated every frame for as long as the dead entity stayed in Reference, which is
-					until its label is destroyed -- so it never cleared on its own.
-
-					A missing RootPart is now just a hidden tag. The entry is deliberately LEFT in
-					Reference: Removed is what destroys the label, and it finds it through this
-					very table, so clearing it here would orphan the TextLabel under Folder for
-					the rest of the round. entitylib will report the entity properly soon enough
-					and the real cleanup happens there. ]]
-					local root = ent.RootPart
-					if not (root and root.Parent) then
-						nametag.Visible = false
-						continue
-					end
-
-					--[[ And never draw against a character its player has moved on from. The
-					sweep prunes these once a second, which is up to a second of a tag sitting
-					over an empty spot -- two property reads a frame is cheaper than explaining
-					that to anyone. ]]
-					if supersededEntity(ent) then
-						nametag.Visible = false
-						continue
-					end
-
-					local rootPos = root.Position
-
-					if DistanceCheck.Enabled then
-						local distance = selfPos and (selfPos - rootPos).Magnitude or math.huge
-						if distance < DistanceLimit.ValueMin or distance > DistanceLimit.ValueMax then
-							nametag.Visible = false
-							continue
-						end
-					end
-
-					local headPos, headVis = gameCamera:WorldToViewportPoint(rootPos + Vector3.new(0, ent.HipHeight + 1, 0))
-					nametag.Visible = headVis
-					if not headVis then
-						continue
-					end
-
-					if Distance.Enabled then
-						local mag = selfPos and math.floor((selfPos - rootPos).Magnitude) or 0
-						if Sizes[ent] ~= mag then
-							nametag.Text = string.format(Strings[ent], mag)
-							local size = getfontsize(removeTags(nametag.Text), nametag.TextSize, nametag.FontFace, Vector2.new(100000, 100000))
-							nametag.Size = UDim2.fromOffset(size.X + 8, size.Y + 7)
-							positionIcons(nametag, size.X, size.Y + 7)
-							Sizes[ent] = mag
-						end
-					end
-					nametag.Position = UDim2.fromOffset(headPos.X, headPos.Y)
+					drawTag(ent, nametag, selfPos)
 				end
 			end)
 		end,
@@ -5611,10 +5702,67 @@ run(function()
 		end
 	}
 	
+	--[[ One live setup at a time, however many starts arrive.
+
+	Nearly every toggle below reacts with `if NameTags.Enabled then NameTags:Toggle()
+	NameTags:Toggle() end`, which is fine when a person clicks one. Applying a profile
+	clicks all of them: LoadOptions walks the saved options and fires that Function for
+	every one whose value differs from the profile you were on.
+
+	And while a profile is applying the GUI splits that pair. The OFF runs inline, but the
+	ON goes through queueStart -- deferred onto a drain thread so sixty modules do not all
+	start in one frame. So switching between two profiles that both have this module on
+	queues one start per changed option and then runs them back to back with nothing in
+	between.
+
+	Every one of those starts connected another RenderStepped loop, another EntityAdded,
+	another EntityRemoved and another set of device watchers on top of the last, and none
+	were ever dropped -- the module's maid is emptied only when it is toggled OFF, and no
+	toggle-off ever ran. Eight changed options meant eight of everything, all writing into
+	the one Reference table.
+
+	So a start ends the previous one first. Same two steps the GUI takes on a disable --
+	empty the maid, then let the module drop its own state -- done from in here because a
+	second start never gives the GUI the chance. ]]
+	local liveSetup = false
+
+	local function dropSetup()
+		for _, connection in NameTags.Connections do
+			pcall(function()
+				local disconnect = connection.Disconnect or connection.disconnect or connection.Destroy
+				if type(disconnect) == 'function' then
+					disconnect(connection)
+				end
+			end)
+		end
+		table.clear(NameTags.Connections)
+
+		showGameNametags('nametags')
+
+		if Removed[methodused] then
+			for ent in Reference do
+				Removed[methodused](ent)
+			end
+		end
+		--[[ the loop above only reaches entities that still have a tag; sweep the rest so
+		no attribute listener outlives the setup ]]
+		for ent in enchantConns do
+			unwatchEnchant(ent)
+		end
+
+		liveSetup = false
+	end
+
 	NameTags = vape.Categories.Render:CreateModule({
 		Name = 'NameTags',
 		Function = function(callback)
 			if callback then
+				-- a start with no disable in front of it is a restart, not an addition
+				if liveSetup then
+					dropSetup()
+				end
+				liveSetup = true
+
 				--[[ Ours replaces the game's rather than sitting on top of it. Same name,
 				same health, same spot -- with both up the text renders twice and the game's
 				own icon shows up beside it. ]]
@@ -5672,18 +5820,7 @@ run(function()
 				end
 				NameTags:Clean(playersService.PlayerAdded:Connect(watchDevice))
 			else
-				showGameNametags('nametags')
-
-				if Removed[methodused] then
-					for i in Reference do
-						Removed[methodused](i)
-					end
-				end
-				--[[ the loop above only reaches entities that still have a tag; sweep the
-				rest so no attribute listener outlives the module ]]
-				for ent in enchantConns do
-					unwatchEnchant(ent)
-				end
+				dropSetup()
 			end
 		end,
 		Tooltip = 'Draws nametags through walls.'
@@ -6086,104 +6223,6 @@ run(function()
 				bedwars.CatController.leap = old
 			end)
 		end,
-		farmer_cletus = function()
-			kitCollection('HarvestableCrop', function(v)
-				if bedwars.Client:Get(remotes.HarvestCrop):CallServer({position = bedwars.BlockController:getBlockPosition(v.Position)}) then
-					bedwars.GameAnimationUtil:playAnimation(lplr.Character, bedwars.AnimationType.PUNCH)
-					bedwars.SoundManager:playSound(bedwars.SoundList.CROP_HARVEST)
-				end
-			end, 10, false)
-		end,
-		gingerbread_man = function()
-			local old = bedwars.LaunchPadController.attemptLaunch
-			bedwars.LaunchPadController.attemptLaunch = function(...)
-				local res = {old(...)}
-				local self, block = ...
-	
-				-- AutoGumdrop owns the pad while it is on, toggles and all. This break is
-				-- unconditional, so with both running its 'Break gumdrop' toggle did nothing
-				-- visible -- the pad went either way -- and the two modules raced to break the
-				-- same block.
-				if not genv.AutoGumdropActive and (workspace:GetServerTimeNow() - self.lastLaunch) < 0.4 then
-					if block:GetAttribute('PlacedByUserId') == lplr.UserId and (block.Position - entitylib.character.RootPart.Position).Magnitude < 30 then
-						task.spawn(bedwars.breakBlock, block, false, nil, true)
-					end
-				end
-	
-				return unpack(res)
-			end
-	
-			AutoKit:Clean(function()
-				bedwars.LaunchPadController.attemptLaunch = old
-			end)
-		end,
-		void_dragon = function()
-			local oldflap = bedwars.VoidDragonController.flapWings
-			local flapped
-	
-			bedwars.VoidDragonController.flapWings = function(self)
-				if not flapped and bedwars.Client:Get(remotes.DragonFly):CallServer() then
-					local modifier = bedwars.SprintController:getMovementStatusModifier():addModifier({
-						blockSprint = true,
-						constantSpeedMultiplier = 2
-					})
-					self.SpeedMaid:GiveTask(modifier)
-					self.SpeedMaid:GiveTask(function()
-						flapped = false
-					end)
-					flapped = true
-				end
-			end
-	
-			AutoKit:Clean(function()
-				bedwars.VoidDragonController.flapWings = oldflap
-			end)
-	
-			repeat
-				if bedwars.VoidDragonController.inDragonForm then
-					local plr = entitylib.EntityPosition({
-						Range = 30,
-						Part = 'RootPart',
-						Players = true
-					})
-	
-					if plr then
-						bedwars.Client:Get(remotes.DragonBreath):SendToServer({
-							player = lplr,
-							targetPoint = plr.RootPart.Position
-						})
-					end
-				end
-				task.wait(0.1)
-			until not AutoKit.Enabled
-		end,
-		warlock = function()
-			local lastTarget
-			repeat
-				if store.hand.tool and store.hand.tool.Name == 'warlock_staff' then
-					local plr = entitylib.EntityPosition({
-						Range = 30,
-						Part = 'RootPart',
-						Players = true,
-						NPCs = true
-					})
-	
-					if plr and plr.Character ~= lastTarget then
-						if not bedwars.Client:Get(remotes.WarlockTarget):CallServer({
-							target = plr.Character
-						}) then
-							plr = nil
-						end
-					end
-	
-					lastTarget = plr and plr.Character
-				else
-					lastTarget = nil
-				end
-	
-				task.wait(0.1)
-			until not AutoKit.Enabled
-		end,
 	}
 	
 	AutoKit = vape.Categories.Utility:CreateModule({
@@ -6192,12 +6231,11 @@ run(function()
 			if callback then
 				--[[ Every kit loop below touches Instances and fires remotes, and this
 				thread is whatever enabled the module -- a profile apply on load, or a
-				GUI click -- neither of which carries the elevated identity. Without
-				this, farmer_cletus' harvest remote throws 'lacking capability Plugin'
-				on the first crop in range and takes the whole kit loop with it, since
-				nothing here is pcall'd. Set once for the thread rather than inside
-				the loops: it persists across task.wait, and every kit function runs
-				on this same thread. ]]
+				GUI click -- neither of which carries the elevated identity. Without it
+				a remote that needs the raised identity throws on the first call and
+				takes the whole kit loop with it, since nothing here is pcall'd. Set
+				once for the thread rather than inside the loops: it persists across
+				task.wait, and every kit function runs on this same thread. ]]
 				if vape.ThreadFix then
 					setthreadidentity(8)
 				end
@@ -9221,7 +9259,7 @@ run(function()
 				end
 	
 				bedwars.ClickHold.showProgress = function(self)
-					local roact = debug.getupvalue(oldshowprogress, 1)
+					local roact = bedwars.Roact
 					local countdown = roact.mount(roact.createElement('ScreenGui', {}, { roact.createElement('Frame', {
 						[roact.Ref] = self.wrapperRef,
 						Size = UDim2.new(),
@@ -10690,7 +10728,8 @@ shared.bedwars = {
     targetinfo          = targetinfo,
     prediction          = prediction,
     color               = color,
-    uipallet            = uipallet,
+	uipallet            = uipallet,
+	buffer              = pistonwareBuffer,
 
     --[[ Game state ]]
     lplr                = lplr,
@@ -10777,7 +10816,7 @@ local function compileBedwarsSource(source, chunkName)
     local func, err = loadstring(source, chunkName)
     if not func then
         local size = type(source) == 'string' and #source or 0
-        warn(string.format('[pistonware] %s failed to compile (%d bytes): %s', chunkName, size, tostring(err)))
+		bufferCall('error', 'bedwars.compile', err, {chunk = chunkName, bytes = size})
     end
     return func, err
 end
@@ -10827,7 +10866,7 @@ local function downloadBedwars()
         if not localFunc then
             return nil, bootFailure('bedwars.local.compile', compileError)
         end
-        warn('[pistonware] developer mode: running local games/bedwars.lua (not the published build)')
+		bufferCall('print', 'bedwars.developer', 'running local games/bedwars.lua')
         return res
     end
 
@@ -10884,7 +10923,7 @@ end
 local bedwarsSource, bedwarsFailure = downloadBedwars()
 if not bedwarsSource then
     local failure = bedwarsFailure or bootFailure('bedwars.download', 'no usable BedWars payload')
-    warn('[pistonware] '..failure.stage..': '..failure.error)
+	bufferCall('error', failure.stage, failure.error)
     pcall(function()
         vape:CreateNotification('Vape', 'BedWars modules could not be loaded ('..failure.stage..'). Rejoin the game to retry.', 30, 'alert')
     end)
@@ -10894,7 +10933,7 @@ end
 local bedwarsFn, bedwarsCompileError = compileBedwarsSource(bedwarsSource, 'bedwars')
 if not bedwarsFn then
     local failure = bootFailure('bedwars.compile', bedwarsCompileError)
-    warn('[pistonware] '..failure.stage..': '..failure.error)
+	bufferCall('error', failure.stage, failure.error)
     pcall(function()
         vape:CreateNotification('Vape', 'Combat modules could not be loaded (bedwars.compile). Rejoin the game to retry.', 30, 'alert')
     end)
@@ -10907,7 +10946,7 @@ end
         of their session, and names the actual problem. ]]
 if not republishKey() then
     local failure = bootFailure('bedwars.key', 'no validated key was available for the BedWars payload')
-    warn('[pistonware] '..failure.stage..': '..failure.error)
+	bufferCall('error', failure.stage, failure.error)
     pcall(function()
         vape:CreateNotification('Vape', 'Your key was not available when combat modules tried to load. Re-run the pistonware loader to fix this.', 30, 'alert')
     end)
@@ -10917,7 +10956,7 @@ end
 local ok, result = xpcall(bedwarsFn, errorTrace)
 if not ok then
     local failure = bootFailure('bedwars.payload.execute', result)
-    warn('[pistonware] '..failure.stage..': '..failure.error)
+	bufferCall('error', failure.stage, failure.error)
     return failure
 end
 if type(result) == 'table' and result.PistonwareBootFailure then
